@@ -49,8 +49,8 @@ def sample_unit_sphere_jax(key_theta,key_phi, N):
     Generates a random distribution on the unit sphere.
     """
     
-    theta = jnp.arccos(1 - 2 * random_uniform_jax(key_r,N))
-    phi = 2 * jnp.pi * 2 * random_uniform_jax(key_theta,N)
+    theta = jnp.arccos(1 - 2 * random_uniform_jax(key_theta,N))
+    phi = 2 * jnp.pi * 2 * random_uniform_jax(key_phi,N)
     x = jnp.sin(theta) * jnp.cos(phi)
     y = jnp.sin(theta) * jnp.sin(phi)
     z = jnp.cos(theta)
@@ -103,7 +103,7 @@ def get_satellites(NFW_profile, unit_vectors,halo_c,halo_rvir, halo_centers,
             if NFW_profile[rand_idx] <= (c[i]*s):
                 break 
 
-        etaVir = nfw_radii[rand_idx] / (c[i]*s)  # r/rvir
+        etaVir = NFW_profile[rand_idx] / (c[i]*s)  # r/rvir
         p = etaVir * halo_rvir[i] / 1000
         sat_pos[i] = halo_centers[i] + unit_vectors[rand_idx] * p
         vx[i] = np.random.normal(loc=halo_velocities[i,0], scale=sig)
