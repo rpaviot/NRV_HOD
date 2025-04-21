@@ -21,6 +21,7 @@ def gauss_legendre_integration(f, a, b, **kwargs):
 
 
 def set_massfunction(dict_cosmology,logM, z):
+    ##Colossus mass function. Will be replace by pyccl mass function in the future.
     cosmo = cosmology.setCosmology('myCosmo', dict_cosmology)
     dndlogM = mass_function.massFunction(10**logM, z , mdef = 'vir', model = 'tinker08', q_out = 'dndlnM')
     return dndlogM*np.log(10)
