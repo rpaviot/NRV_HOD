@@ -8,6 +8,7 @@ from colossus.lss import mass_function
 from scipy.special import roots_legendre
 from functools import partial
 
+#Precision for DeltaSigma estimation.
 n_legendre = 200
 x_legendre, w_legendre = roots_legendre(n_legendre)
 
