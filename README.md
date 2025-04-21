@@ -6,6 +6,8 @@ This is an HOD codes wrapped around an emulator that can performs halo occupatio
 to projected clustering and galaxy-galaxy lensing 2-point functions.
 
 The code is divided in two parts:
+
+
 **1) Semi-analytical models of galaxy-halo connection**
 This model included modelling of gamma_t (Dsigma), w_theta (wp) in a lightcone geometry.
 This class is based upon the pyccl library. It also includes lensing magnification contribution, 
