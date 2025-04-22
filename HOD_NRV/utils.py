@@ -44,13 +44,13 @@ def random_poisson_numba(prob):
     return result
 
 @partial(jit,static_argnames='n')
-def random_uniform_jax(n,key,a=0,b=1):
+def random_uniform_jax(key,n,a=0,b=1):
     key, subkey = jrandom.split(key)
     result = jrandom.uniform(subkey, (n,),minval=a,maxval=b)
     return result
 
 @jit
-def random_poisson_jax(prob,key):
+def random_poisson_jax(key,prob):
     key, subkey = jrandom.split(key)
-    result = jrandom.poisson(key,prob, (prob.shape[0],))
+    result = jrandom.poisson(subkey,prob, (prob.shape[0],))
     return result
