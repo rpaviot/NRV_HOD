@@ -43,6 +43,7 @@ def random_poisson_numba(prob):
         result[i] = np.random.poisson(prob[i])
     return result
 
+
 def random_uniform_jax(key,size,a=0,b=1):
     result = jrandom.uniform(key,size,minval=a,maxval=b)
     return result

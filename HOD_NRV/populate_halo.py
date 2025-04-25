@@ -4,8 +4,8 @@ import jax.numpy as jnp
 import jax.random as jrandom
 #import jax.numpy as jnp
 from .HOD_models import Occupation
-import utils 
-import NFW_jax
+from .NFW_jax import create_point_on_unit_sphere
+from .utils import random_uniform_jax,random_poisson_jax
 
 
 class halo_occupation:
@@ -20,7 +20,7 @@ class halo_occupation:
         self.dict_cosmology = cosmology
         self.Lbox = jnp.int(jnp.round(self.halo.x.values.max() - self.halo.y.values.min()),2)
         self.zeff = zeff
-        self.create_point_on_sphere()
+        self.SpherePoints = create_point_on_unit_sphere()
 
     def set_halo_model(self,hod_type):
 
@@ -36,13 +36,8 @@ class halo_occupation:
 
         self.HOD = Occupation(hod_type,self.dict_cosmology,self.zeff)
 
-    def create_point_on_sphere(self):
 
-        key = jrandom.key(0)
-        key, key_theta, key_phi = jrandom.split(key,num=3)
-        self.SpherePoints = NFW_jax.sample_unit_sphere_jax(key_theta,key_phi,N=10_000_000)
-
-    def central_galaxies(self):
+    #def central_galaxies(self):
 
 
 

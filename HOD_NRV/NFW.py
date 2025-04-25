@@ -2,7 +2,7 @@ import numpy as np
 import jax.numpy as jnp
 import jax.random as jrandom
 from jax import jit
-from .utils import * 
+from .utils import gauss_legendre_integration,random_uniform_jax,random_poisson_numba
 from numba import vectorize, njit, prange
 from functools import partial
 
@@ -42,7 +42,6 @@ def sample_unit_sphere_jax(key_theta,key_phi, N):
     key_theta : key
     key_phi : key
     N : number of simulated points 
-    x_max, optional: The upper bond of the profile. Default to 50.
     
     Returns 
     ----------
@@ -112,5 +111,7 @@ def get_satellites(NFW_profile, unit_vectors,halo_c,halo_rvir, halo_centers,
 
 
     return sat_pos,np.stack((vx,vy,vz),axis=-1)
+
+
 
 
