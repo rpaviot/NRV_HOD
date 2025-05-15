@@ -100,8 +100,8 @@ def NFW_radius(u_samples,Rvir,c,mask):
 
 
 
-
-def spherical_NFW_satellites_positions(key,SpherePoints, halo_centers, Rvir, c, N_s):
+@partial(jit,static_argnames=['N_s_tot'])
+def spherical_NFW_satellites_positions(key,SpherePoints, halo_centers, Rvir, c, N_s, N_s_tot):
     """
     Generate NFW satellite positions with improved performance
     
@@ -126,7 +126,7 @@ def spherical_NFW_satellites_positions(key,SpherePoints, halo_centers, Rvir, c, 
     u_samples = random_uniform_jax(key_radii, (N_s_tot,))
     
     # Create arrays that map each satellite to its halo properties
-    halo_indices = jnp.repeat(jnp.arange(num_halos), N_s)
+    halo_indices = jnp.repeat(jnp.arange(num_halos), N_s,total_repeat_length=N_s_tot)
     sat_Rs = Rs[halo_indices]
     sat_c = c[halo_indices]
     sat_Rvir = Rvir[halo_indices]
