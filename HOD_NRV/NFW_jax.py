@@ -64,7 +64,7 @@ def single_inverse_CDF(u,Rvir,Rs,c):
     Return the inverse CDF of the NFW profile.
 
     """
-    rbins = jnp.geomspace(0.001, Rvir, 1000)
+    rbins = jnp.geomspace(0.1, Rvir, 1000)
     cdf = NFW_CDF(rbins)
     return jnp.interp(u,cdf,rbins)
 
@@ -100,22 +100,60 @@ def NFW_radius(u_samples,Rvir,c,mask):
 
 
 
-def spherical_NFW_satellites_positions(key, SpherePoints, halo_centers, halo_Rvir, halo_concentration, halo_N_s, N_halo):
+
+def spherical_NFW_satellites_positions(key,SpherePoints, halo_centers, Rvir, c, N_s):
+    """
+    Generate NFW satellite positions with improved performance
+    
+    Parameters
+    ----------
+    key : PRNG key
+    halo_centers : Array of shape (num_halos, 3) with halo center coordinates
+    Rvir : Array of shape (num_halos,) with virial radii
+    c : Array of shape (num_halos,) with concentration parameters
+    N_s : Array of shape (num_halos,) with number of satellites per halo
+    
+    Returns
+    -------
+    sat_positions : Array with satellite positions
+    """
+    num_halos = len(Rvir)
+    N_s_tot = jnp.sum(N_s)
+    Rs = Rvir / c
+    
+    # Split keys for different random operations
+    key, key_radii, key_angles = jrandom.split(key, 3)
+    u_samples = random_uniform_jax(key_radii, (N_s_tot,))
+    
+    # Create arrays that map each satellite to its halo properties
+    halo_indices = jnp.repeat(jnp.arange(num_halos), N_s)
+    sat_Rs = Rs[halo_indices]
+    sat_c = c[halo_indices]
+    sat_Rvir = Rvir[halo_indices]
+    
+    radii = vmap(single_inverse_CDF)(u_samples, sat_Rvir, sat_Rs, sat_c)
+    coordinates = jrandom.permutation(key_angles,SpherePoints)[:N_s_tot]    
+    sat_positions = coordinates * (radii / 1000)[:, None] + halo_centers[halo_indices]
+    
+    return sat_positions
 
 
-    max_N_s, tot_N_s = jnp.max(halo_N_s),jnp.sum(halo_N_s)
+# def spherical_NFW_satellites_positions(key, SpherePoints, halo_centers, halo_Rvir, halo_concentration, halo_N_s, N_halo):
 
-    key, subkey_r, subkey_theta = jrandom.split(key)
-    u_samples = random_uniform_jax(subkey_r,(N_halo, max_N_s))
 
-    # Create the mask: True where index < N_s[i]
-    indices = jnp.arange(max_N_s)
-    mask = indices[None, :] < halo_N_s[:, None]
+#     max_N_s, tot_N_s = jnp.max(halo_N_s),jnp.sum(halo_N_s)
 
-    # Zero out invalid entries (optional, only if needed; could also just use the mask)
-    # u_samples_padded = jnp.where(mask, u_samples, 0.0)
-    radius = NFW_radius(u_samples,halo_Rvir,halo_concentration,mask)
-    coordinates = jrandom.shuffle(subkey_theta,SpherePoints)[:tot_N_s]
+#     key, subkey_r, subkey_theta = jrandom.split(key)
+#     u_samples = random_uniform_jax(subkey_r,(N_halo, max_N_s))
 
-    sat_positions = halo_centers + radius*coordinates
-    return 
+#     # Create the mask: True where index < N_s[i]
+#     indices = jnp.arange(max_N_s)
+#     mask = indices[None, :] < halo_N_s[:, None]
+
+#     # Zero out invalid entries (optional, only if needed; could also just use the mask)
+#     # u_samples_padded = jnp.where(mask, u_samples, 0.0)
+#     radius = NFW_radius(u_samples,halo_Rvir,halo_concentration,mask)
+#     coordinates = jrandom.shuffle(subkey_theta,SpherePoints)[:tot_N_s]
+
+#     sat_positions = halo_centers + radius*coordinates
+#     return sat_positions
