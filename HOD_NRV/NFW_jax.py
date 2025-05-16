@@ -121,9 +121,8 @@ def spherical_NFW_satellites_positions(key,SpherePoints, halo_centers, Rvir, c, 
     N_s_tot = jnp.sum(N_s)
     Rs = Rvir / c
     
-    # Split keys for different random operations
-    key, key_radii, key_angles = jrandom.split(key, 3)
-    u_samples = random_uniform_jax(key_radii, (N_s_tot,))
+    key, key_r, key_theta = jrandom.split(key, 3)
+    u_samples = random_uniform_jax(key_r, (N_s_tot,))
     
     # Create arrays that map each satellite to its halo properties
     halo_indices = jnp.repeat(jnp.arange(num_halos), N_s,total_repeat_length=N_s_tot)
@@ -132,7 +131,7 @@ def spherical_NFW_satellites_positions(key,SpherePoints, halo_centers, Rvir, c, 
     sat_Rvir = Rvir[halo_indices]
     
     radii = vmap(single_inverse_CDF)(u_samples, sat_Rvir, sat_Rs, sat_c)
-    coordinates = jrandom.permutation(key_angles,SpherePoints)[:N_s_tot]    
+    coordinates = jrandom.permutation(key_theta,SpherePoints)[:N_s_tot]    
     sat_positions = coordinates * (radii / 1000)[:, None] + halo_centers[halo_indices]
     
     return sat_positions
