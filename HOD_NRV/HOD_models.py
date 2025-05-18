@@ -2,9 +2,8 @@ import jax.numpy as jnp
 import jax.random as jrandom
 import jax.scipy.special as jsp
 from jax import jit
-from .utils import * 
 from scipy.interpolate import CubicSpline as CS
-
+from .utils import gauss_legendre_integration
 
 sqrtpi = jnp.sqrt(2 * jnp.pi)
 
@@ -59,7 +58,7 @@ class Occupation:
 
     satellite_params = ["As", "Mmin", "M1", "alpha", "kappa"]
 
-    def __init__(self, hod_type,cosmo_params,z_snap):
+    def __init__(self, hod_type):
         if hod_type not in self.central_funcs:
             raise ValueError(f"Unknown HOD type: {hod_type}")
         self.hod_type = hod_type
@@ -69,9 +68,7 @@ class Occupation:
         params = {}
         #self.params = {key: params.get(key, None) for key in self.central_params + self.satellite_params}
         self.key = {key for key in self.central_params + self.satellite_params}
-        self.logM_bins = jnp.geomspace(10.6,15,10000)
-
-        self.mass_function = set_massfunction(cosmo_params,self.logM_bins,z=z_snap)
+ 
 
 
     def set_params(self, dict_params):

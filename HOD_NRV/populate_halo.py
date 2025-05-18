@@ -5,8 +5,8 @@ import jax.random as jrandom
 #import jax.numpy as jnp
 from .HOD_models import Occupation
 from .NFW_jax import create_point_on_unit_sphere
-from .utils import random_uniform_jax,random_poisson_jax
-
+from .utils import *
+import gc
 
 class halo_occupation:
     
@@ -14,13 +14,23 @@ class halo_occupation:
     This is the main class that populate dark halos of a dark matter simulation with galaxies
     """
 
-    def __init__(self, halo_path, cosmology, zeff):
+    def __init__(self, halo_path, cosmology, zeff,Lbox):
+        
+        df = pd.read_parquet(halo_path)
+        self.halo_catalogue = JaxDataSet(df)
 
-        self.halo = pd.read_parquet(halo_path)
         self.dict_cosmology = cosmology
-        self.Lbox = jnp.int(jnp.round(self.halo.x.values.max() - self.halo.y.values.min()),2)
+        self.Lbox = Lbox
         self.zeff = zeff
         self.SpherePoints = create_point_on_unit_sphere()
+        self.n_halos = len(self.halo_catalogue)
+
+        self.logM_bins = jnp.geomspace(10.6,15,10000)
+        self.mass_function = set_mass_function(self.dict_cosmology,self.logM_bins,z=zeff)
+
+        del df
+        gc.collect()
+        
 
     def set_halo_model(self,hod_type):
 
@@ -34,10 +44,24 @@ class halo_occupation:
         Set the HOD_models class.
         """
 
-        self.HOD = Occupation(hod_type,self.dict_cosmology,self.zeff)
+        self.HOD = Occupation(hod_type)
 
 
-    #def central_galaxies(self):
+    def populate_galaxies(self,dict_params):
+        
+        key = jrandom.key(np.random.uniform(0,int(1e32)))
+        key_c, key_s = jrandom.split(key=2)
+        probC,probS = self.HOD.compute_HOD_occupation(self.halo_catalogue.logM,dict_params)
+
+        rand_uniform = random_uniform_jax(key_c,self.n_halos)
+        rand_poisson = random_poisson_jax(key_s,probS)
+        
+        cond_central = probC > rand_uniform
+
+
+
+
+
 
 
 

@@ -68,37 +68,6 @@ def single_inverse_CDF(u,Rvir,Rs,c):
     cdf = NFW_CDF(rbins)
     return jnp.interp(u,cdf,rbins)
 
-@jit
-def NFW_radius(u_samples,Rvir,c,mask):
-
-    """
-    Parameters
-    ----------
-    u_samples : Array of shape (Ns_max, N_halo) with Ns_max = max(N_s) with N_s the number of satellites per halo,
-    and N_halo the total number of halo. random uniform distribution of points in [0,1]  
-    Rvir : Virial radius of th halos
-    c : Concentration of the halos
-    mask : boolean array of shape u_samples 
-    
-    Returns 
-    ---------- 
-    Return the randomly draw NFW radii.
-
-    """
-    Rs=Rvir/c
-    # vmap across satellites within each halo, then halos
-    batched_eval = vmap(
-        vmap(single_inverse_CDF,in_axes=(0, None, None, None)),  # over satellites
-        in_axes=(0, 0, 0, 0)  # over halos
-    )
-    
-    r_samples = batched_eval(u_samples,Rvir,Rs,c)
-
-    # Optionally mask padded outputs
-    r_samples = jnp.where(mask, r_samples, jnp.nan)
-    return r_samples
-
-
 
 @partial(jit,static_argnames=['N_s_tot'])
 def spherical_NFW_satellites_positions(key,SpherePoints, halo_centers, Rvir, c, N_s, N_s_tot):
@@ -118,7 +87,6 @@ def spherical_NFW_satellites_positions(key,SpherePoints, halo_centers, Rvir, c, 
     sat_positions : Array with satellite positions
     """
     num_halos = len(Rvir)
-    N_s_tot = jnp.sum(N_s)
     Rs = Rvir / c
     
     key, key_r, key_theta = jrandom.split(key, 3)
@@ -137,22 +105,14 @@ def spherical_NFW_satellites_positions(key,SpherePoints, halo_centers, Rvir, c, 
     return sat_positions
 
 
-# def spherical_NFW_satellites_positions(key, SpherePoints, halo_centers, halo_Rvir, halo_concentration, halo_N_s, N_halo):
+@partial(jit,static_argnames=['N_s_tot'])
+def dispersion_velocities_satellites(key, halo_velocities, vrms_h, N_s, N_s_tot):
+    num_halos = len(halo_velocities)
 
-
-#     max_N_s, tot_N_s = jnp.max(halo_N_s),jnp.sum(halo_N_s)
-
-#     key, subkey_r, subkey_theta = jrandom.split(key)
-#     u_samples = random_uniform_jax(subkey_r,(N_halo, max_N_s))
-
-#     # Create the mask: True where index < N_s[i]
-#     indices = jnp.arange(max_N_s)
-#     mask = indices[None, :] < halo_N_s[:, None]
-
-#     # Zero out invalid entries (optional, only if needed; could also just use the mask)
-#     # u_samples_padded = jnp.where(mask, u_samples, 0.0)
-#     radius = NFW_radius(u_samples,halo_Rvir,halo_concentration,mask)
-#     coordinates = jrandom.shuffle(subkey_theta,SpherePoints)[:tot_N_s]
-
-#     sat_positions = halo_centers + radius*coordinates
-#     return sat_positions
+    indices = jnp.repeat(jnp.arange(num_halos), N_s,total_repeat_length=N_s_tot)
+    sig = vrms_h[indices] * 0.577
+    key_vx, key_vy, key_vz = jrandom.split(key, 3)
+    vx_sat = jrandom.normal(key_vx, shape=(len(indices),)) * sig + halo_velocities[indices, 0]
+    vy_sat = jrandom.normal(key_vy, shape=(len(indices),)) * sig + halo_velocities[indices, 1]
+    vz_sat = jrandom.normal(key_vz, shape=(len(indices),)) * sig + halo_velocities[indices, 2]
+    return jnp.column_stack([vx_sat, vy_sat, vz_sat])

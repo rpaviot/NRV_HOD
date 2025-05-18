@@ -8,7 +8,7 @@ from colossus.lss import mass_function
 from scipy.special import roots_legendre
 from functools import partial
 
-#Precision for DeltaSigma estimation.
+#Precision for integration.
 n_legendre = 200
 x_legendre, w_legendre = roots_legendre(n_legendre)
 
@@ -21,11 +21,14 @@ def gauss_legendre_integration(f, a, b, **kwargs):
     return integral
 
 
-def set_massfunction(dict_cosmology,logM, z):
+def set_mass_function(dict_cosmology,logM, z):
     ##Colossus mass function. Will be replace by pyccl mass function in the future.
     cosmo = cosmology.setCosmology('myCosmo', dict_cosmology)
     dndlogM = mass_function.massFunction(10**logM, z , mdef = 'vir', model = 'tinker08', q_out = 'dndlnM')
     return dndlogM*np.log(10)
+
+def process_parquet_catalogue(catalogue):
+    print("ok")
 
 
 @njit(parallel=True, fastmath=True)
@@ -51,3 +54,34 @@ def random_uniform_jax(key,size,a=0,b=1):
 def random_poisson_jax(key,prob):
     result = jrandom.poisson(key,prob, (prob.shape[0],))
     return result
+
+
+class JaxDataSet:
+    def __init__(self, df: DataFrame, columns=None):
+        object.__setattr__(self, '_columns', [])
+
+        # Use specified columns or all if None
+        if columns is None:
+            columns = df.columns
+        else:
+            columns = list(columns)
+
+        for col in columns:
+            setattr(self, col, jnp.array(df[col].values))
+
+    def __setattr__(self, name, value):
+        if not name.startswith('_') and isinstance(value, jnp.ndarray):
+            if name not in self._columns:
+                self._columns.append(name)
+        object.__setattr__(self, name, value)
+
+    def __getitem__(self, mask):
+        out = JaxDataSet.__new__(JaxDataSet)
+        object.__setattr__(out, '_columns', self._columns.copy())
+        for col in self._columns:
+            setattr(out, col, getattr(self, col)[mask])
+        return out
+
+    @property
+    def columns(self):
+        return self._columns
