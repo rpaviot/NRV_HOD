@@ -7,6 +7,7 @@ from colossus.cosmology import cosmology
 from colossus.lss import mass_function
 from scipy.special import roots_legendre
 from functools import partial
+import pandas as pd
 
 #Precision for integration.
 n_legendre = 200
@@ -57,7 +58,7 @@ def random_poisson_jax(key,prob):
 
 
 class JaxDataSet:
-    def __init__(self, df: DataFrame, columns=None):
+    def __init__(self, df: pd.DataFrame, columns=None):
         object.__setattr__(self, '_columns', [])
 
         # Use specified columns or all if None
@@ -70,7 +71,7 @@ class JaxDataSet:
             setattr(self, col, jnp.array(df[col].values))
 
     def __setattr__(self, name, value):
-        if not name.startswith('_') and isinstance(value, jnp.ndarray):
+        if isinstance(value, jnp.ndarray):
             if name not in self._columns:
                 self._columns.append(name)
         object.__setattr__(self, name, value)

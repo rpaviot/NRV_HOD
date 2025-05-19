@@ -48,6 +48,10 @@ def compute_fsat_(logM,mass_function,probC,probS):
     nsat = gauss_legendre_integration(func_intg,logM.min(),logM.max())
     return nsat/ngal
 
+def assembly_bias_mass(logM,A,B,IntrinsicProperty,ExternalProperty):
+    return logM + A*IntrinsicProperty + B*ExternalProperty
+
+
     
 class Occupation:
     central_funcs = {
@@ -56,38 +60,59 @@ class Occupation:
         "ELG_SFR": (ELG_SFR, ["Ac", "Mmin", "sig_M", "gamma"]),
     }
 
-    satellite_params = ["As", "Mmin", "M1", "alpha", "kappa"]
+    satellite_params=["As", "Mmin", "M1", "alpha", "kappa"]
+    assembly_bias_params=['A_cent','B_cent','A_sat','B_sat']
 
-    def __init__(self, hod_type):
+    logM_bins = jnp.geomspace(10.6,15,10000)
+
+    def __init__(self, hod_type,assembly_bias=False,fI=None,fE=None):
+
         if hod_type not in self.central_funcs:
-            raise ValueError(f"Unknown HOD type: {hod_type}")
+            raise AttributeError(f"Unknown HOD type: {hod_type}")
+        
         self.hod_type = hod_type
         self.HOD_central, self.central_params = self.central_funcs[hod_type]
         self.HOD_satellite = HOD_satellite
+        self.assembly_bias = assembly_bias
+
+        if self.assembly_bias:
+            if fI is None or fE is None:
+                raise AttributeError("At least one internal or external halo proprieties have to be defined to model \
+                                     assembly bias")
+            self.key = set(self.central_params + self.satellite_params + self.assembly_bias_params)
+        else:
+            self.key = set(self.central_params + self.satellite_params)
+
+        self.fI=fI
+        self.fE=fE
         
-        params = {}
-        #self.params = {key: params.get(key, None) for key in self.central_params + self.satellite_params}
-        self.key = {key for key in self.central_params + self.satellite_params}
- 
-
-
     def set_params(self, dict_params):
         try:
             [dict_params[key] for key in self.key]
         except KeyError as e:
-            raise ValueError(f"Missing an argument: {e.args[0]}")
+            raise KeyError(f"Missing an argument: {e.args[0]}")
+
         self.central_args, self.satellite_args = (
             [dict_params[key] for key in self.central_params],
             [dict_params[key] for key in self.satellite_params])
         
         self.params = dict_params
+
+        if self.assembly_bias:
+            id_cent = self.central_params.index("Mmin"),self.satellite_params.index("M1")
+            Mmin_mod = assembly_bias_mass(dict_params["Mmin"],dict_params["Acent"],dict_params["Bcent"],self.fI,self.fE)
+            self.central_args[id_cent] = Mmin_mod
+            if self.satellite_bias:
+                id_sat = self.satellite_params.index("M1")
+                M1_mod = assembly_bias_mass(dict_params["M1"],dict_params["Asat"],dict_params["Bsat"],self.fI,self.fE)
+                self.satellite_args[id_sat] = M1_mod
         
-        
+
+
     def compute_HOD_occupation(self,logM,dict_params):
         self.set_params(dict_params)
         probC = self.HOD_central(logM, *self.central_args)
         probS = self.HOD_satellite(logM, *self.satellite_args)
-    
         return probC,probS
     
     def compute_ngal(self,dict_params):

@@ -17,15 +17,13 @@ class halo_occupation:
     def __init__(self, halo_path, cosmology, zeff,Lbox):
         
         df = pd.read_parquet(halo_path)
-        self.halo_catalogue = JaxDataSet(df)
+        self.halo = JaxDataSet(df)
 
         self.dict_cosmology = cosmology
         self.Lbox = Lbox
         self.zeff = zeff
         self.SpherePoints = create_point_on_unit_sphere()
         self.n_halos = len(self.halo_catalogue)
-
-        self.logM_bins = jnp.geomspace(10.6,15,10000)
         self.mass_function = set_mass_function(self.dict_cosmology,self.logM_bins,z=zeff)
 
         del df
@@ -56,7 +54,10 @@ class halo_occupation:
         rand_uniform = random_uniform_jax(key_c,self.n_halos)
         rand_poisson = random_poisson_jax(key_s,probS)
         
-        cond_central = probC > rand_uniform
+        halo_cent = self.halo[probC > rand_uniform]
+        halo_sat = self.halo[rand_poisson > 0]
+
+
 
 
 
