@@ -22,7 +22,9 @@ class halo_occupation:
         self.dict_cosmology = cosmology
         self.Lbox = Lbox
         self.zeff = zeff
-        self.SpherePoints = create_point_on_unit_sphere()
+
+        key = jrandom.key(0)
+        self.SpherePoints = create_point_on_unit_sphere(key)
         self.n_halos = len(self.halo_catalogue)
         self.mass_function = set_mass_function(self.dict_cosmology,self.logM_bins,z=zeff)
 
@@ -56,6 +58,7 @@ class halo_occupation:
         
         halo_cent = self.halo[probC > rand_uniform]
         halo_sat = self.halo[rand_poisson > 0]
+
 
 
 

@@ -28,9 +28,6 @@ def set_mass_function(dict_cosmology,logM, z):
     dndlogM = mass_function.massFunction(10**logM, z , mdef = 'vir', model = 'tinker08', q_out = 'dndlnM')
     return dndlogM*np.log(10)
 
-def process_parquet_catalogue(catalogue):
-    print("ok")
-
 
 @njit(parallel=True, fastmath=True)
 def random_uniform_numba(n,a=0,b=1):
