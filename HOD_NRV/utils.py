@@ -22,10 +22,10 @@ def gauss_legendre_integration(f, a, b, **kwargs):
     return integral
 
 
-def set_mass_function(dict_cosmology,logM, z):
+def set_mass_function(dict_cosmology,logM, z,mass_definition):
     ##Colossus mass function. Will be replace by pyccl mass function in the future.
     cosmo = cosmology.setCosmology('myCosmo', dict_cosmology)
-    dndlogM = mass_function.massFunction(10**logM, z , mdef = 'vir', model = 'tinker08', q_out = 'dndlnM')
+    dndlogM = mass_function.massFunction(10**logM, z , mdef = mass_definition, model = 'tinker08', q_out = 'dndlnM')
     return dndlogM*np.log(10)
 
 
@@ -75,10 +75,17 @@ class JaxDataSet:
 
     def __getitem__(self, mask):
         out = JaxDataSet.__new__(JaxDataSet)
-        object.__setattr__(out, '_columns', self._columns.copy())
+        object.__setattr__(out, '_columns', self._columns)  # or .copy() if you modify it elsewhere
         for col in self._columns:
-            setattr(out, col, getattr(self, col)[mask])
+            object.__setattr__(out, col, getattr(self, col)[mask])
         return out
+
+    # def __getitem__(self, mask):
+    #     out = JaxDataSet.__new__(JaxDataSet)
+    #     object.__setattr__(out, '_columns', self._columns.copy())
+    #     for col in self._columns:
+    #         setattr(out, col, getattr(self, col)[mask])
+    #     return out
 
     @property
     def columns(self):

@@ -63,22 +63,19 @@ class Occupation:
     satellite_params=["As", "Mmin", "M1", "alpha", "kappa"]
     assembly_bias_params=['A_cent','B_cent','A_sat','B_sat']
 
-    logM_bins = jnp.geomspace(10.6,15,10000)
-
-    def __init__(self, hod_type,assembly_bias=False,fI=None,fE=None):
+    def __init__(self, hod_type,logM_bins,mass_function,assembly_bias=False,fI=None,fE=None):
 
         if hod_type not in self.central_funcs:
             raise AttributeError(f"Unknown HOD type: {hod_type}")
         
+        self.logM_bins = logM_bins
+        self.mass_function=mass_function
         self.hod_type = hod_type
         self.HOD_central, self.central_params = self.central_funcs[hod_type]
         self.HOD_satellite = HOD_satellite
         self.assembly_bias = assembly_bias
 
         if self.assembly_bias:
-            if fI is None or fE is None:
-                raise AttributeError("At least one internal or external halo proprieties have to be defined to model \
-                                     assembly bias")
             self.key = set(self.central_params + self.satellite_params + self.assembly_bias_params)
         else:
             self.key = set(self.central_params + self.satellite_params)
@@ -106,8 +103,7 @@ class Occupation:
                 id_sat = self.satellite_params.index("M1")
                 M1_mod = assembly_bias_mass(dict_params["M1"],dict_params["Asat"],dict_params["Bsat"],self.fI,self.fE)
                 self.satellite_args[id_sat] = M1_mod
-        
-
+    
 
     def compute_HOD_occupation(self,logM,dict_params):
         self.set_params(dict_params)

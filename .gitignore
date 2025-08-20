@@ -172,3 +172,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+test_sim.ipynb
+create_virtual_snapshot.py
+downsample.py 
+flamingo_0057_downsampled.hdf5
