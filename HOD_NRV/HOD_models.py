@@ -34,6 +34,33 @@ def HOD_satellite(logM, As, Mmin, M1, alpha, kappa):
     Nsat = jnp.where(logM > Mmin + jnp.log10(kappa),Nsat,0)
     return Nsat
 
+@jit
+def HOD_satellite_conformity(logM, As, Mmin, M1, alpha, kappa, M1_EE, has_central):
+    """
+    AbacusHOD-style conformity: satellite occupation depends on central presence
+    
+    Parameters
+    ----------
+    logM : halo mass
+    As : satellite amplitude
+    Mmin : minimum mass for centrals
+    M1 : standard satellite mass scale  
+    alpha : satellite power law index
+    kappa : satellite cutoff parameter
+    M1_EE : satellite mass scale when ELG central present
+    has_central : boolean array indicating central presence
+    
+    Returns
+    -------
+    Satellite occupation probability
+    """
+    # Use different M1 based on central presence
+    M1_eff = jnp.where(has_central, M1_EE, M1)
+    
+    Nsat = As * jnp.power((10**logM - kappa*10**Mmin) / (10**M1_eff), alpha)
+    Nsat = jnp.where(logM > Mmin + jnp.log10(kappa), Nsat, 0)
+    return Nsat
+
 
 def compute_ngal_(logM,mass_function,probC,probS):
     integrand = mass_function*(probC + probS)
@@ -61,9 +88,10 @@ class Occupation:
     }
 
     satellite_params=["As", "Mmin", "M1", "alpha", "kappa"]
+    satellite_conformity_params=["As", "Mmin", "M1", "alpha", "kappa", "M1_EE"]
     assembly_bias_params=['A_cent','B_cent','A_sat','B_sat']
 
-    def __init__(self, hod_type,logM_bins,mass_function,assembly_bias=False,fI=None,fE=None):
+    def __init__(self, hod_type,logM_bins,mass_function,assembly_bias=False,conformity=False,fI=None,fE=None):
 
         if hod_type not in self.central_funcs:
             raise AttributeError(f"Unknown HOD type: {hod_type}")
@@ -72,13 +100,21 @@ class Occupation:
         self.mass_function=mass_function
         self.hod_type = hod_type
         self.HOD_central, self.central_params = self.central_funcs[hod_type]
-        self.HOD_satellite = HOD_satellite
         self.assembly_bias = assembly_bias
+        self.conformity = conformity
+        
+        # Set satellite function and parameters based on conformity
+        if self.conformity:
+            self.HOD_satellite = HOD_satellite_conformity
+            sat_params = self.satellite_conformity_params
+        else:
+            self.HOD_satellite = HOD_satellite
+            sat_params = self.satellite_params
 
         if self.assembly_bias:
-            self.key = set(self.central_params + self.satellite_params + self.assembly_bias_params)
+            self.key = set(self.central_params + sat_params + self.assembly_bias_params)
         else:
-            self.key = set(self.central_params + self.satellite_params)
+            self.key = set(self.central_params + sat_params)
 
         self.fI=fI
         self.fE=fE
@@ -89,9 +125,12 @@ class Occupation:
         except KeyError as e:
             raise KeyError(f"Missing an argument: {e.args[0]}")
 
+        # Set satellite parameter list based on conformity
+        sat_params = self.satellite_conformity_params if self.conformity else self.satellite_params
+        
         self.central_args, self.satellite_args = (
             [dict_params[key] for key in self.central_params],
-            [dict_params[key] for key in self.satellite_params])
+            [dict_params[key] for key in sat_params])
         
         self.params = dict_params
 
@@ -105,11 +144,33 @@ class Occupation:
                 self.satellite_args[id_sat] = M1_mod
     
 
-    def compute_HOD_occupation(self,logM,dict_params):
+    def compute_HOD_occupation(self,logM,dict_params,has_central=None):
         self.set_params(dict_params)
         probC = self.HOD_central(logM, *self.central_args)
-        probS = self.HOD_satellite(logM, *self.satellite_args)
+        
+        if self.conformity and has_central is not None:
+            # For conformity, use the actual central realization
+            probS = self.HOD_satellite(logM, *self.satellite_args, has_central)
+        else:
+            probS = self.HOD_satellite(logM, *self.satellite_args)
+            
         return probC,probS
+    
+    def compute_central_occupation(self,logM,dict_params):
+        self.set_params(dict_params)
+        probC = self.HOD_central(logM, *self.central_args)
+        return probC
+    
+    def compute_satellite_occupation(self,logM,dict_params,has_central=None):
+        self.set_params(dict_params)
+        
+        if self.conformity and has_central is not None:
+            # For conformity, use the actual central realization
+            probS = self.HOD_satellite(logM, *self.satellite_args, has_central)
+        else:
+            probS = self.HOD_satellite(logM, *self.satellite_args)
+            
+        return probS
     
     def compute_ngal(self,dict_params):
         probC,probS = self.compute_HOD_occupation(self.logM_bins,dict_params)

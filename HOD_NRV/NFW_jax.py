@@ -241,3 +241,170 @@ def dispersion_velocities_satellites(key, halo_velocities, vrms_h, N_s, N_s_tot)
     vy_sat = jrandom.normal(key_vy, shape=(len(indices),)) * sig + halo_velocities[indices, 1]
     vz_sat = jrandom.normal(key_vz, shape=(len(indices),)) * sig + halo_velocities[indices, 2]
     return jnp.stack([vx_sat, vy_sat, vz_sat],axis=-1)
+
+
+@jit
+def exponential_profile_CDF(r, tau, Rs):
+    """
+    CDF for exponential profile: dN(r)/dr = exp(-r/(tau*Rs))
+    
+    Parameters
+    ----------
+    r : radius
+    tau : exponential slope parameter
+    Rs : scale radius
+    
+    Returns
+    -------
+    CDF value
+    """
+    return 1.0 - jnp.exp(-r / (tau * Rs))
+
+
+@jit
+def single_exponential_inverse_CDF(u, tau, Rs, Rmax):
+    """
+    Inverse CDF for exponential profile
+    
+    Parameters
+    ----------
+    u : uniform random variable [0,1]
+    tau : exponential slope parameter  
+    Rs : scale radius
+    Rmax : maximum radius cutoff
+    
+    Returns
+    -------
+    radius sample
+    """
+    # For exponential: CDF = 1 - exp(-r/(tau*Rs))
+    # Inverse: r = -tau*Rs * ln(1 - u)
+    # But we need to account for truncation at Rmax
+    u_max = exponential_profile_CDF(Rmax, tau, Rs)
+    u_scaled = u * u_max  # Scale u to [0, u_max]
+    return -tau * Rs * jnp.log(1.0 - u_scaled)
+
+
+@partial(jit, static_argnames=['N_s_tot'])
+def extended_NFW_satellites_positions(key, SpherePoints, halo_centers, Rvir, c, N_s, N_s_tot,
+                                     f_exp=0.0, tau=6.0, lambda_NFW=1.0):
+    """
+    Generate satellite positions using extended NFW profile:
+    - fraction f_exp follow exponential decay beyond virial radius
+    - remaining follow rescaled NFW with lambda_NFW scaling
+    
+    Parameters
+    ----------
+    key : PRNG key
+    SpherePoints : precomputed unit sphere points
+    halo_centers : (num_halos, 3) halo positions
+    Rvir : (num_halos,) virial radii  
+    c : (num_halos,) concentrations
+    N_s : (num_halos,) number of satellites per halo
+    N_s_tot : int, total satellites
+    f_exp : float, fraction using exponential profile
+    tau : float, exponential slope parameter
+    lambda_NFW : float, NFW rescaling factor
+    
+    Returns
+    -------
+    sat_positions : (N_s_tot, 3) satellite positions
+    """
+    num_halos = len(Rvir)
+    Rs = Rvir / c
+    
+    # Split satellites into exponential and NFW components
+    key_comp, key_exp, key_theta = jrandom.split(key, 3)
+    
+    # Determine which satellites use which profile
+    component_choice = random_uniform_jax(key_comp, (N_s_tot,))
+    use_exponential = component_choice < f_exp
+    
+    # Map satellites to halo properties
+    halo_indices = jnp.repeat(jnp.arange(num_halos), N_s, total_repeat_length=N_s_tot)
+    sat_Rs = Rs[halo_indices]
+    sat_c = c[halo_indices]
+    sat_Rvir = Rvir[halo_indices]
+    
+    # Generate radii for each component
+    u_samples = random_uniform_jax(key_exp, (N_s_tot,))
+    
+    # Exponential component radii (can extend beyond Rvir)
+    Rmax_exp = sat_Rvir * 3.0  # Allow extension to 3*Rvir
+    radii_exp = vmap(single_exponential_inverse_CDF)(
+        u_samples, tau, sat_Rs, Rmax_exp
+    )
+    
+    # NFW component radii (rescaled by lambda_NFW)
+    Rs_scaled = sat_Rs / lambda_NFW
+    c_scaled = sat_c * lambda_NFW
+    radii_nfw = vmap(single_inverse_CDF)(u_samples, sat_Rvir, Rs_scaled, c_scaled)
+    
+    # Select appropriate radii based on component choice
+    radii = jnp.where(use_exponential, radii_exp, radii_nfw)
+    
+    # Generate directions and positions
+    directions = jrandom.permutation(key_theta, SpherePoints)[:N_s_tot]
+    sat_positions = directions * (radii / 1000)[:, None] + halo_centers[halo_indices]
+    
+    return sat_positions
+
+
+@partial(jit, static_argnames=['N_s_tot'])
+def extended_elliptical_NFW_satellites_positions(key, SpherePoints, halo_centers, Rvir, c, 
+                                                shapes, axis_ratios, N_s, N_s_tot,
+                                                f_exp=0.0, tau=6.0, lambda_NFW=1.0):
+    """
+    Extended elliptical NFW with exponential component and NFW rescaling
+    
+    Parameters same as extended_NFW_satellites_positions plus:
+    shapes : (num_halos, 3, 3) rotation matrices
+    axis_ratios : (num_halos, 2) [b/a, c/a] ratios
+    """
+    num_halos = len(Rvir)
+    Rs = Rvir / c
+    
+    # Component selection
+    key_comp, key_exp, key_dir = jrandom.split(key, 3)
+    component_choice = random_uniform_jax(key_comp, (N_s_tot,))
+    use_exponential = component_choice < f_exp
+    
+    # Satellite-to-halo mapping
+    halo_indices = jnp.repeat(jnp.arange(num_halos), N_s, total_repeat_length=N_s_tot)
+    sat_Rs = Rs[halo_indices]
+    sat_c = c[halo_indices]
+    sat_Rvir = Rvir[halo_indices]
+    
+    # Generate radii
+    u_samples = random_uniform_jax(key_exp, (N_s_tot,))
+    
+    # Exponential radii
+    Rmax_exp = sat_Rvir * 3.0
+    radii_exp = vmap(single_exponential_inverse_CDF)(
+        u_samples, tau, sat_Rs, Rmax_exp
+    )
+    
+    # Rescaled NFW radii
+    Rs_scaled = sat_Rs / lambda_NFW
+    c_scaled = sat_c * lambda_NFW
+    radii_nfw = vmap(single_inverse_CDF)(u_samples, sat_Rvir, Rs_scaled, c_scaled)
+    
+    radii_m = jnp.where(use_exponential, radii_exp, radii_nfw)
+    
+    # Apply elliptical transformation
+    directions = jrandom.permutation(key_dir, SpherePoints)[:N_s_tot]
+    
+    R_per_sat = shapes[halo_indices]
+    ar_per_sat = axis_ratios[halo_indices]
+    b_over_a = ar_per_sat[:, 0]
+    c_over_a = ar_per_sat[:, 1]
+    
+    scale_vectors = jnp.stack([jnp.ones_like(b_over_a), b_over_a, c_over_a], axis=-1)
+    D_times_u = scale_vectors * directions
+    
+    D_times_u_exp = D_times_u[:, :, None]
+    rotated = jnp.matmul(R_per_sat, D_times_u_exp)[:, :, 0]
+    
+    sat_positions = rotated * radii_m[:, None] / 1000.0 + halo_centers[halo_indices]
+    
+    return sat_positions
