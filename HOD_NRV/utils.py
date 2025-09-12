@@ -40,6 +40,7 @@ def random_uniform_numba(n,a=0,b=1):
 def random_poisson_numba(prob):
     n = len(prob)
     result = np.zeros(n)
+    
     for i in prange(n):
         result[i] = np.random.poisson(prob[i])
     return result
