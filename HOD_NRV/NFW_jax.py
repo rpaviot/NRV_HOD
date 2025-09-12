@@ -5,7 +5,9 @@ from jax import jit,vmap
 from .utils import * 
 from numba import vectorize, njit, prange
 from functools import partial
-
+from dataclasses import dataclass
+from abc import ABC, abstractmethod
+from typing import Optional
 
 def sample_unit_sphere_jax(key_theta,key_phi, N):
     """
@@ -339,3 +341,170 @@ def extended_elliptical_NFW_satellites_positions(key, SpherePoints, halo_centers
     sat_positions = rotated * radii_m[:, None] / 1000.0 + halo_centers[halo_indices]
     
     return sat_positions
+
+
+# =============================================================================
+# Strategy Pattern for Satellite Positioning
+# =============================================================================
+
+
+@dataclass
+class SatellitePositioningStrategy(ABC):
+    """
+    Abstract base class for satellite positioning strategies.
+    
+    This class defines the interface for different NFW positioning algorithms,
+    allowing for clean separation of positioning logic and easy extension.
+    """
+    
+    @abstractmethod
+    def position_satellites(self, 
+                          key: jrandom.PRNGKey,
+                          SpherePoints: jnp.ndarray,
+                          halo_centers: jnp.ndarray,
+                          Rvir: jnp.ndarray,
+                          c: jnp.ndarray,
+                          N_s: jnp.ndarray,
+                          N_s_tot: int,
+                          **kwargs) -> jnp.ndarray:
+        """Position satellites using this strategy's algorithm."""
+        pass
+
+
+@dataclass
+class SphericalNFWStrategy(SatellitePositioningStrategy):
+    """Strategy for standard spherical NFW satellite positioning."""
+    
+    def position_satellites(self, key, SpherePoints, halo_centers, Rvir, c, N_s, N_s_tot, **kwargs):
+        return spherical_NFW_satellites_positions(key, SpherePoints, halo_centers, Rvir, c, N_s, N_s_tot)
+
+
+@dataclass  
+class EllipticalNFWStrategy(SatellitePositioningStrategy):
+    """Strategy for triaxial/elliptical NFW satellite positioning."""
+    
+    def position_satellites(self, key, SpherePoints, halo_centers, Rvir, c, N_s, N_s_tot, shapes, ratios, **kwargs):
+        return elliptical_NFW_satellites_positions(key, SpherePoints, halo_centers, Rvir, c, shapes, ratios, N_s, N_s_tot)
+
+
+@dataclass
+class ExtendedNFWStrategy(SatellitePositioningStrategy):
+    """Strategy for extended NFW satellite positioning with exponential component."""
+    
+    def position_satellites(self, key, SpherePoints, halo_centers, Rvir, c, N_s, N_s_tot, f_exp, tau, lambda_NFW, **kwargs):
+        return extended_NFW_satellites_positions(key, SpherePoints, halo_centers, Rvir, c, N_s, N_s_tot, 
+                                               f_exp=f_exp, tau=tau, lambda_NFW=lambda_NFW)
+
+
+@dataclass
+class ExtendedEllipticalNFWStrategy(SatellitePositioningStrategy):
+    """Strategy for extended elliptical NFW satellite positioning."""
+    
+    def position_satellites(self, key, SpherePoints, halo_centers, Rvir, c, N_s, N_s_tot, 
+                          shapes, ratios, f_exp, tau, lambda_NFW, **kwargs):
+        return extended_elliptical_NFW_satellites_positions(key, SpherePoints, halo_centers, Rvir, c, 
+                                                          shapes, ratios, N_s, N_s_tot, 
+                                                          f_exp=f_exp, tau=tau, lambda_NFW=lambda_NFW)
+
+
+def position_satellites(key: jrandom.PRNGKey,
+                       SpherePoints: jnp.ndarray,
+                       halo_centers: jnp.ndarray,
+                       Rvir: jnp.ndarray,
+                       c: jnp.ndarray,
+                       N_s: jnp.ndarray,
+                       N_s_tot: int,
+                       triaxial_NFW: bool = False,
+                       shapes: Optional[jnp.ndarray] = None,
+                       ratios: Optional[jnp.ndarray] = None,
+                       f_exp: float = 0.0,
+                       tau: float = 6.0,
+                       lambda_NFW: float = 1.0) -> jnp.ndarray:
+    """
+    Unified interface for satellite positioning using appropriate NFW strategy.
+    
+    Automatically selects and applies the correct positioning strategy based on
+    the provided parameters. This function eliminates the need for complex
+    conditional logic in calling code.
+    
+    Parameters
+    ----------
+    key : jax.random.PRNGKey
+        Random key for satellite position sampling
+    SpherePoints : jnp.ndarray
+        Pre-generated points on unit sphere for directional sampling
+    halo_centers : jnp.ndarray, shape (N_halos, 3)
+        Halo center positions [Mpc/h]
+    Rvir : jnp.ndarray, shape (N_halos,)
+        Halo virial radii [Mpc/h]
+    c : jnp.ndarray, shape (N_halos,)
+        Halo concentration parameters
+    N_s : jnp.ndarray, shape (N_halos,)
+        Number of satellites per halo
+    N_s_tot : int
+        Total number of satellites across all halos
+    triaxial_NFW : bool, default=False
+        Whether to use triaxial (elliptical) NFW profiles
+    shapes : jnp.ndarray, optional, shape (N_halos, 3, 3)
+        Halo orientation matrices for triaxial profiles
+    ratios : jnp.ndarray, optional, shape (N_halos, 2)
+        Axis ratios [b/a, c/a] for triaxial profiles
+    f_exp : float, default=0.0
+        Exponential component fraction [0, 1] for extended profiles
+    tau : float, default=6.0
+        Exponential decay scale in units of Rs for extended profiles
+    lambda_NFW : float, default=1.0
+        NFW profile rescaling factor for extended profiles
+        
+    Returns
+    -------
+    sat_positions : jnp.ndarray, shape (N_s_tot, 3)
+        Satellite galaxy positions [Mpc/h]
+        
+    Examples
+    --------
+    >>> # Standard spherical NFW
+    >>> positions = position_satellites(key, sphere_points, centers, rvir, conc, n_sats, n_tot)
+    >>> 
+    >>> # Extended elliptical NFW
+    >>> positions = position_satellites(key, sphere_points, centers, rvir, conc, n_sats, n_tot,
+    ...                               triaxial_NFW=True, shapes=shapes, ratios=ratios,
+    ...                               f_exp=0.2, lambda_NFW=1.5)
+    
+    Notes
+    -----
+    Strategy selection is automatic based on parameters:
+    - Extended profiles used when f_exp > 0 or lambda_NFW ≠ 1
+    - Elliptical profiles used when triaxial_NFW = True
+    - This gives 4 possible strategies: spherical, elliptical, extended, extended+elliptical
+    
+    All individual NFW positioning functions remain available for direct use
+    if needed for specific applications.
+    """
+    # Strategy selection logic
+    use_extended = (f_exp > 0.0 or lambda_NFW != 1.0)
+    
+    if use_extended and triaxial_NFW:
+        strategy = ExtendedEllipticalNFWStrategy()
+    elif use_extended:
+        strategy = ExtendedNFWStrategy()
+    elif triaxial_NFW:
+        strategy = EllipticalNFWStrategy()
+    else:
+        strategy = SphericalNFWStrategy()
+    
+    # Execute strategy with all parameters
+    return strategy.position_satellites(
+        key=key,
+        SpherePoints=SpherePoints,
+        halo_centers=halo_centers,
+        Rvir=Rvir,
+        c=c,
+        N_s=N_s,
+        N_s_tot=N_s_tot,
+        shapes=shapes,
+        ratios=ratios,
+        f_exp=f_exp,
+        tau=tau,
+        lambda_NFW=lambda_NFW
+    )

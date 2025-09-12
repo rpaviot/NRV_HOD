@@ -135,12 +135,18 @@ class Occupation:
         self.params = dict_params
 
         if self.assembly_bias:
-            id_cent = self.central_params.index("Mmin"),self.satellite_params.index("M1")
-            Mmin_mod = assembly_bias_mass(dict_params["Mmin"],dict_params["Acent"],dict_params["Bcent"],self.fI,self.fE)
-            self.central_args[id_cent] = Mmin_mod
-            if self.satellite_bias:
-                id_sat = self.satellite_params.index("M1")
-                M1_mod = assembly_bias_mass(dict_params["M1"],dict_params["Asat"],dict_params["Bsat"],self.fI,self.fE)
+            # Apply assembly bias to central occupation (Mmin modification)
+            if "Mmin" in self.central_params:
+                id_cent = self.central_params.index("Mmin")
+                Mmin_mod = assembly_bias_mass(dict_params["Mmin"], dict_params["A_cent"], 
+                                            dict_params["B_cent"], self.fI, self.fE)
+                self.central_args[id_cent] = Mmin_mod
+            
+            # Apply assembly bias to satellite occupation (M1 modification)
+            if "M1" in sat_params:
+                id_sat = sat_params.index("M1")
+                M1_mod = assembly_bias_mass(dict_params["M1"], dict_params["A_sat"], 
+                                          dict_params["B_sat"], self.fI, self.fE)
                 self.satellite_args[id_sat] = M1_mod
     
 

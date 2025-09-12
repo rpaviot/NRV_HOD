@@ -325,9 +325,9 @@ def setup_assembly_bias_data(df: pd.DataFrame,
         
     Returns
     -------
-    fA : jnp.ndarray or None, shape (N,)
+    fI: jnp.ndarray or None, shape (N,)
         Intrinsic property values for assembly bias
-    fB : jnp.ndarray or None, shape (N,)  
+    fE : jnp.ndarray or None, shape (N,)  
         External property values for assembly bias
         
     Raises
@@ -351,10 +351,10 @@ def setup_assembly_bias_data(df: pd.DataFrame,
     if 'fI' not in cm and 'fE' not in cm:
         raise AttributeError("Assembly bias is enabled but 'fI' AND 'fE' are missing in column mapping.")
     
-    fA = jnp.array(df[cm['fI']]) if 'fI' in cm else None
-    fB = jnp.array(df[cm['fE']]) if 'fE' in cm else None
+    fI = jnp.array(df[cm['fI']]) if 'fI' in cm else None
+    fE = jnp.array(df[cm['fE']]) if 'fE' in cm else None
     
-    return fA, fB
+    return fI,fE
 
 
 def apply_rsd_preprocessing(positions: jnp.ndarray,

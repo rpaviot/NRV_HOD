@@ -14,8 +14,6 @@ def random_orthonormal_basis(seed=None):
         Q[:, 0] *= -1.0
     return Q
 
-
-
 def spherical_nfw_null_test():
     import numpy as np
     from scipy.optimize import minimize

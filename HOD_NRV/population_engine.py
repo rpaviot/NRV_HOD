@@ -18,6 +18,57 @@ from . import NFW_jax as NFWj
 from .utils import random_uniform_jax, random_poisson_jax
 
 
+def filter_halo_data(pre_cond: jnp.ndarray, has_sat: jnp.ndarray, **arrays) -> dict:
+    """
+    Apply double filtering (pre_cond then has_sat) to multiple arrays.
+    
+    This utility function eliminates repetitive array filtering code by applying
+    two sequential boolean masks to multiple arrays at once.
+    
+    Parameters
+    ----------
+    pre_cond : jnp.ndarray
+        First filter condition (e.g., probS > 0)
+    has_sat : jnp.ndarray  
+        Second filter condition applied after pre_cond (e.g., N_s > 0)
+    **arrays : keyword arguments
+        Named arrays to filter. None values are preserved as None.
+        
+    Returns
+    -------
+    dict : Dictionary with filtered arrays using the same keys
+    
+    Examples
+    --------
+    >>> # Instead of multiple filtering lines:
+    >>> filtered = filter_halo_data(
+    ...     pre_cond, has_sat,
+    ...     positions=halo_positions,
+    ...     velocities=halo_velocities,
+    ...     radius=halo_radius,
+    ...     concentration=halo_conc,
+    ...     vrms=halo_vrms,
+    ...     shapes=halo_shapes if triaxial else None
+    ... )
+    >>> # Clean access:
+    >>> filtered_positions = filtered['positions']
+    
+    Notes
+    -----
+    This function handles the common pattern of filtering arrays twice:
+    first by a pre-condition, then by a secondary condition on the 
+    already-filtered data.
+    """
+    filtered = {}
+    for name, array in arrays.items():
+        if array is not None:
+            filtered[name] = array[pre_cond][has_sat]
+        else:
+            filtered[name] = None
+    return filtered
+
+
+
 def populate_centrals(key: jrandom.PRNGKey,
                      positions: jnp.ndarray,
                      velocities: jnp.ndarray, 
@@ -164,12 +215,7 @@ def populate_satellites(key_s: jrandom.PRNGKey,
     N_s = random_poisson_jax(key_s, probS_filtered)
     has_sat = N_s > 0
     
-    # Extract data for halos that actually have satellites
-    cent_positions = positions[pre_cond][has_sat]
-    cent_velocities = velocities[pre_cond][has_sat]  
-    vrms_filtered = vrms[pre_cond][has_sat]
-    radius_filtered = radius[pre_cond][has_sat]
-    concentration_filtered = concentration[pre_cond][has_sat]
+    # Extract data for halos that actually have satellites using clean filtering
     N_s_filtered = N_s[has_sat]
     N_s_tot = int(jnp.sum(N_s_filtered))
     
@@ -178,44 +224,38 @@ def populate_satellites(key_s: jrandom.PRNGKey,
         empty_array = jnp.array([]).reshape(0, 3)
         return empty_array, empty_array
     
-    # Determine whether to use extended NFW profiles
-    use_extended_NFW = (f_exp > 0.0 or lambda_NFW != 1.0)
+    # Apply double filtering to all halo data arrays
+    filtered = filter_halo_data(
+        pre_cond, has_sat,
+        positions=positions,
+        velocities=velocities,
+        radius=radius,
+        concentration=concentration,
+        vrms=vrms,
+        shapes=shapes if triaxial_NFW else None,
+        ratios=ratios if triaxial_NFW else None
+    )
     
-    # Sample satellite positions from NFW profiles
-    if use_extended_NFW:
-        if triaxial_NFW:
-            shapes_filtered = shapes[pre_cond][has_sat]
-            ratios_filtered = ratios[pre_cond][has_sat]
-            sat_positions = NFWj.extended_elliptical_NFW_satellites_positions(
-                key_s_pos, SpherePoints, cent_positions, radius_filtered,
-                concentration_filtered, shapes_filtered, ratios_filtered,
-                N_s_filtered, N_s_tot, f_exp=f_exp, tau=tau, lambda_NFW=lambda_NFW
-            )
-        else:
-            sat_positions = NFWj.extended_NFW_satellites_positions(
-                key_s_pos, SpherePoints, cent_positions, radius_filtered,
-                concentration_filtered, N_s_filtered, N_s_tot,
-                f_exp=f_exp, tau=tau, lambda_NFW=lambda_NFW
-            )
-    else:
-        # Use standard NFW profiles
-        if triaxial_NFW:
-            shapes_filtered = shapes[pre_cond][has_sat]
-            ratios_filtered = ratios[pre_cond][has_sat]
-            sat_positions = NFWj.elliptical_NFW_satellites_positions(
-                key_s_pos, SpherePoints, cent_positions, radius_filtered,
-                concentration_filtered, shapes_filtered, ratios_filtered,
-                N_s_filtered, N_s_tot
-            )
-        else:
-            sat_positions = NFWj.spherical_NFW_satellites_positions(
-                key_s_pos, SpherePoints, cent_positions, radius_filtered,
-                concentration_filtered, N_s_filtered, N_s_tot
-            )
+    # Sample satellite positions using unified NFW interface
+    sat_positions = NFWj.position_satellites(
+        key=key_s_pos,
+        SpherePoints=SpherePoints,
+        halo_centers=filtered['positions'],
+        Rvir=filtered['radius'],
+        c=filtered['concentration'],
+        N_s=N_s_filtered,
+        N_s_tot=N_s_tot,
+        triaxial_NFW=triaxial_NFW,
+        shapes=filtered['shapes'],
+        ratios=filtered['ratios'],
+        f_exp=f_exp,
+        tau=tau,
+        lambda_NFW=lambda_NFW
+    )
     
     # Sample satellite velocities from dispersion model
     sat_velocities = NFWj.dispersion_velocities_satellites(
-        key_s_vel, cent_velocities, vrms_filtered, N_s_filtered, N_s_tot
+        key_s_vel, filtered['velocities'], filtered['vrms'], N_s_filtered, N_s_tot
     )
     
     return sat_positions, sat_velocities
@@ -335,7 +375,7 @@ def populate_haloes_full(positions: jnp.ndarray,
                         rsd_factor: float = 1.0,
                         rsd_axis_index: int = 2,
                         Lbox: float = 1000.0,
-                        random_seed: Optional[int] = None) -> Tuple[jnp.ndarray, jnp.ndarray]:
+                        random_seed: Optional[int] = None) -> Tuple[jnp.ndarray, jnp.ndarray, float]:
     """
     Complete halo population pipeline: centrals + satellites + RSD.
     
@@ -390,10 +430,12 @@ def populate_haloes_full(positions: jnp.ndarray,
         Final galaxy positions (with RSD if requested) [Mpc/h]
     velocities_gal : jnp.ndarray, shape (N_galaxies, 3)
         Final galaxy velocities [km/s]
+    satellite_fraction : float
+        Fraction of galaxies that are satellites (N_satellites / N_total)
         
     Examples
     --------
-    >>> pos_gal, vel_gal = populate_haloes_full(
+    >>> pos_gal, vel_gal, sat_frac = populate_haloes_full(
     ...     halo_pos, halo_vel, halo_mass, halo_R, halo_c, halo_vrms,
     ...     halo_logM, hod_model, hod_params, sphere_points
     ... )
@@ -455,4 +497,10 @@ def populate_haloes_full(positions: jnp.ndarray,
         # Just apply periodic boundary conditions
         positions_gal = (positions_gal + Lbox) % Lbox
     
-    return positions_gal, velocities_gal
+    # Calculate satellite fraction
+    n_centrals = len(cent_positions)
+    n_satellites = len(sat_positions) 
+    n_total = n_centrals + n_satellites
+    satellite_fraction = n_satellites / n_total if n_total > 0 else 0.0
+    
+    return positions_gal, velocities_gal, satellite_fraction

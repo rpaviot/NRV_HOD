@@ -10,6 +10,7 @@ from .data_reader import (
     setup_assembly_bias_data, apply_rsd_preprocessing, validate_rsd_axis
 )
 from .population_engine import populate_haloes_full
+from .two_point import compute_galaxy_clustering, compute_galaxy_lensing
 from . import test
 
 class HaloOccupation:
@@ -72,6 +73,8 @@ class HaloOccupation:
         Galaxy positions after population [Mpc/h]
     velocities_gal : jnp.ndarray, shape (N_galaxies, 3)
         Galaxy velocities after population [km/s]
+    satellite_fraction : float
+        Fraction of galaxies that are satellites (N_satellites / N_total)
         
     Examples
     --------
@@ -181,16 +184,13 @@ class HaloOccupation:
 
         # === ASSEMBLY BIAS DATA ===
         if assembly_bias:
-            self.fA, self.fB = setup_assembly_bias_data(
+            self.fI, self.fE = setup_assembly_bias_data(
                 self.DataFrame, column_mapping
             )
         else:
-            self.fA = None
-            self.fB = None
-        
-        # Legacy attribute names for backward compatibility
-        self.fI = self.fA
-        self.fE = self.fB
+            self.fI = None
+            self.fE = None
+    
 
         # Store number of halos
         self.n_halos = len(self.DataFrame)
@@ -301,11 +301,13 @@ class HaloOccupation:
         >>> # Access populated galaxies
         >>> galaxy_positions = halo.positions_gal
         >>> galaxy_velocities = halo.velocities_gal
+        >>> sat_fraction = halo.satellite_fraction
         
         Notes
         -----
         After calling this method, galaxy positions and velocities are
         available in `self.positions_gal` and `self.velocities_gal`.
+        The satellite fraction is available in `self.satellite_fraction`.
         
         For conformity models, satellite occupation depends on actual
         central galaxy realization rather than just central probability.
@@ -323,7 +325,7 @@ class HaloOccupation:
         lambda_NFW = dict_params.get('lambda_NFW', 1.0)
         
         # Use the population engine for the complete workflow
-        self.positions_gal, self.velocities_gal = populate_haloes_full(
+        self.positions_gal, self.velocities_gal, self.satellite_fraction = populate_haloes_full(
             positions=self.positions,
             velocities=self.velocities, 
             mass=self.mass,
@@ -347,6 +349,93 @@ class HaloOccupation:
             random_seed=random_seed
         )
 
+
+    def compute_galaxy_clustering(self, mode: str, bins1: Union[int, Any], 
+                                 catalog2: Optional[Any] = None,
+                                 bins2: Optional[Any] = None,
+                                 output: str = 'auto') -> tuple:
+        """
+        Compute galaxy clustering correlation function.
+        
+        Parameters
+        ----------
+        mode : str
+            Correlation function mode ('s', 'smu', 'rppi')
+        bins1 : int or array-like
+            Primary binning edges for correlation function
+        catalog2 : array-like, optional
+            Second catalog for cross-correlation
+        bins2 : array-like, optional
+            Secondary binning edges
+        output : str, default='auto'
+            Output format ('auto', 'multipoles', 'wp')
+            
+        Returns
+        -------
+        r : array-like
+            Bin centers or separation values
+        xi : array-like
+            Correlation function values
+            
+        Raises
+        ------
+        RuntimeError
+            If galaxies have not been populated yet
+        """
+        if not hasattr(self, 'positions_gal'):
+            raise RuntimeError("Galaxies not populated. Call populate_haloes() first.")
+            
+        return compute_galaxy_clustering(
+            self.positions_gal, self.Lbox, self.rsd_axis, mode, bins1,
+            catalog2=catalog2, bins2=bins2, output=output
+        )
+    
+    
+    def compute_galaxy_lensing(self, bins1: Union[int, Any],
+                              output: str = 'xi',
+                              bins2: Optional[Any] = None,
+                              bins_comp: Any = None) -> tuple:
+        """
+        Compute galaxy-galaxy lensing signal.
+        
+        Parameters
+        ----------  
+        bins1 : int or array-like
+            Primary binning edges for projected separation
+        output : str, default='xi'
+            Output format
+        bins2 : array-like, optional
+            Secondary binning edges
+        bins_comp : array-like, optional
+            Binning for completeness calculation. If None, uses default.
+            
+        Returns
+        -------
+        rp : array-like
+            Projected separation bins
+        delta_sigma : array-like
+            Surface mass density contrast
+            
+        Raises
+        ------
+        RuntimeError
+            If galaxies or particles have not been loaded
+        """
+        if not hasattr(self, 'positions_gal'):
+            raise RuntimeError("Galaxies not populated. Call populate_haloes() first.")
+        if not hasattr(self, 'positions_part'):
+            raise RuntimeError("Particle data not loaded. Provide DataFrame_part during initialization.")
+            
+        # Set default for bins_comp if not provided
+        if bins_comp is None:
+            import numpy as np
+            bins_comp = np.geomspace(5e-3, 100, 81)
+            
+        return compute_galaxy_lensing(
+            self.positions_gal, self.positions_part, self.Lbox, 
+            self.rsd_axis, self.RHO_M, bins1,
+            output=output, bins2=bins2, bins_comp=bins_comp
+        )
 
 
 
