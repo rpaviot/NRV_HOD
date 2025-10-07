@@ -2,7 +2,7 @@ import numpy as np
 import jax.numpy as jnp
 import jax.random as jrandom
 from jax import jit
-from .utils import gauss_legendre_integration,random_uniform_jax,random_poisson_numba
+from ..utils.utils_functions import gauss_legendre_integration,random_uniform_jax,random_poisson_numba
 from numba import vectorize, njit, prange
 from functools import partial
 

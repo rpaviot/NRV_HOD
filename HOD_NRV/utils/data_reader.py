@@ -15,7 +15,7 @@ from astropy.cosmology import FlatLambdaCDM
 from astropy import units as u
 from typing import Dict, Optional, Tuple, Union, Any
 
-from .utils import set_mass_function
+from .utils_functions import set_mass_function
 
 
 def read_halo_catalog(halo_path: Optional[str] = None, 

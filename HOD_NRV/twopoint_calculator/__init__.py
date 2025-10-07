@@ -40,7 +40,7 @@ from .precompute_deltasigma import (
 from .fast_two_point import FastDeltaSigmaCalculator
 
 # Legacy functions (for backward compatibility and null testing)
-from .two_point_legacy import (
+from .standard_two_point_calculator import (
     compute_corr,
     DeltaSigmaCalculator,
     compute_galaxy_clustering,

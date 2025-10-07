@@ -3,7 +3,7 @@ import jax.random as jrandom
 import jax.scipy.special as jsp
 from jax import jit
 from scipy.interpolate import CubicSpline as CS
-from .utils import gauss_legendre_integration
+from ..utils.utils_functions import gauss_legendre_integration
 
 sqrtpi = jnp.sqrt(2 * jnp.pi)
 

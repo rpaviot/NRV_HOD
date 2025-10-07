@@ -18,7 +18,7 @@ Author: NRVpy Development Team
 """
 
 from pycorr import TwoPointCorrelationFunction
-from ..utils import gauss_legendre_integration
+from ..utils.utils_functions import gauss_legendre_integration
 import numpy as np
 from scipy.interpolate import interp1d
 import multiprocessing

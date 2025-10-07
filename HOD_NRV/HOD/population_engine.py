@@ -14,8 +14,8 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from typing import Tuple, Optional
 
-from . import NFW_jax as NFWj
-from .utils import random_uniform_jax, random_poisson_jax
+from ..satellites import NFW_jax as NFWj
+from ..utils.utils_functions import random_uniform_jax, random_poisson_jax
 
 
 def filter_halo_data(pre_cond: jnp.ndarray, has_sat: jnp.ndarray, **arrays) -> dict:

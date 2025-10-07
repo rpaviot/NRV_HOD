@@ -182,3 +182,4 @@ EXTENDED_NFW_CHANGES.md
 EMULATOR_README.md
 example_emulator_parameter_generation.py
 test_emulator_performance.ipynb
+HOD_NRV/test/output

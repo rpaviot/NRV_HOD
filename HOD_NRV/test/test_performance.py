@@ -33,8 +33,8 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from HOD_NRV.HOD_catalogue import HaloOccupation
-from HOD_NRV.emulator_utils import rescale_Ac_to_target_ngal
+from HOD_NRV.HOD.HOD_catalogue import HaloOccupation
+from HOD_NRV.utils.emulator_utils import rescale_Ac_to_target_ngal
 
 
 def print_header(title):
@@ -149,14 +149,17 @@ def main():
     halo.set_halo_model('ELG_GHOD')
 
     start = time.time()
-    Ac_rescaled, ngal_achieved = rescale_Ac_to_target_ngal(
+    Ac_rescaled = rescale_Ac_to_target_ngal(
         halo.HOD, hod_params_base, target_ngal, Ac_fiducial=1.0
     )
     elapsed_rescale = time.time() - start
 
+    # Compute achieved ngal with rescaled Ac
+    hod_params_check = hod_params_base.copy()
+    hod_params_check['Ac'] = Ac_rescaled
+    ngal_achieved = float(halo.HOD.compute_ngal(hod_params_check))
 
     print_timing("Rescale Ac to target ngal", elapsed_rescale)
-    print(Ac_rescaled,ngal_achieved)
     print(f"    → Rescaled Ac: {float(Ac_rescaled):.6f}")
     print(f"    → Achieved ngal: {ngal_achieved:.6e} (h/Mpc)^3")
     print(f"    → Target ngal: {target_ngal:.6e} (h/Mpc)^3")

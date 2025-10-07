@@ -3,15 +3,16 @@ import jax.random as jrandom
 from typing import Dict, Optional, Union, Any
 
 from .HOD_models import Occupation
-from . import NFW_jax as NFWj
-from .data_reader import (
+from ..satellites import NFW_jax as NFWj
+from ..utils.data_reader import (
     read_halo_catalog, setup_cosmology, setup_data_arrays,
-    setup_particle_data_arrays, setup_triaxial_shapes, 
+    setup_particle_data_arrays, setup_triaxial_shapes,
     setup_assembly_bias_data, apply_rsd_preprocessing, validate_rsd_axis
 )
 from .population_engine import populate_haloes_full
-from .two_point import compute_galaxy_clustering, compute_galaxy_lensing
-from .test import test_satellites
+from ..twopoint_calculator.standard_two_point_calculator import (
+    compute_galaxy_clustering, compute_galaxy_lensing
+)
 
 class HaloOccupation:
     """
@@ -201,6 +202,7 @@ class HaloOccupation:
         
         # Run validation tests if requested
         if do_test:
+            from ..test import test_satellites
             test_satellites.run_all_tests()
 
 

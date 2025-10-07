@@ -15,7 +15,7 @@ import h5py
 from scipy.spatial import cKDTree
 from scipy.interpolate import interp1d
 from typing import Tuple, Dict, Optional
-from ..utils import gauss_legendre_integration
+from ..utils.utils_functions import gauss_legendre_integration
 
 
 def build_particle_kdtree(positions_part: np.ndarray,

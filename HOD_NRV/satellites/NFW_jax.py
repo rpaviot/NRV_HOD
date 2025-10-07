@@ -2,7 +2,7 @@ import numpy as np
 import jax.numpy as jnp
 import jax.random as jrandom
 from jax import jit,vmap
-from .utils import * 
+from ..utils.utils_functions import * 
 from numba import vectorize, njit, prange
 from functools import partial
 from dataclasses import dataclass
