@@ -1,8 +1,14 @@
+import sys
+from pathlib import Path
 import jax.random as jrandom
-from .NFW_jax import create_point_on_unit_sphere,spherical_NFW_satellites_positions,elliptical_NFW_satellites_positions
 from scipy.optimize import minimize
 import numpy as np
 import jax.numpy as jnp
+
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+
+from HOD_NRV.NFW_jax import create_point_on_unit_sphere, spherical_NFW_satellites_positions, elliptical_NFW_satellites_positions
 
 def random_orthonormal_basis(seed=None):
     if seed is not None:

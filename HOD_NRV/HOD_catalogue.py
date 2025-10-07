@@ -11,7 +11,7 @@ from .data_reader import (
 )
 from .population_engine import populate_haloes_full
 from .two_point import compute_galaxy_clustering, compute_galaxy_lensing
-from . import test
+from .test import test_satellites
 
 class HaloOccupation:
     """
@@ -201,7 +201,7 @@ class HaloOccupation:
         
         # Run validation tests if requested
         if do_test:
-            test.run_all_tests()
+            test_satellites.run_all_tests()
 
 
 

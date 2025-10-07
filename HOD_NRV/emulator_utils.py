@@ -109,16 +109,14 @@ def rescale_Ac_to_target_ngal(
     hod_model,
     params: Dict[str, float],
     target_ngal: float,
-    Ac_fiducial: float = 1.0,
-    max_iterations: int = 5,
-    tolerance: float = 1e-6
-) -> Tuple[float, float]:
+    Ac_fiducial: float = 1.0
+) -> float:
     """
     Rescale Ac to achieve a target galaxy number density.
 
-    This function iteratively adjusts Ac to match the target number density.
-    Since ngal is linear in Ac (for independent central/satellite occupations),
-    typically only 1-2 iterations are needed.
+    This function directly computes the rescaled Ac needed to match the target
+    number density. Since ngal is linearly proportional to Ac (for independent
+    central/satellite occupations), the rescaling is exact in one step.
 
     Parameters
     ----------
@@ -130,31 +128,23 @@ def rescale_Ac_to_target_ngal(
         Target galaxy number density [(Mpc/h)^-3]
     Ac_fiducial : float, default=1.0
         Initial fiducial value for Ac
-    max_iterations : int, default=5
-        Maximum number of rescaling iterations
-    tolerance : float, default=1e-6
-        Relative tolerance for convergence |ngal_achieved - target_ngal| / target_ngal
 
     Returns
     -------
     Ac_rescaled : float
         Rescaled central amplitude that achieves the target number density
-    ngal_achieved : float
-        Actual number density achieved with Ac_rescaled
 
     Raises
     ------
     ValueError
         If ngal cannot be computed (e.g., invalid parameters)
-    RuntimeWarning
-        If convergence is not achieved within max_iterations
 
     Examples
     --------
-    >>> Ac_new, ngal_new = rescale_Ac_to_target_ngal(
+    >>> Ac_new = rescale_Ac_to_target_ngal(
     ...     halo.HOD, params, target_ngal=1e-3, Ac_fiducial=0.5
     ... )
-    >>> print(f"Rescaled Ac: {Ac_new:.4f}, achieved ngal: {ngal_new:.2e}")
+    >>> print(f"Rescaled Ac: {Ac_new:.4f}")
 
     Notes
     -----
@@ -166,29 +156,14 @@ def rescale_Ac_to_target_ngal(
     This works because ngal is linearly proportional to Ac when central and
     satellite occupations are independent.
     """
-    Ac_current = Ac_fiducial
+    # Compute ngal with fiducial Ac
+    ngal_fiducial = compute_ngal_with_fiducial_Ac(hod_model, params, Ac_fiducial)
 
-    for iteration in range(max_iterations):
-        # Compute ngal with current Ac
-        ngal_current = compute_ngal_with_fiducial_Ac(hod_model, params, Ac_current)
+    # Rescale Ac linearly (ngal ∝ Ac for independent central/satellite)
+    Ac_rescaled = Ac_fiducial * (target_ngal / ngal_fiducial)
 
-        # Check for convergence
-        relative_error = abs(ngal_current - target_ngal) / target_ngal
-        if relative_error < tolerance:
-            return Ac_current, ngal_current
-
-        # Rescale Ac linearly (ngal ∝ Ac for independent central/satellite)
-        Ac_current = Ac_current * (target_ngal / ngal_current)
-
-    # If we reach here, convergence was not achieved
-    warnings.warn(
-        f"Ac rescaling did not converge after {max_iterations} iterations. "
-        f"Relative error: {relative_error:.2e}. "
-        f"Achieved ngal: {ngal_current:.2e}, target: {target_ngal:.2e}",
-        RuntimeWarning
-    )
-
-    return Ac_current, ngal_current
+    # Convert to float to avoid numpy array formatting issues
+    return float(Ac_rescaled)
 
 
 def create_latin_hypercube(
@@ -425,9 +400,7 @@ def generate_hod_parameter_grid(
     -------
     param_grid : pd.DataFrame
         DataFrame with columns for all HOD parameters including rescaled Ac.
-        Shape: (n_samples, n_params+2) where the extra columns are:
-        - 'Ac': rescaled central amplitude
-        - 'ngal_achieved': actual number density achieved
+        Shape: (n_samples, n_params+1) where 'Ac' is the rescaled central amplitude.
 
     Examples
     --------
@@ -563,9 +536,8 @@ def generate_hod_parameter_grid(
         for param_name, param_value in fixed_params_copy.items():
             lhs_samples[param_name] = param_value
 
-    # Initialize arrays for Ac and achieved ngal
+    # Initialize array for Ac
     Ac_values = np.zeros(n_samples)
-    ngal_achieved = np.zeros(n_samples)
 
     # Rescale Ac for each parameter combination
     if verbose:
@@ -579,28 +551,19 @@ def generate_hod_parameter_grid(
         params = lhs_samples.iloc[i].to_dict()
 
         # Rescale Ac to achieve target ngal
-        Ac_rescaled, ngal = rescale_Ac_to_target_ngal(
+        Ac_rescaled = rescale_Ac_to_target_ngal(
             halo.HOD, params, target_ngal, Ac_fiducial
         )
 
         Ac_values[i] = Ac_rescaled
-        ngal_achieved[i] = ngal
 
     # Combine into final DataFrame
     param_grid = lhs_samples.copy()
     param_grid.insert(0, 'Ac', Ac_values)  # Insert Ac as first column
-    param_grid['ngal_achieved'] = ngal_achieved
-
-    # Compute statistics
-    ngal_mean = np.mean(ngal_achieved)
-    ngal_std = np.std(ngal_achieved)
-    ngal_relative_std = ngal_std / target_ngal
 
     if verbose:
         print(f"\nDone! Parameter grid statistics:")
         print(f"  Target ngal: {target_ngal:.4e} (Mpc/h)^-3")
-        print(f"  Mean achieved ngal: {ngal_mean:.4e} (Mpc/h)^-3")
-        print(f"  Std of achieved ngal: {ngal_std:.4e} (relative: {ngal_relative_std:.2e})")
         print(f"  Ac range: [{Ac_values.min():.4f}, {Ac_values.max():.4f}]")
 
     # Save if path provided
