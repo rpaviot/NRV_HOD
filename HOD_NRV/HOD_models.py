@@ -35,28 +35,37 @@ def HOD_satellite(logM, As, Mmin, M1, alpha, kappa):
     return Nsat
 
 @jit
-def HOD_satellite_conformity(logM, As, Mmin, M1, alpha, kappa, M1_EE, has_central):
+def HOD_satellite_conformity(logM, As, Mmin, M1, alpha, kappa, kappa_EE, has_central):
     """
     AbacusHOD-style conformity: satellite occupation depends on central presence
-    
+
     Parameters
     ----------
     logM : halo mass
     As : satellite amplitude
     Mmin : minimum mass for centrals
-    M1 : standard satellite mass scale  
+    M1 : standard satellite mass scale
     alpha : satellite power law index
     kappa : satellite cutoff parameter
-    M1_EE : satellite mass scale when ELG central present
+    kappa_EE : scaling factor for M1 when central present (M1_EE = kappa_EE * M1)
     has_central : boolean array indicating central presence
-    
+
     Returns
     -------
     Satellite occupation probability
+
+    Notes
+    -----
+    The effective satellite mass scale is M1_EE = kappa_EE * M1 when a central
+    galaxy is present. This parametrization allows M1 to be fixed while still
+    varying the conformity strength via kappa_EE.
     """
+    # Compute M1_EE from scaling: M1_EE = kappa_EE * M1
+    M1_EE = M1 + jnp.log10(kappa_EE)  # log10(M1_EE) = log10(kappa_EE * M1)
+
     # Use different M1 based on central presence
     M1_eff = jnp.where(has_central, M1_EE, M1)
-    
+
     Nsat = As * jnp.power((10**logM - kappa*10**Mmin) / (10**M1_eff), alpha)
     Nsat = jnp.where(logM > Mmin + jnp.log10(kappa), Nsat, 0)
     return Nsat
@@ -88,7 +97,7 @@ class Occupation:
     }
 
     satellite_params=["As", "Mmin", "M1", "alpha", "kappa"]
-    satellite_conformity_params=["As", "Mmin", "M1", "alpha", "kappa", "M1_EE"]
+    satellite_conformity_params=["As", "Mmin", "M1", "alpha", "kappa", "kappa_EE"]
     assembly_bias_params=['A_cent','B_cent','A_sat','B_sat']
 
     def __init__(self, hod_type,logM_bins,mass_function,assembly_bias=False,conformity=False,fI=None,fE=None):
