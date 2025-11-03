@@ -1,20 +1,26 @@
 """
-Null test for fast galaxy-galaxy lensing pre-computation.
+Parallel null test for fast galaxy-galaxy lensing pre-computation.
 
-This test performs the pre-computation step for ΔΣ using the precompute_deltasigma
-module. It demonstrates the workflow for creating a lensing grid that can be used
-for fast interpolation during HOD parameter fitting.
+This test performs the pre-computation step for ΔΣ using the parallel version
+(precompute_deltasigma_parallel) with multi-core CPU parallelization via joblib.
+
+Key differences from test_fast_dsigma.py:
+- Uses precompute_lensing_grid_parallel() with joblib parallelization
+- Supports n_jobs parameter for controlling CPU cores
+- ~10-50× faster on multi-core systems
+- Pure NumPy implementation (no JAX fork() conflicts)
 
 Workflow:
 1. Load halo and particle catalogs
 2. Downsample particle catalog by factor 20
 3. Pre-select particles within 3×Rvir of ANY halo center (reduces data volume)
-4. For each selected particle, compute ΔΣ using ξ_gm from ALL particles
+4. For each selected particle, compute ΔΣ using ξ_gm from ALL particles (parallel)
 5. Save pre-computed ΔΣ grid to disk
 
 Key parameters:
 - 3×Rvir: Criterion for pre-selecting particles near halos (saves disk space)
 - search_radius ~100 Mpc/h: Maximum scale for ξ_gm computation (BAO scale)
+- n_jobs: Number of parallel jobs (-1 = all CPUs)
 
 Note: The search_radius for ξ_gm computation is independent of the 3×Rvir
 particle selection criterion. We compute ξ_gm up to BAO scales even though
@@ -30,11 +36,24 @@ from pathlib import Path
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from HOD_NRV.twopoint_calculator.precompute_deltasigma import (
-    build_particle_kdtree,
-    compute_deltasigma_spherical,
-    save_precomputed_lensing
+from HOD_NRV.twopoint_calculator.precompute_deltasigma_parallel import (
+    precompute_lensing_grid_parallel,
+    estimate_memory_usage
 )
+from HOD_NRV.twopoint_calculator.precompute_deltasigma import (
+    save_precomputed_lensing,
+    load_precomputed_lensing
+)
+# Numba backend (optional, high-performance for large datasets)
+try:
+    from HOD_NRV.twopoint_calculator.precompute_deltasigma_numba import (
+        precompute_lensing_grid_numba
+    )
+    NUMBA_AVAILABLE = True
+except ImportError:
+    NUMBA_AVAILABLE = False
+    print("Warning: Numba backend not available (numba package required)")
+
 from test_utils import print_header, print_timing
 
 
@@ -42,7 +61,7 @@ def main():
     # ========================================================================
     # Configuration
     # ========================================================================
-    print_header("Fast ΔΣ Pre-computation Test Configuration")
+    print_header("Fast ΔΣ Pre-computation Test Configuration (PARALLEL)")
 
     # Paths (same as test_performance.py)
     halo_path = '/Users/ler13nrv/Documents/flamingo_data/parquet_halo_catalogue_L1000N1800.parquet'
@@ -74,20 +93,21 @@ def main():
     # This reduces the amount of data we need to save to disk
     r_factor_selection = 3.0  # Select particles within 3×Rvir
 
-    # Search radius for spherical profile computation
-    # Should cover maximum rp_bin with some margin
-    search_radius_spherical = 100  # Mpc/h (~47 Mpc/h)
-
-    # Downsampling factor for particles (reduced for better statistics)
-    downsample_factor = 40  # Was 40, but spherical method needs more particles
+    # Downsampling factor4for particles
+    downsample_factor = 1 # Was 40, but spherical method needs more particles
 
     # Computation method
     method = 'spherical'  # 'spherical' (recommended) or 'cylindrical' (legacy)
 
+    # Parallel processing parameters
+    n_jobs = -1  # -1 = use all available CPUs
+    backend = 'loky'  # Options: 'numba' (fastest), 'loky', 'multiprocessing', 'threading'
+    use_memmap = True  # Use memory-mapped arrays (essential for zero downsampling!)
+
     # Output path for pre-computed lensing grid
     output_dir = Path(__file__).parent / 'output'
     output_dir.mkdir(exist_ok=True)
-    output_path = output_dir / 'precomputed_lensing_grid.h5'
+    output_path = output_dir / 'precomputed_lensing_grid_parallel.h5'
 
     print(f"\n  Halo catalog: {Path(halo_path).name}")
     print(f"  Particle catalog: {Path(particle_path).name}")
@@ -98,7 +118,12 @@ def main():
     print(f"    Method: {method}")
     print(f"    rp bins: {len(rp_bins)-1} bins from {rp_bins[0]:.2f} to {rp_bins[-1]:.2f} Mpc/h")
     print(f"    Particle selection: within {r_factor_selection:.1f}×Rvir of halos")
-    print(f"    Search radius: {search_radius_spherical:.1f} Mpc/h")
+    print(f"\n  Parallel processing:")
+    print(f"    n_jobs: {n_jobs} (all CPUs)")
+    print(f"    Backend: {backend}")
+    print(f"    Memory-mapping: {'enabled' if use_memmap else 'disabled'}")
+    if use_memmap and downsample_factor == 1:
+        print(f"    ⚠ Memory-mapping is ESSENTIAL for zero downsampling!")
     print(f"\n  Output path: {output_path}")
 
     # ========================================================================
@@ -118,10 +143,11 @@ def main():
     print_timing("Load particle catalog", elapsed_particles)
     print(f"    → Loaded {len(df_particles):,} particles (already downsampled)")
 
-    # Additional downsampling by factor 20
+    # Additional downsampling
     n_particles_original = len(df_particles)
     df_particles = df_particles.iloc[::downsample_factor].reset_index(drop=True)
     n_particles_downsampled = len(df_particles)
+
 
     print(f"    → Further downsampled to {n_particles_downsampled:,} particles")
     print(f"    → Total downsampling: {n_particles_original/n_particles_downsampled:.1f}x")
@@ -133,7 +159,7 @@ def main():
 
     # Extract halo positions and virial radii
     halo_positions = df_halos[['x', 'y', 'z']].values
-    halo_rvir = df_halos['rvir'].values/1000
+    halo_rvir = df_halos['rvir'].values / 1000  # Convert to Mpc/h
 
     # Extract particle positions
     particle_positions = df_particles[['x', 'y', 'z']].values
@@ -142,6 +168,7 @@ def main():
     print(f"  Halo Rvir range: [{halo_rvir.min():.3f}, {halo_rvir.max():.3f}] Mpc/h")
     print(f"  Particle positions: {particle_positions.shape}")
 
+
     # ========================================================================
     # Step 3: Pre-select Particles Near Halos (within 3×Rvir)
     # ========================================================================
@@ -149,6 +176,7 @@ def main():
 
     print(f"\n  Building KD-tree for particle positions...")
     start = time.time()
+    from HOD_NRV.twopoint_calculator.precompute_deltasigma import build_particle_kdtree
     kdtree_particles = build_particle_kdtree(particle_positions, Lbox)
     elapsed_kdtree = time.time() - start
     print_timing("Build particle KD-tree", elapsed_kdtree)
@@ -182,62 +210,76 @@ def main():
     print(f"    Memory saved: {(1 - len(selected_particle_indices)/len(particle_positions))*100:.1f}%")
 
     # ========================================================================
-    # Step 4: Pre-compute ΔΣ at Selected Particle Positions
+    # Step 4: Pre-compute ΔΣ at Selected Particle Positions (PARALLEL)
     # ========================================================================
-    print_header("Step 4: Pre-compute ΔΣ at Selected Particle Positions")
+    print_header("Step 4: Pre-compute ΔΣ at Selected Particle Positions (PARALLEL)")
 
     print(f"\n  Computing ΔΣ for {len(selected_particle_indices):,} selected particles...")
-    print(f"  Using {method} method with search radius {search_radius_spherical:.1f} Mpc/h")
-    print(f"  This may take a while...\n")
+    print(f"  Using {method} method (parallel processing)")
+    print(f"  Backend: {backend}")
+    print(f"  This will use ALL available CPU cores!\n")
 
     start = time.time()
 
-    all_deltasigma = []
-    n_success = 0
-    n_failed = 0
+    # Determine batch size based on backend
+    if backend == 'numba':
+        batch_size = len(selected_particle_positions)//10  # Joblib: ~5% per batch
+    else:
+        batch_size = len(selected_particle_positions)//10  # Joblib: ~5% per batch
 
-    for i, particle_pos in enumerate(selected_particle_positions):
-        if (i + 1) % max(1, len(selected_particle_positions) // 10) == 0:
-            elapsed = time.time() - start
-            rate = (i + 1) / elapsed
-            remaining = (len(selected_particle_positions) - i - 1) / rate
-            print(f"    Progress: {i+1}/{len(selected_particle_positions)} "
-                  f"({100*(i+1)/len(selected_particle_positions):.1f}%) | "
-                  f"Rate: {rate:.1f} part/s | ETA: {remaining/60:.1f} min")
+    # Use backend-specific implementation
+    if backend == 'numba':
+        if not NUMBA_AVAILABLE:
+            print(f"\n  ERROR: Numba backend requested but not available!")
+            print(f"  Install numba: conda install numba")
+            print(f"  Falling back to 'loky' backend...\n")
+            backend = 'loky'
+        else:
+            print(f"  Using Numba prange (zero-copy shared memory parallelism)")
+            print(f"  Batch size: {batch_size} particles/batch")
+            print(f"  Note: First call may be slow due to Numba JIT compilation...")
+            print(f"  Verbose output will appear during computation.\n")
 
-        # Query particles within search radius
-        nearby_indices = kdtree_particles.query_ball_point(particle_pos, r=search_radius_spherical)
-
-        if len(nearby_indices) < 50:  # Need more particles for spherical method
-            n_failed += 1
-            continue
-
-        nearby_particles = particle_positions[nearby_indices]
-
-        try:
-            delta_sigma = compute_deltasigma_spherical(
-                position=particle_pos,
-                nearby_particles=nearby_particles,
+            # Numba backend - with batch processing to avoid memory explosion
+            positions, deltasigma_values = precompute_lensing_grid_numba(
+                selected_particle_positions=selected_particle_positions,
+                particle_positions_full=particle_positions,
                 RHO_M=RHO_M,
                 rp_bins=rp_bins,
-                n_particles_total=len(particle_positions),
-                Lbox=Lbox
+                Lbox=Lbox,
+                particle_mass=None,
+                search_radius_computation=None,
+                n_radial_bins=200,
+                batch_size=batch_size,  # Process 5000 particles per batch (tune for memory)
+                verbose=False
             )
 
-            all_deltasigma.append(delta_sigma)
-            n_success += 1
+    # Joblib backends (loky, multiprocessing, threading)
+    if backend != 'numba':
+        print(f"  Batch size: {batch_size} particles")
 
-        except Exception as e:
-            n_failed += 1
-            if n_failed <= 5:  # Only print first few errors
-                print(f"    Warning: Failed at position {particle_pos}: {e}")
+        # Use joblib parallel pre-computation function
+        positions, deltasigma_values = precompute_lensing_grid_parallel(
+            selected_particle_positions=selected_particle_positions,  # Pre-selected particles
+            particle_positions_full=particle_positions,  # Full catalog for neighbor queries
+            RHO_M=RHO_M,
+            rp_bins=rp_bins,
+            Lbox=Lbox,
+            particle_mass=None,  # Auto-compute from RHO_M and Lbox
+            method=method,
+            los_axis='z',
+            n_jobs=n_jobs,
+            batch_size=batch_size,
+            backend=backend,
+            use_memmap=use_memmap,  # Enable memory-mapping for zero downsampling
+            verbose=True
+        )
 
     elapsed_precompute = time.time() - start
     print_timing("\nTotal pre-computation time", elapsed_precompute)
 
-    # Convert to arrays
-    positions = selected_particle_positions[:n_success]
-    deltasigma_values = np.array(all_deltasigma)
+    n_success = len(positions)
+    n_failed = len(selected_particle_indices) - n_success
 
     print(f"\n  Computation results:")
     print(f"    Successful: {n_success:,}")
@@ -266,10 +308,14 @@ def main():
         'n_particles_selected': len(selected_particle_indices),
         'downsample_factor': downsample_factor,
         'r_factor_selection': r_factor_selection,
-        'search_radius_spherical': search_radius_spherical,
         'method': method,
         'n_success': n_success,
         'n_failed': n_failed,
+        'n_jobs': n_jobs,
+        'backend': backend,
+        'batch_size': batch_size,
+        'use_memmap': use_memmap,
+        'parallel': True,
     }
 
     save_precomputed_lensing(
@@ -293,7 +339,7 @@ def main():
     print(f"  {'2. Load & downsample particle catalog':<45s} {elapsed_particles:>9.3f}s  {elapsed_particles/total_time*100:>5.1f}%")
     print(f"  {'3. Build particle KD-tree':<45s} {elapsed_kdtree:>9.3f}s  {elapsed_kdtree/total_time*100:>5.1f}%")
     print(f"  {'4. Select particles near halos':<45s} {elapsed_selection:>9.3f}s  {elapsed_selection/total_time*100:>5.1f}%")
-    print(f"  {'5. Pre-compute ΔΣ grid':<45s} {elapsed_precompute:>9.3f}s  {elapsed_precompute/total_time*100:>5.1f}%")
+    print(f"  {'5. Parallel pre-compute ΔΣ grid':<45s} {elapsed_precompute:>9.3f}s  {elapsed_precompute/total_time*100:>5.1f}%")
     print(f"  {'-'*45} {'-'*10}  {'-'*6}")
     print(f"  {'TOTAL':<45s} {total_time:>9.3f}s  100.0%")
 
@@ -308,13 +354,19 @@ def main():
     print(f"    Output file size: {output_path.stat().st_size / 1e6:.1f} MB")
 
     print("\n" + "="*70)
-    print("  Fast ΔΣ pre-computation test completed successfully!")
+    print("  Fast ΔΣ parallel pre-computation test completed successfully!")
     print("="*70 + "\n")
+
+    print(f"\nPerformance comparison with serial version:")
+    print(f"  Expected speedup: ~{n_jobs if n_jobs > 0 else 'auto'}× (depends on CPU cores)")
+    print(f"  Parallel backend: {backend}")
 
     print(f"\nNext steps:")
     print(f"  1. Load the pre-computed grid with load_precomputed_lensing()")
     print(f"  2. Use interpolation to get ΔΣ at galaxy positions during HOD sampling")
     print(f"  3. This avoids recomputing correlation functions for every HOD trial")
+    print(f"  4. Run compare_lensing_pipelines() to validate against standard method")
+    print(f"  5. Compare with serial version using test/compare_serial_parallel_grids.py")
 
 
 def compare_lensing_pipelines():
@@ -330,7 +382,7 @@ def compare_lensing_pipelines():
     from HOD_NRV.utils.emulator_utils import rescale_Ac_to_target_ngal
     from HOD_NRV.twopoint_calculator.fast_two_point import FastDeltaSigmaCalculator
 
-    print_header("Lensing Pipeline Comparison (Realistic HOD)")
+    print_header("Lensing Pipeline Comparison (Realistic HOD - PARALLEL)")
 
     # ========================================================================
     # Configuration (same as test_performance.py)
@@ -366,16 +418,16 @@ def compare_lensing_pipelines():
         'kappa': 0.8
     }
 
-    target_ngal = 2e-4  # (h/Mpc)^3
+    target_ngal = 2e-3  # (h/Mpc)^3
 
     # Lensing bins (same as test_performance.py)
     rp_lens_bins = np.logspace(-1, 1.5, 16)
     bins_comp = np.geomspace(5e-2, 100, 31)
-    downsample_factor = 10
+    downsample_factor = 20
 
     output_dir = Path(__file__).parent / 'output'
     output_dir.mkdir(exist_ok=True)
-    precomputed_grid_path = output_dir / 'precomputed_lensing_grid.h5'
+    precomputed_grid_path = output_dir / 'precomputed_lensing_grid_parallel.h5'
 
     print(f"\n  Configuration:")
     print(f"    Box size: {Lbox} Mpc/h")
@@ -389,7 +441,7 @@ def compare_lensing_pipelines():
 
     if not precomputed_grid_path.exists():
         print(f"\n  ⚠️  Pre-computed grid not found!")
-        print(f"  Running pre-computation first...\n")
+        print(f"  Running parallel pre-computation first...\n")
         main()
 
     print(f"\n  Loading pre-computed grid from: {precomputed_grid_path.name}")
@@ -577,7 +629,7 @@ def compare_lensing_pipelines():
     print(f"    RMS relative difference:             {np.sqrt(np.mean(rel_diff_median**2)):6.2f}%")
 
     # Save comparison results
-    comparison_file = output_dir / 'lensing_comparison.npz'
+    comparison_file = output_dir / 'lensing_comparison_parallel.npz'
 
     np.savez(
         comparison_file,
@@ -617,7 +669,7 @@ def compare_lensing_pipelines():
 
 if __name__ == "__main__":
     # Uncomment to run pre-computation only:
-    # main()
+    main()
 
     # Run comparison with realistic HOD population:
-    compare_lensing_pipelines()
+    # compare_lensing_pipelines()

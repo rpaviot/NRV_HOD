@@ -15,6 +15,42 @@ from scipy.interpolate import RBFInterpolator
 from typing import Tuple, Optional
 
 
+def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
+    """
+    Compute weighted median of values.
+
+    Parameters
+    ----------
+    values : np.ndarray
+        Values to take median of
+    weights : np.ndarray
+        Weights for each value (must be non-negative)
+
+    Returns
+    -------
+    float
+        Weighted median
+
+    Notes
+    -----
+    The weighted median is the value where the cumulative weight equals 0.5.
+    This is more robust to outliers than weighted mean.
+    """
+    # Sort by values
+    sorted_idx = np.argsort(values)
+    sorted_values = values[sorted_idx]
+    sorted_weights = weights[sorted_idx]
+
+    # Compute cumulative weights
+    cumsum = np.cumsum(sorted_weights)
+    cumsum /= cumsum[-1]  # Normalize to [0, 1]
+
+    # Find where cumsum crosses 0.5
+    idx = np.searchsorted(cumsum, 0.5)
+
+    return sorted_values[idx]
+
+
 class FastDeltaSigmaCalculator:
     """
     Fast galaxy-galaxy lensing calculator using pre-computed ΔΣ values.
@@ -33,6 +69,9 @@ class FastDeltaSigmaCalculator:
         Number of nearest neighbors to use for interpolation
     Lbox : float, optional
         Simulation box size for periodic boundary conditions [Mpc/h]
+    use_median : bool, default=False
+        If True, use weighted median instead of weighted mean for interpolation.
+        More robust to outliers and skewed distributions.
 
     Attributes
     ----------
@@ -83,8 +122,9 @@ class FastDeltaSigmaCalculator:
         self,
         precomputed_file: str,
         interpolation_method: str = 'idw',
-        k_neighbors: int = 8,
-        Lbox: Optional[float] = None
+        k_neighbors: int = 1000,
+        Lbox: Optional[float] = None,
+        use_median: bool = False
     ):
         from .precompute_deltasigma import load_precomputed_lensing
 
@@ -94,6 +134,7 @@ class FastDeltaSigmaCalculator:
 
         self.interpolation_method = interpolation_method
         self.k_neighbors = k_neighbors
+        self.use_median = use_median
 
         # Get Lbox from metadata if not provided
         if Lbox is None:
@@ -112,6 +153,7 @@ class FastDeltaSigmaCalculator:
         print(f"FastDeltaSigmaCalculator initialized")
         print(f"  Interpolation method: {interpolation_method}")
         print(f"  K-neighbors: {k_neighbors}")
+        print(f"  Use median: {use_median}")
         print(f"  Radial bins: {len(self.rp_bins)-1}")
 
     def interpolate_deltasigma_at_position(
@@ -155,11 +197,19 @@ class FastDeltaSigmaCalculator:
             weights = 1.0 / (distances ** power)
             weights /= weights.sum()
 
-            # Weighted average of ΔΣ from neighbors
-            delta_sigma_interp = np.sum(
-                weights[:, np.newaxis] * self.deltasigma[indices],
-                axis=0
-            )
+            if self.use_median:
+                # Weighted median of ΔΣ from neighbors (more robust to outliers)
+                delta_sigma_interp = np.zeros(len(self.rp_bins) - 1)
+                for i in range(len(self.rp_bins) - 1):
+                    delta_sigma_interp[i] = weighted_median(
+                        self.deltasigma[indices, i], weights
+                    )
+            else:
+                # Weighted average of ΔΣ from neighbors
+                delta_sigma_interp = np.sum(
+                    weights[:, np.newaxis] * self.deltasigma[indices],
+                    axis=0
+                )
 
         elif self.interpolation_method == 'rbf':
             # Radial basis function interpolation
@@ -191,7 +241,7 @@ class FastDeltaSigmaCalculator:
         verbose: bool = False
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute total ΔΣ by summing contributions from all galaxies.
+        Compute averaged ΔΣ from contributions of all galaxies.
 
         Parameters
         ----------
@@ -206,8 +256,8 @@ class FastDeltaSigmaCalculator:
         -------
         rp_centers : np.ndarray
             Bin centers [Mpc/h]
-        delta_sigma_total : np.ndarray
-            Total surface mass density contrast [Msun h/pc²]
+        delta_sigma_avg : np.ndarray
+            Averaged surface mass density contrast [Msun h/pc²]
 
         Examples
         --------
@@ -219,10 +269,10 @@ class FastDeltaSigmaCalculator:
 
         Notes
         -----
-        The lensing signal is simply the sum of individual contributions:
+        The lensing signal is the average of individual contributions:
 
         .. math::
-            \\Delta\\Sigma_{total}(r_p) = \\sum_{i=1}^{N_{gal}} \\Delta\\Sigma_i(r_p)
+            \\Delta\\Sigma_{avg}(r_p) = \\frac{1}{N_{gal}} \\sum_{i=1}^{N_{gal}} \\Delta\\Sigma_i(r_p)
 
         where each ΔΣ_i is interpolated from nearby pre-computed values.
         """
@@ -241,8 +291,8 @@ class FastDeltaSigmaCalculator:
         if verbose:
             print(f"Computing ΔΣ for {n_galaxies} galaxies...")
 
-        # Initialize total ΔΣ
-        delta_sigma_total = np.zeros(n_bins)
+        # Initialize sum
+        delta_sigma_sum = np.zeros(n_bins)
 
         # Sum contributions from all galaxies
         for i, gal_pos in enumerate(galaxy_positions):
@@ -252,16 +302,19 @@ class FastDeltaSigmaCalculator:
             # Interpolate ΔΣ at this galaxy position
             delta_sigma_i = self.interpolate_deltasigma_at_position(gal_pos)
 
-            # Add to total
-            delta_sigma_total += delta_sigma_i
+            # Add to sum
+            delta_sigma_sum += delta_sigma_i
+
+        # Average over all galaxies (galaxy-galaxy lensing is an average, not a sum)
+        delta_sigma_avg = delta_sigma_sum / n_galaxies
 
         # Compute bin centers
         rp_centers = np.sqrt(rp_bins[:-1] * rp_bins[1:])
 
         if verbose:
-            print(f"Done! Total ΔΣ computed at {n_bins} radial bins")
+            print(f"Done! Averaged ΔΣ computed at {n_bins} radial bins")
 
-        return rp_centers, delta_sigma_total
+        return rp_centers, delta_sigma_avg
 
     def compute_deltasigma_averaged(
         self,

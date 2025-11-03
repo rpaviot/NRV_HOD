@@ -110,20 +110,19 @@ def rescale_Ac_to_target_ngal(
     params: Dict[str, float],
     target_ngal: float,
     Ac_fiducial: float = 1.0
-) -> float:
+) -> Tuple[float, float]:
     """
-    Rescale Ac to achieve a target galaxy number density.
+    Rescale Ac AND As to achieve a target galaxy number density.
 
-    This function directly computes the rescaled Ac needed to match the target
-    number density. Since ngal is linearly proportional to Ac (for independent
-    central/satellite occupations), the rescaling is exact in one step.
+    This function computes the rescaling factor needed to match the target
+    number density while preserving the ratio Ac/As (which governs clustering).
 
     Parameters
     ----------
     hod_model : HOD_models.Occupation
         HOD model instance with cosmology and mass function set
     params : dict
-        HOD parameters (excluding Ac)
+        HOD parameters including 'As' but excluding 'Ac'
     target_ngal : float
         Target galaxy number density [(Mpc/h)^-3]
     Ac_fiducial : float, default=1.0
@@ -132,7 +131,9 @@ def rescale_Ac_to_target_ngal(
     Returns
     -------
     Ac_rescaled : float
-        Rescaled central amplitude that achieves the target number density
+        Rescaled central amplitude
+    As_rescaled : float
+        Rescaled satellite amplitude (preserving Ac/As ratio)
 
     Raises
     ------
@@ -141,30 +142,36 @@ def rescale_Ac_to_target_ngal(
 
     Examples
     --------
-    >>> Ac_new = rescale_Ac_to_target_ngal(
-    ...     halo.HOD, params, target_ngal=1e-3, Ac_fiducial=0.5
+    >>> Ac_new, As_new = rescale_Ac_to_target_ngal(
+    ...     halo.HOD, params, target_ngal=1e-3, Ac_fiducial=1.0
     ... )
-    >>> print(f"Rescaled Ac: {Ac_new:.4f}")
+    >>> # Both Ac and As are rescaled by the same factor
+    >>> print(f"Rescaled Ac: {Ac_new:.4f}, As: {As_new:.4f}")
 
     Notes
     -----
     The rescaling formula is:
 
     .. math::
-        A_c^{new} = A_c^{old} \\times \\frac{n_{gal}^{target}}{n_{gal}^{old}}
+        ratio = \\frac{n_{gal}^{target}}{n_{gal}^{fiducial}}
 
-    This works because ngal is linearly proportional to Ac when central and
-    satellite occupations are independent.
+        A_c^{new} = A_c^{fid} \\times ratio
+
+        A_s^{new} = A_s^{old} \\times ratio
+
+    This preserves the ratio Ac/As which determines the clustering signal.
     """
     # Compute ngal with fiducial Ac
     ngal_fiducial = compute_ngal_with_fiducial_Ac(hod_model, params, Ac_fiducial)
 
-    # Rescale Ac linearly (ngal ∝ Ac for independent central/satellite)
-    Ac_rescaled = Ac_fiducial * (target_ngal / ngal_fiducial)
+    # Compute rescaling factor to maintain Ac/As ratio
+    rescale_factor = target_ngal / ngal_fiducial
 
-    # Convert to float to avoid numpy array formatting issues
-    return float(Ac_rescaled)
+    # Rescale both Ac and As by the same factor to preserve Ac/As ratio
+    Ac_rescaled = Ac_fiducial * rescale_factor
+    As_rescaled = params['As'] * rescale_factor
 
+    return Ac_rescaled, As_rescaled
 
 def create_latin_hypercube(
     param_ranges: Dict[str, Tuple[float, float]],
@@ -550,12 +557,14 @@ def generate_hod_parameter_grid(
         # Get parameters for this sample
         params = lhs_samples.iloc[i].to_dict()
 
-        # Rescale Ac to achieve target ngal
-        Ac_rescaled = rescale_Ac_to_target_ngal(
+        # Rescale Ac and As to achieve target ngal (preserving Ac/As ratio)
+        Ac_rescaled, _ = rescale_Ac_to_target_ngal(
             halo.HOD, params, target_ngal, Ac_fiducial
         )
 
         Ac_values[i] = Ac_rescaled
+        # Note: As is NOT updated in the grid - we keep the sampled As values
+        # Rescaling happens at prediction time by calling rescale_Ac_to_target_ngal
 
     # Combine into final DataFrame
     param_grid = lhs_samples.copy()

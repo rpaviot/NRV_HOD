@@ -216,13 +216,13 @@ class DeltaSigmaCalculator:
         """Function to integrate for surface density"""
         return self.spline_xigm(np.sqrt(r_proj**2 + chi**2))
     
-    def compute_sigma(self, r, chi_max=150):
+    def compute_sigma(self, r, chi_max=100):
         """Compute surface density at radii rr"""
         SIGMA = 2 * gauss_legendre_integration(self.sigma_integrand, 0, chi_max, r_proj=r)
         
         # Store SIGMA and create its spline
         self.SIGMA = SIGMA
-        self.spline_SIGMA = interp1d(r, SIGMA, bounds_error=False, 
+        self.spline_SIGMA = interp1d(r, SIGMA, kind='cubic',bounds_error=False, 
                                     fill_value=(SIGMA[0], 0))
         return SIGMA
     

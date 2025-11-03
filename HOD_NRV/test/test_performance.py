@@ -35,21 +35,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from HOD_NRV.HOD.HOD_catalogue import HaloOccupation
 from HOD_NRV.utils.emulator_utils import rescale_Ac_to_target_ngal
-
-
-def print_header(title):
-    """Print formatted section header."""
-    print("\n" + "="*70)
-    print(f"  {title}")
-    print("="*70)
-
-
-def print_timing(step_name, elapsed_time, units="s"):
-    """Print timing result."""
-    if units == "ms":
-        print(f"  ⏱  {step_name:40s} {elapsed_time*1000:8.2f} ms")
-    else:
-        print(f"  ⏱  {step_name:40s} {elapsed_time:8.3f} s")
+from test_utils import print_header, print_timing
 
 
 def main():
@@ -149,25 +135,29 @@ def main():
     halo.set_halo_model('ELG_GHOD')
 
     start = time.time()
-    Ac_rescaled = rescale_Ac_to_target_ngal(
+    Ac_rescaled, As_rescaled = rescale_Ac_to_target_ngal(
         halo.HOD, hod_params_base, target_ngal, Ac_fiducial=1.0
     )
     elapsed_rescale = time.time() - start
 
-    # Compute achieved ngal with rescaled Ac
+    # Compute achieved ngal with rescaled Ac and As
     hod_params_check = hod_params_base.copy()
     hod_params_check['Ac'] = Ac_rescaled
-    ngal_achieved = float(halo.HOD.compute_ngal(hod_params_check))
+    hod_params_check['As'] = As_rescaled
+    ngal_achieved = halo.HOD.compute_ngal(hod_params_check)
 
-    print_timing("Rescale Ac to target ngal", elapsed_rescale)
+    print_timing("Rescale Ac and As to target ngal", elapsed_rescale)
     print(f"    → Rescaled Ac: {float(Ac_rescaled):.6f}")
-    print(f"    → Achieved ngal: {ngal_achieved:.6e} (h/Mpc)^3")
-    print(f"    → Target ngal: {target_ngal:.6e} (h/Mpc)^3")
-    print(f"    → Relative error: {abs(ngal_achieved - target_ngal)/target_ngal * 100:.2e}%")
+    print(f"    → Rescaled As: {float(As_rescaled):.6f}")
+    print(f"    → Ac/As ratio: {float(Ac_rescaled/As_rescaled):.6f}")
+    print(f"    → Achieved ngal: {float(ngal_achieved):.6e} (h/Mpc)^3")
+    print(f"    → Target ngal: {float(target_ngal):.6e} (h/Mpc)^3")
+    print(f"    → Relative error: {float(abs(ngal_achieved - target_ngal)/target_ngal * 100):.2e}%")
 
-    # Add Ac to parameters
+    # Add rescaled Ac and As to parameters
     hod_params = hod_params_base.copy()
     hod_params['Ac'] = Ac_rescaled
+    hod_params['As'] = As_rescaled
 
     # ========================================================================
     # Step 4: Compute HOD Occupation Probabilities
