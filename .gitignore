@@ -183,4 +183,12 @@ example_emulator_parameter_generation.py
 test_emulator_performance.ipynb
 HOD_NRV/test/output
 HOD_NRV/twopoint_calculator/README_MEMMAP.md
-two_point.py 
+two_point.py
+
+# IDE and editor directories
+.vscode/
+.claude/
+
+# Project-specific files
+twopoint.py
+HOD_NRV2_part2.ipynb
