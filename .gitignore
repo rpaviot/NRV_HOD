@@ -190,5 +190,7 @@ two_point.py
 .claude/
 
 # Project-specific files
-twopoint.py
 HOD_NRV2_part2.ipynb
+
+# macOS
+.DS_Store
