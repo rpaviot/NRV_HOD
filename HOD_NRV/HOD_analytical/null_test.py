@@ -95,10 +95,10 @@ hod_params_natural = {
 # M [Msun/h] = M [Msun] / h  =>  log10(M [Msun/h]) = log10(M [Msun]) - log10(h)
 log10h = np.log10(h)
 hod_params_h_units = {
-    'log10Mmin': 12.0 - log10h,   # log10(Mmin / [Msun/h])
+    'log10Mmin': 12.0 + log10h,   # log10(Mmin / [Msun/h])
     'siglnM': 0.4,
-    'log10M0': 11.5 - log10h,
-    'log10M1': 13.3 - log10h,
+    'log10M0': 11.5 + log10h,
+    'log10M1': 13.3 + log10h,
     'alpha': 1.0
 }
 
@@ -178,16 +178,23 @@ def compute_pyccl_power_spectra(cosmo, hod_params_h, z_array,
     concentration = ccl.halos.ConcentrationDuffy08(mass_def=mass_def)
     mass_func = ccl.halos.MassFuncTinker08(mass_def=mass_def)
     halo_bias = ccl.halos.HaloBiasTinker10(mass_def=mass_def)
+
+    hod_params_h2 = hod_params_h.copy()
+    if units_per_h==True:
+        hod_params_h2['log10Mmin'] = hod_params_h['log10Mmin'] - np.log10(h_val)
+        hod_params_h2['log10M0'] = hod_params_h['log10M0'] - np.log10(h_val)
+        hod_params_h2['log10M1'] = hod_params_h['log10M1'] - np.log10(h_val)
+
     
     # IMPORTANT: pyccl HaloProfileHOD expects mass parameters in h-units!
     prof_hod = ccl.halos.HaloProfileHOD(
         mass_def=mass_def,
         concentration=concentration,
-        log10Mmin_0=hod_params_h['log10Mmin'],
-        siglnM_0=hod_params_h['siglnM'],
-        log10M0_0=hod_params_h['log10M0'],
-        log10M1_0=hod_params_h['log10M1'],
-        alpha_0=hod_params_h['alpha'],
+        log10Mmin_0=hod_params_h2['log10Mmin'],
+        siglnM_0=hod_params_h2['siglnM'],
+        log10M0_0=hod_params_h2['log10M0'],
+        log10M1_0=hod_params_h2['log10M1'],
+        alpha_0=hod_params_h2['alpha'],
         fc_0=1.0,
         ns_independent=True
     )
@@ -241,6 +248,7 @@ def compute_pyccl_power_spectra(cosmo, hod_params_h, z_array,
     else:
         k_out = k_arr_natural
     
+
     return k_out, Pk_gg, Pk_gm, n_gal
 
 
@@ -267,10 +275,16 @@ def run_null_test(units_per_h: bool):
     print("\n" + "-"*50)
     print("COMPUTING PYCCL REFERENCE")
     print("-"*50)
+
+
+    if units_per_h:
+        input_params = hod_params_h_units
+    else:
+        input_params = hod_params_natural
     
     t0 = time.time()
     k_pyccl, Pk_gg_pyccl, Pk_gm_pyccl, ngal_pyccl = compute_pyccl_power_spectra(
-        cosmo, hod_params_natural, z_array,
+        cosmo, input_params, z_array,
         k_min=k_min, k_max=k_max, n_k=n_k,
         M_min=M_min, M_max=M_max, n_M=n_M,
         units_per_h=units_per_h
@@ -307,7 +321,6 @@ def run_null_test(units_per_h: bool):
         k_array=np.geomspace(k_min, k_max, n_k),  # Always in natural units (1/Mpc)
         M_min=M_min,
         M_max=M_max,
-        n_M_points=n_M,
         units_per_h=units_per_h,
         verbose=True
     )
@@ -394,7 +407,6 @@ def test_csmf_hod():
         k_array=np.geomspace(k_min, k_max, n_k),
         M_min=M_min,
         M_max=M_max,
-        n_M_points=n_M,
         units_per_h=False,  # Natural units
         masses_are_log10=True,
         verbose=True

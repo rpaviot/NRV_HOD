@@ -18,6 +18,7 @@ Author: NRVpy Development Team
 import numpy as np
 from typing import Tuple, Optional
 import warnings
+from scipy.interpolate import interp1d
 
 try:
     from fastpt import HT
@@ -27,6 +28,19 @@ except ImportError:
     warnings.warn(
         "FAST-PT not available. Install with: pip install FAST-PT\n"
         "See: https://github.com/JoeMcEwen/FAST-PT"
+    )
+
+# Import DeltaSigmaCalculator and bin averaging utility
+try:
+    from HOD_NRV.HOD_numerical.twopoint_calculator.standard_two_point_calculator import (
+        DeltaSigmaCalculator,
+        binavg_2D
+    )
+    HAS_DELTASIGMA = True
+except ImportError:
+    HAS_DELTASIGMA = False
+    warnings.warn(
+        "DeltaSigmaCalculator not available. Traditional method will not work."
     )
 
 
@@ -110,7 +124,8 @@ def Pk_to_xi_gm(k: np.ndarray, Pk_gm: np.ndarray) -> Tuple[np.ndarray, np.ndarra
     return r, xi_gm
 
 
-def Pk_to_wgg_direct(k: np.ndarray, Pk_gg: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def Pk_to_wgg_direct(k: np.ndarray, Pk_gg: np.ndarray,
+                     r_out, rp_bins: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     Direct transform from P_gg(k) to projected correlation w_gg(r).
 
@@ -126,30 +141,49 @@ def Pk_to_wgg_direct(k: np.ndarray, Pk_gg: np.ndarray) -> Tuple[np.ndarray, np.n
         Wavenumbers [h/Mpc or 1/Mpc], must be log-spaced
     Pk_gg : array
         Galaxy power spectrum [(Mpc/h)³ or Mpc³]
+    r_out: array
+    r_bins : array, optional
+        Bin edges for averaging [Mpc/h]. If provided, returns bin-averaged w_gg.
+        If None (default), returns point evaluations at transform radii.
 
     Returns
     -------
     r : array
         Projected radii [Mpc/h or Mpc]
+        - If r_bins is None: transform radii
+        - If r_bins provided: bin centers (geometric mean)
     wgg : array
         Projected correlation function [Mpc/h or Mpc]
+        - If r_bins is None: point evaluations
+        - If r_bins provided: bin-averaged values
 
     Examples
     --------
     >>> k = np.logspace(-3, 2, 512)
+    >>> # Point evaluations
     >>> r, wgg = Pk_to_wgg_direct(k, Pk_gg)
+    >>> # Bin-averaged
+    >>> r_bins = np.logspace(-1, 1.5, 10)
+    >>> r_centers, wgg_avg = Pk_to_wgg_direct(k, Pk_gg, r_bins=r_bins)
     """
     if not HAS_FASTPT:
         raise ImportError("FAST-PT is required. Install with: pip install FAST-PT")
 
     # Direct transform for w_gg
     r, wgg_full = HT.k_to_r(k, Pk_gg, alpha_k=1., beta_r=-1., mu=0., pf=1./(2*np.pi))
+    spline_wgg = interp1d(r, wgg_full, kind='cubic', bounds_error=False,
+                            fill_value=(wgg_full[0], wgg_full[-1]))
 
-    return r, wgg_full
+    if rp_bins is not None:
+        wgg_avg = binavg_2D(spline_wgg, rp_bins)
+        return r_out, wgg_avg
+    else:
+        return r_out, spline_wgg(r_out)
 
 
 def Pk_to_DeltaSigma_direct(k: np.ndarray, Pk_gm: np.ndarray,
-                             rho_m: float) -> Tuple[np.ndarray, np.ndarray]:
+                             rho_m: float, r_out, 
+                             rp_bins: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     Direct transform from P_gm(k) to DeltaSigma(R) (Method 2).
 
@@ -170,14 +204,22 @@ def Pk_to_DeltaSigma_direct(k: np.ndarray, Pk_gm: np.ndarray,
     rho_m : float
         Mean matter density in comoving units
         [Msun/h / (Mpc/h)³] if using h-units
+    r_out : float 
+    r_bins : array, optional
+        Bin edges for averaging [Mpc/h]. If provided, returns bin-averaged ΔΣ.
+        If None (default), returns point evaluations at transform radii.
 
     Returns
     -------
     r : array
         Projected radii [Mpc/h or Mpc]
+        - If r_bins is None: transform radii
+        - If r_bins provided: bin centers (geometric mean)
     DeltaSigma : array
         Surface mass density contrast
         [Msun/h / (Mpc/h)²] if using h-units
+        - If r_bins is None: point evaluations
+        - If r_bins provided: bin-averaged values
 
     Notes
     -----
@@ -188,7 +230,11 @@ def Pk_to_DeltaSigma_direct(k: np.ndarray, Pk_gm: np.ndarray,
     --------
     >>> k = np.logspace(-3, 2, 512)
     >>> rho_m = 2.775e11  # Msun/h / (Mpc/h)^3
+    >>> # Point evaluations
     >>> r, ds = Pk_to_DeltaSigma_direct(k, Pk_gm, rho_m)
+    >>> # Bin-averaged
+    >>> r_bins = np.logspace(-1, 1.5, 10)
+    >>> r_centers, ds_avg = Pk_to_DeltaSigma_direct(k, Pk_gm, rho_m, r_bins=r_bins)
     """
     if not HAS_FASTPT:
         raise ImportError("FAST-PT is required. Install with: pip install FAST-PT")
@@ -197,9 +243,16 @@ def Pk_to_DeltaSigma_direct(k: np.ndarray, Pk_gm: np.ndarray,
     r, ds_unnormalized = HT.k_to_r(k, Pk_gm, alpha_k=1., beta_r=-1., mu=2., pf=1./(2*np.pi))
 
     # Rescale by rho_m
-    DeltaSigma = ds_unnormalized * rho_m
+    DeltaSigma = ds_unnormalized * rho_m / 1e12 
+    spline_ds = interp1d(r, DeltaSigma, kind='cubic', bounds_error=False,
+                        fill_value=(DeltaSigma[0], DeltaSigma[-1]))
+    if rp_bins is not None:
+        # Bin-average using binavg_2D
 
-    return r, DeltaSigma
+        ds_avg = binavg_2D(spline_ds, rp_bins)
+        return r_out, ds_avg
+    else:
+        return r_out, spline_ds(r_out)
 
 
 # ============================================================================
@@ -207,8 +260,11 @@ def Pk_to_DeltaSigma_direct(k: np.ndarray, Pk_gm: np.ndarray,
 # ============================================================================
 
 def Pk_gm_to_DeltaSigma_traditional(k: np.ndarray, Pk_gm: np.ndarray,
-                                    R_out: np.ndarray, rho_m: float,
-                                    chi_max: float = 100.0) -> np.ndarray:
+                                    rho_m: float,
+                                    R_out: np.ndarray,
+                                    chi_max: float = 100.0,
+                                    rp_bins : np.ndarray = None,
+                                    ) -> np.ndarray:
     """
     Compute DeltaSigma from P_gm using traditional method (Method 1).
 
@@ -222,16 +278,23 @@ def Pk_gm_to_DeltaSigma_traditional(k: np.ndarray, Pk_gm: np.ndarray,
     Pk_gm : array
         Galaxy-matter power spectrum [(Mpc/h)³ or Mpc³]
     R_out : array
-        Projected radii [Mpc/h or Mpc]
+        Projected radii or bin edges [Mpc/h or Mpc]
+        - If bin_avg=False: radii for point evaluation
+        - If bin_avg=True: bin edges for averaging
     rho_m : float
         Mean matter density [Msun/h / (Mpc/h)³]
-    chi_max : float
+    chi_max : float, default=100.0
         Maximum line-of-sight distance [Mpc/h or Mpc]
+    bin_avg : bool, default=False
+        If True, treat R_out as bin edges and return bin-averaged ΔΣ.
+        If False, treat R_out as radii and return point evaluations.
 
     Returns
     -------
     DeltaSigma : array
         Surface mass density contrast [Msun h/pc²]
+        - If bin_avg=False: shape matches R_out
+        - If bin_avg=True: shape is (len(R_out)-1,)
 
     See Also
     --------
@@ -242,19 +305,28 @@ def Pk_gm_to_DeltaSigma_traditional(k: np.ndarray, Pk_gm: np.ndarray,
     >>> k = np.logspace(-3, 2, 512)
     >>> R = np.logspace(-1, 1.5, 15)
     >>> rho_m = 2.775e11
+    >>> # Point evaluations
     >>> ds = Pk_gm_to_DeltaSigma_traditional(k, Pk_gm, R, rho_m)
+    >>> # Bin-averaged
+    >>> R_bins = np.logspace(-1, 1.5, 10)
+    >>> ds_avg = Pk_gm_to_DeltaSigma_traditional(k, Pk_gm, R_bins, rho_m, bin_avg=True)
     """
-    from HOD_NRV.HOD_numerical.twopoint_calculator.standard_two_point_calculator import DeltaSigmaCalculator
+    if not HAS_DELTASIGMA:
+        raise ImportError("DeltaSigmaCalculator not available. Install HOD_NRV package.")
 
     # Transform P_gm -> xi_gm using FAST-PT
     r, xi_gm = Pk_to_xi_gm(k, Pk_gm)
 
-    # Use DeltaSigmaCalculator to compute DeltaSigma from xi_gm
-    calc = DeltaSigmaCalculator(r, xi_gm, rho_m)
-    calc.compute_sigma(r, chi_max=chi_max)
-    DeltaSigma = calc.compute_deltasigma(R_out)
+    # Use DeltaSigmaCalculator (now computes everything at init)
+    calc = DeltaSigmaCalculator(r, xi_gm, rho_m, chi_max=chi_max)
 
-    return DeltaSigma
+    # Evaluate or average
+    if rp_bins is not None:
+        DeltaSigma = calc.compute_deltasigma_averaged(rp_bins)
+    else:
+        DeltaSigma = calc.compute_deltasigma(R_out)
+
+    return R_out, DeltaSigma
 
 
 # ============================================================================
@@ -263,8 +335,10 @@ def Pk_gm_to_DeltaSigma_traditional(k: np.ndarray, Pk_gm: np.ndarray,
 
 def Pk_gm_to_DeltaSigma(k: np.ndarray, Pk_gm: np.ndarray,
                         R_out: np.ndarray, rho_m: float,
+                        rp_bins : str = None,
                         method: str = 'direct',
-                        chi_max: float = 100.0) -> np.ndarray:
+                        chi_max: float = 100.0,
+                        bin_avg: bool = False) -> np.ndarray:
     """
     Compute DeltaSigma from P_gm with choice of method.
 
@@ -275,14 +349,17 @@ def Pk_gm_to_DeltaSigma(k: np.ndarray, Pk_gm: np.ndarray,
     Pk_gm : array
         Galaxy-matter power spectrum [(Mpc/h)³ or Mpc³]
     R_out : array
-        Projected radii [Mpc/h or Mpc]
     rho_m : float
         Mean matter density [Msun/h / (Mpc/h)³]
     method : str, default='direct'
         'direct' - Direct Hankel transform (Method 2, faster)
         'traditional' - Via xi_gm integration (Method 1, matches numerical code)
-    chi_max : float
+    chi_max : float, default=100.0
         Maximum line-of-sight distance (for traditional method)
+    bin_avg : bool, default=False
+        If True, treat R_out as bin edges and return bin-averaged ΔΣ.
+        If False, treat R_out as radii and return point evaluations.
+    rp_bins: Optional
 
     Returns
     -------
@@ -291,23 +368,20 @@ def Pk_gm_to_DeltaSigma(k: np.ndarray, Pk_gm: np.ndarray,
 
     Examples
     --------
-    >>> # Direct method (faster)
+    >>> # Direct method (faster), point evaluation
     >>> ds = Pk_gm_to_DeltaSigma(k, Pk_gm, R, rho_m, method='direct')
     >>>
-    >>> # Traditional method (matches numerical code)
-    >>> ds = Pk_gm_to_DeltaSigma(k, Pk_gm, R, rho_m, method='traditional')
+    >>> # Traditional method, bin-averaged
+    >>> R_bins = np.logspace(-1, 1.5, 10)
+    >>> ds_avg = Pk_gm_to_DeltaSigma(k, Pk_gm, R_bins, rho_m,
+    ...                              method='traditional', bin_avg=True)
     """
     if method == 'direct':
-        # Method 2: Direct transform
-        r, ds = Pk_to_DeltaSigma_direct(k, Pk_gm, rho_m)
-        # Interpolate to R_out
-        ds_out = np.interp(R_out, r, ds)
-        # Convert to Msun h/pc²
-        return ds_out / 1e12
+        return Pk_to_DeltaSigma_direct(k, Pk_gm, rho_m,R_out,rp_bins=rp_bins)
 
     elif method == 'traditional':
-        # Method 1: Via xi_gm
-        return Pk_gm_to_DeltaSigma_traditional(k, Pk_gm, R_out, rho_m, chi_max=chi_max)
+        return Pk_gm_to_DeltaSigma_traditional(k, Pk_gm, R_out, rho_m,rp_bins=rp_bins,
+                                               chi_max=chi_max, bin_avg=bin_avg)
 
     else:
         raise ValueError(f"Unknown method: {method}. Use 'direct' or 'traditional'")

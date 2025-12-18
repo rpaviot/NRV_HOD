@@ -63,7 +63,6 @@ from .halo_model import (
 
     # Factory and convenience functions
     create_hod,
-    compute_power_spectra,
 
     # Parameter definitions
     STANDARD_HOD_PARAMS,
@@ -71,9 +70,6 @@ from .halo_model import (
 
     # Validation
     validate_hod_params,
-
-    # Utilities
-    get_simpson_weights,
 
     # Documentation
     UNIT_CONVERSION_INFO,
@@ -88,7 +84,6 @@ __all__ = [
 
     # Factory and convenience functions
     'create_hod',
-    'compute_power_spectra',
 
     # Parameter definitions
     'STANDARD_HOD_PARAMS',
@@ -96,9 +91,6 @@ __all__ = [
 
     # Validation
     'validate_hod_params',
-
-    # Utilities
-    'get_simpson_weights',
 
     # Documentation
     'UNIT_CONVERSION_INFO',

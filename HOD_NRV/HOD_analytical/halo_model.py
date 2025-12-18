@@ -1,27 +1,18 @@
 """
-Optimized Halo Model Power Spectrum Calculator with Full Vmap
-=============================================================
+Optimized Halo Model Power Spectrum Calculator with Full JAX/Vmap
+=================================================================
 
-This module provides a highly optimized JAX-based halo model calculator
-for computing galaxy-galaxy (P_gg) and galaxy-matter (P_gm) power spectra
-across multiple redshifts.
+Key Design Principles:
+- z_array defines the exact redshifts for output (no interpolation)
+- Gauss-Legendre integration everywhere (no trapezoid)
+- Pure JAX functions for JIT/vmap compatibility
+- numpy only for pyccl calls, JAX for everything else
+- Single z → squeezed output shapes
+- Multi z → Mstar arrays must match z_array length
 
-Key Features:
-- Full vmap over ALL dimensions including redshift
-- Support for Standard HOD and CSMF (Conditional Stellar Mass Function)
-- Correct unit conversion between natural units and h-units
-- Pre-computed quantities for efficient MCMC sampling
-
-Unit Conversion Rules (CCL natural -> h-units):
-    k [h/Mpc]                = k [1/Mpc] / h
-    P(k) [(Mpc/h)³]          = P(k) [Mpc³] × h³
-    M_halo [Msun/h]          = M [Msun] × h
-    M_stellar [Msun/h²]      = M* [Msun] × h²
-    dn/dlogM [(Mpc/h)⁻³]     = dn/dlogM [Mpc⁻³] / h²  (NOT h³, because of h in logM!)
-    ρ_m [(Msun/h)/(Mpc/h)³]  = ρ_m [Msun/Mpc³] / h²
-    n_gal [(Mpc/h)⁻³]        = n_gal [Mpc⁻³] / h³
-
-Author: Optimized implementation for MCMC chains
+Unit Conversion Strategy:
+    pyccl computes in natural units (Msun, Mpc, 1/Mpc)
+    When units_per_h=True: outputs converted to h-units
 """
 
 import numpy as np
@@ -31,47 +22,140 @@ from jax import jit, vmap
 from jax.scipy.special import erf as erf_jax
 from functools import partial
 import pyccl as ccl
-from scipy.integrate import simpson
-from scipy.special import erf
-from scipy.interpolate import interp1d
-import time
+from scipy.special import roots_legendre
 from enum import Enum
-from typing import Dict, Optional, Union, Tuple
-from dataclasses import dataclass
+from typing import Dict, Optional, Union, Tuple, Callable
 
 # Import Hankel transform utilities
 from HOD_NRV.utilsf.hankel_transforms import (
     Pk_to_wgg_direct,
     Pk_to_DeltaSigma_direct,
-    Pk_gm_to_DeltaSigma_traditional
+    Pk_gm_to_DeltaSigma_traditional,
 )
-from HOD_NRV.utilsf.utils_functions import gauss_legendre_integration
 
-# Enable 64-bit precision in JAX
+# Enable 64-bit precision
 jax.config.update("jax_enable_x64", True)
 
 
 # ============================================================================
-# HOD Types Enumeration
+# Gauss-Legendre Integration Utilities
+# ============================================================================
+
+N_GL = 200
+_x_gl, _w_gl = roots_legendre(N_GL)
+GL_X = jnp.array(_x_gl)  # Nodes in [-1, 1]
+GL_W = jnp.array(_w_gl)  # Weights
+
+
+@jit
+def gl_nodes_scaled(a: float, b: float) -> jnp.ndarray:
+    """
+    Scale GL nodes from [-1, 1] to [a, b].
+    
+    Parameters
+    ----------
+    a, b : float
+        Integration bounds
+    
+    Returns
+    -------
+    nodes : array, shape (N_GL,)
+        Scaled nodes in [a, b]
+    
+    Example
+    -------
+    >>> log10M_nodes = gl_nodes_scaled(9.0, 16.0)  # Mass range 1e9 to 1e16
+    >>> M_nodes = 10.0 ** log10M_nodes
+    """
+    return 0.5 * ((b - a) * GL_X + (a + b))
+
+
+@jit
+def gl_integrate_precomputed(integrand: jnp.ndarray, a: float, b: float) -> jnp.ndarray:
+    """
+    Gauss-Legendre integration when integrand is already evaluated at GL nodes.
+    
+    This is the fast path: just a dot product with the weights.
+    
+    Parameters
+    ----------
+    integrand : array, shape (N_GL,) or (N_GL, ...)
+        Integrand values evaluated at GL nodes (from gl_nodes_scaled)
+    a, b : float
+        Integration bounds
+    
+    Returns
+    -------
+    integral : float or array
+        Result of ∫_a^b f(x) dx
+    
+    Example
+    -------
+    >>> # Precompute at GL nodes
+    >>> log10M_nodes = gl_nodes_scaled(9.0, 16.0)
+    >>> n_M = mass_function(10**log10M_nodes)  # shape (N_GL,)
+    >>> N_c = occupation(10**log10M_nodes)      # shape (N_GL,)
+    >>> 
+    >>> # Integrate: just a dot product!
+    >>> n_gal = gl_integrate_precomputed(N_c * n_M, 9.0, 16.0)
+    """
+    return 0.5 * (b - a) * jnp.dot(GL_W, integrand)
+
+
+def make_gl_integrator(f: Callable) -> Callable:
+    """
+    Create a JIT-compiled Gauss-Legendre integrator for function f.
+    
+    Use this when you need to integrate a function that is NOT precomputed
+    at GL nodes (e.g., integrating over stellar mass in CSMF).
+    
+    Parameters
+    ----------
+    f : callable
+        Function to integrate. Must be JAX-compatible (jittable).
+        Signature: f(x, *args) where x has shape (N_GL,)
+    
+    Returns
+    -------
+    integrate : callable
+        JIT-compiled function with signature: integrate(a, b, *args) -> float
+    
+    Example
+    -------
+    >>> @jit
+    ... def gaussian(x, mu, sigma):
+    ...     return jnp.exp(-0.5 * ((x - mu) / sigma)**2)
+    >>> 
+    >>> integrate_gaussian = make_gl_integrator(gaussian)
+    >>> 
+    >>> # Integrate N(0,1) from -3 to 3
+    >>> result = integrate_gaussian(-3.0, 3.0, 0.0, 1.0)
+    >>> print(f"Result: {result:.6f}")  # ~2.507 (unnormalized)
+    """
+    @jit
+    def integrate(a: float, b: float, *args):
+        x_scaled = gl_nodes_scaled(a, b)
+        f_values = f(x_scaled, *args)
+        return 0.5 * (b - a) * jnp.dot(GL_W, f_values)
+    
+    return integrate
+
+
+# ============================================================================
+# HOD Types and Validation
 # ============================================================================
 
 class HODType(Enum):
-    """Supported HOD model types"""
     STANDARD = "standard"
     CSMF = "csmf"
 
 
-# ============================================================================
-# HOD Parameter Definitions
-# ============================================================================
-
-# Parameter names expected for each HOD type
 STANDARD_HOD_PARAMS = ['log10Mmin', 'siglnM', 'log10M0', 'log10M1', 'alpha']
 CSMF_HOD_PARAMS = ['M0', 'M1', 'gamma1', 'gamma2', 'sigma_c', 'alpha_s', 'b0', 'b1']
 
 
 def validate_hod_params(hod_type: HODType, params: Dict) -> bool:
-    """Validate that required HOD parameters are present"""
+    """Validate that required HOD parameters are present."""
     if hod_type == HODType.STANDARD:
         required = STANDARD_HOD_PARAMS
     elif hod_type == HODType.CSMF:
@@ -86,459 +170,349 @@ def validate_hod_params(hod_type: HODType, params: Dict) -> bool:
 
 
 # ============================================================================
-# Simpson Integration Weights
+# Pure JIT Functions for HOD (no self, maximum efficiency)
 # ============================================================================
 
-def get_simpson_weights(n: int) -> jnp.ndarray:
+# --- Standard HOD ---
+
+@jit
+def standard_N_central(M: jnp.ndarray, Mmin: float, sigma_lnM: float) -> jnp.ndarray:
     """
-    Compute Simpson's rule weights for integration.
+    Central occupation for Standard HOD.
+    
+    N_cen(M) = 0.5 * [1 + erf((ln(M) - ln(Mmin)) / sigma_lnM)]
+    """
+    x = jnp.log(M / Mmin) / sigma_lnM
+    return 0.5 * (1.0 + erf_jax(x))
+
+
+@jit
+def standard_N_satellite(M: jnp.ndarray, M0: float, M1: float, alpha: float) -> jnp.ndarray:
+    """
+    Satellite occupation for Standard HOD.
+    
+    N_sat(M) = [(M - M0) / M1]^alpha  for M > M0, else 0
+    """
+    return jnp.where(M > M0, ((M - M0) / M1) ** alpha, 0.0)
+
+
+# --- CSMF HOD ---
+
+@jit
+def csmf_Mstar_central(Mh: jnp.ndarray, M0: float, M1: float,
+                        gamma1: float, gamma2: float) -> jnp.ndarray:
+    """Stellar-to-halo mass relation for centrals."""
+    x = Mh / M1
+    return M0 * (x ** gamma1) / ((1 + x) ** (gamma1 - gamma2))
+
+
+@jit
+def csmf_N_central(Mh: jnp.ndarray, Mstar_min: float, Mstar_max: float,
+                   M0: float, M1: float, gamma1: float, gamma2: float,
+                   sigma_c: float) -> jnp.ndarray:
+    """
+    Central occupation for CSMF in stellar mass bin.
+    
+    Integrates lognormal distribution over [Mstar_min, Mstar_max].
+    """
+    Mstar_c = csmf_Mstar_central(Mh, M0, M1, gamma1, gamma2)
+    log_Mstar_c = jnp.log10(Mstar_c)
+    sqrt2_sigma = jnp.sqrt(2.0) * sigma_c
+    
+    erf_max = erf_jax((jnp.log10(Mstar_max) - log_Mstar_c) / sqrt2_sigma)
+    erf_min = erf_jax((jnp.log10(Mstar_min) - log_Mstar_c) / sqrt2_sigma)
+    
+    return jnp.maximum(0.5 * (erf_max - erf_min), 0.0)
+
+
+@jit
+def _csmf_satellite_integrand(log10_Mstar: jnp.ndarray, Mh: float,
+                               M0: float, M1: float, gamma1: float, gamma2: float,
+                               alpha_s: float, b0: float, b1: float) -> jnp.ndarray:
+    """
+    Integrand for CSMF satellite occupation: Φ(M*|Mh) * M* * ln(10).
     
     Parameters
     ----------
-    n : int
-        Number of points (must be odd for proper Simpson's rule)
+    log10_Mstar : array, shape (N_GL,)
+        Log10 stellar mass at GL nodes
+    Mh : float
+        Single halo mass
+    ... : HOD parameters
     
     Returns
     -------
-    weights : jnp.ndarray
-        Integration weights
+    integrand : array, shape (N_GL,)
     """
-    weights = np.ones(n)
-    weights[1:-1:2] = 4.0
-    weights[2:-1:2] = 2.0
-    return jnp.array(weights / 3.0)
+    Mstar = 10.0 ** log10_Mstar
+    
+    # Characteristic stellar mass
+    Mstar_c = csmf_Mstar_central(Mh, M0, M1, gamma1, gamma2)
+    Mstar_s = 0.56 * Mstar_c
+    
+    # Normalization
+    log_phi = b0 + b1 * jnp.log10(Mh / 1e13)
+    phi_s = 10.0 ** log_phi
+    
+    # Schechter-like function
+    x = Mstar / Mstar_s
+    Phi = (phi_s / Mstar_s) * (x ** alpha_s) * jnp.exp(-x**2)
+    
+    # Jacobian for d(log10 M*) integration
+    return Phi * Mstar * jnp.log(10.0)
+
+
+# Create the integrator for satellite occupation
+_integrate_csmf_satellite = make_gl_integrator(_csmf_satellite_integrand)
+
+
+@jit
+def csmf_N_satellite_single(Mh: float, Mstar_min: float, Mstar_max: float,
+                            M0: float, M1: float, gamma1: float, gamma2: float,
+                            alpha_s: float, b0: float, b1: float) -> float:
+    """
+    Satellite occupation for CSMF at single halo mass.
+    
+    Integrates Schechter function over [Mstar_min, Mstar_max].
+    """
+    log10_Mstar_min = jnp.log10(Mstar_min)
+    log10_Mstar_max = jnp.log10(Mstar_max)
+    
+    N_s = _integrate_csmf_satellite(
+        log10_Mstar_min, log10_Mstar_max,
+        Mh, M0, M1, gamma1, gamma2, alpha_s, b0, b1
+    )
+    return jnp.maximum(N_s, 0.0)
+
+
+# vmap over halo mass array
+@jit
+def csmf_N_satellite(Mh: jnp.ndarray, Mstar_min: float, Mstar_max: float,
+                     M0: float, M1: float, gamma1: float, gamma2: float,
+                     alpha_s: float, b0: float, b1: float) -> jnp.ndarray:
+    """
+    Satellite occupation for CSMF over halo mass array.
+    
+    Parameters
+    ----------
+    Mh : array, shape (n_M,)
+        Halo masses
+    Mstar_min, Mstar_max : float
+        Stellar mass bin edges
+    ... : HOD parameters
+    
+    Returns
+    -------
+    N_sat : array, shape (n_M,)
+    """
+    return vmap(
+        lambda m: csmf_N_satellite_single(
+            m, Mstar_min, Mstar_max, M0, M1, gamma1, gamma2, alpha_s, b0, b1
+        )
+    )(Mh)
 
 
 # ============================================================================
-# Standard HOD Model
+# HOD Wrapper Classes
 # ============================================================================
 
 class StandardHOD:
-    """
-    Standard Zheng et al. HOD model.
+    """Standard Zheng et al. HOD model wrapper."""
     
-    The model is defined by:
-        N_cen(M) = 0.5 * [1 + erf((ln(M) - ln(Mmin)) / sigma_lnM)]
-        N_sat(M) = [(M - M0) / M1]^alpha  for M > M0, else 0
-    
-    IMPORTANT: To match pyccl's HaloProfileHOD behavior, HOD mass parameters
-    are stored in h-units (Msun/h) and compared directly against halo masses
-    in natural units (Msun). This is pyccl's convention.
-    
-    Parameters
-    ----------
-    params : dict
-        HOD parameters:
-        - log10Mmin : log10 of minimum halo mass [Msun/h if units_per_h else Msun]
-        - siglnM : scatter in ln(M)
-        - log10M0 : log10 of satellite cutoff mass [Msun/h if units_per_h else Msun]
-        - log10M1 : log10 of satellite normalization mass [Msun/h if units_per_h else Msun]
-        - alpha : satellite power law slope
-    units_per_h : bool
-        If True, mass parameters are assumed to be in Msun/h (standard convention).
-        These are then used directly against natural-unit mass arrays to match pyccl.
-    h : float
-        Hubble parameter h = H0/100 (required if units_per_h=True)
-    """
-    
-    def __init__(self, params: Dict, units_per_h: bool = False, h: Optional[float] = None):
+    def __init__(self, params: Dict):
         validate_hod_params(HODType.STANDARD, params)
-        
-        self.units_per_h = units_per_h
-        self.h = h
         self.hod_type = HODType.STANDARD
-        
-        if units_per_h and h is None:
-            raise ValueError("Must provide h when units_per_h=True")
-        
-        # Store input parameters
         self.params = params.copy()
-        self.sigma_lnM = params['siglnM']
-        self.alpha = params['alpha']
         
-        # pyccl works entirely in natural units (Msun, Mpc).
-        # If units_per_h=True, input masses are in Msun/h and must be
-        # converted to Msun by multiplying by h.
-        # For log10 quantities: log10(M [Msun]) = log10(M [Msun/h]) + log10(h)
-        
-        if units_per_h:
-            log10h = np.log10(h)
-            self.Mmin = 10**(params['log10Mmin'] + log10h)  # Msun/h -> Msun
-            self.M0 = 10**(params['log10M0'] + log10h)
-            self.M1 = 10**(params['log10M1'] + log10h)
-        else:
-            self.Mmin = 10**params['log10Mmin']  # Already in Msun
-            self.M0 = 10**params['log10M0']
-            self.M1 = 10**params['log10M1']
-        
-        # Store as JAX arrays for JIT compilation
-        self._Mmin_jax = jnp.array(self.Mmin)
-        self._M0_jax = jnp.array(self.M0)
-        self._M1_jax = jnp.array(self.M1)
-        self._sigma_lnM_jax = jnp.array(self.sigma_lnM)
-        self._alpha_jax = jnp.array(self.alpha)
+        # Store as JAX scalars
+        self.Mmin = jnp.array(10.0 ** params['log10Mmin'])
+        self.sigma_lnM = jnp.array(params['siglnM'])
+        self.M0 = jnp.array(10.0 ** params['log10M0'])
+        self.M1 = jnp.array(10.0 ** params['log10M1'])
+        self.alpha = jnp.array(params['alpha'])
     
     def N_central(self, M: jnp.ndarray) -> jnp.ndarray:
-        """
-        Central occupation number.
-        
-        Parameters
-        ----------
-        M : array
-            Halo mass in NATURAL units (Msun)
-        
-        Returns
-        -------
-        N_cen : array
-            Mean number of central galaxies
-        """
-        M = jnp.atleast_1d(M)
-        x = jnp.log(M / self._Mmin_jax) / self._sigma_lnM_jax
-        return 0.5 * (1.0 + erf_jax(x))
+        return standard_N_central(M, self.Mmin, self.sigma_lnM)
     
     def N_satellite(self, M: jnp.ndarray) -> jnp.ndarray:
-        """
-        Satellite occupation number.
-        
-        Parameters
-        ----------
-        M : array
-            Halo mass in NATURAL units (Msun)
-        
-        Returns
-        -------
-        N_sat : array
-            Mean number of satellite galaxies
-        """
-        M = jnp.atleast_1d(M)
-        # Use jnp.where for JAX compatibility
-        result = jnp.where(
-            M > self._M0_jax,
-            ((M - self._M0_jax) / self._M1_jax) ** self._alpha_jax,
-            0.0
-        )
-        return result
+        return standard_N_satellite(M, self.M0, self.M1, self.alpha)
 
-
-# ============================================================================
-# CSMF HOD Model (Conditional Stellar Mass Function)
-# ============================================================================
 
 class CSMF_HOD:
-    """
-    Conditional Stellar Mass Function HOD (Dvornik+2022).
+    """CSMF HOD model wrapper (Dvornik+2022)."""
     
-    This model describes the galaxy population as a function of both
-    halo mass and stellar mass.
-    
-    IMPORTANT: Similar to StandardHOD, mass parameters are used directly
-    without unit conversion to maintain consistency with how pyccl handles
-    HOD parameters.
-    
-    Parameters
-    ----------
-    params : dict
-        CSMF parameters:
-        - M0 : characteristic stellar mass normalization (log10 if masses_are_log10=True)
-        - M1 : characteristic halo mass for SHMR (log10 if masses_are_log10=True)
-        - gamma1 : low-mass slope of SHMR
-        - gamma2 : high-mass slope of SHMR
-        - sigma_c : scatter in central stellar mass
-        - alpha_s : satellite Schechter function slope
-        - b0 : satellite normalization intercept
-        - b1 : satellite normalization slope
-    masses_are_log10 : bool
-        If True, M0 and M1 are provided as log10 values
-    units_per_h : bool
-        If True, mass parameters are in h-units (stored but not converted)
-    h : float
-        Hubble parameter (stored for reference)
-    """
-    
-    def __init__(self, params: Dict, masses_are_log10: bool = True,
-                 units_per_h: bool = False, h: Optional[float] = None):
+    def __init__(self, params: Dict, masses_are_log10: bool = True):
         validate_hod_params(HODType.CSMF, params)
-        
-        self.units_per_h = units_per_h
-        self.h = h
         self.hod_type = HODType.CSMF
         self.params = params.copy()
         
-        if units_per_h and h is None:
-            raise ValueError("Must provide h when units_per_h=True")
-        
-        # pyccl works entirely in natural units (Msun, Mpc).
-        # If units_per_h=True:
-        #   - Halo masses (M1) are in Msun/h -> multiply by h
-        #   - Stellar masses (M0) are in Msun/h² -> multiply by h²
-        # For log10 quantities: add log10(h) or 2*log10(h)
-        
+        # Convert masses
         if masses_are_log10:
-            if units_per_h:
-                log10h = np.log10(h)
-                self.M0 = 10**(params['M0'] + 2*log10h)  # Stellar: Msun/h² -> Msun
-                self.M1 = 10**(params['M1'] + log10h)    # Halo: Msun/h -> Msun
-            else:
-                self.M0 = 10**params['M0']
-                self.M1 = 10**params['M1']
+            self.M0 = jnp.array(10.0 ** params['M0'])
+            self.M1 = jnp.array(10.0 ** params['M1'])
         else:
-            if units_per_h:
-                self.M0 = params['M0'] * h**2  # Stellar: Msun/h² -> Msun
-                self.M1 = params['M1'] * h     # Halo: Msun/h -> Msun
-            else:
-                self.M0 = params['M0']
-                self.M1 = params['M1']
+            self.M0 = jnp.array(params['M0'])
+            self.M1 = jnp.array(params['M1'])
         
-        # Other parameters (dimensionless)
-        self.gamma1 = params['gamma1']
-        self.gamma2 = params['gamma2']
-        self.sigma_c = params['sigma_c']
-        self.alpha_s = params['alpha_s']
-        self.b0 = params['b0']
-        self.b1 = params['b1']
-        
-        # Store as JAX arrays
-        self._params_jax = {
-            'M0': jnp.array(self.M0),
-            'M1': jnp.array(self.M1),
-            'gamma1': jnp.array(self.gamma1),
-            'gamma2': jnp.array(self.gamma2),
-            'sigma_c': jnp.array(self.sigma_c),
-            'alpha_s': jnp.array(self.alpha_s),
-            'b0': jnp.array(self.b0),
-            'b1': jnp.array(self.b1)
-        }
-    
-    def Mstar_central(self, Mh: jnp.ndarray) -> jnp.ndarray:
-        """Stellar-to-halo mass relation for centrals"""
-        Mh = jnp.atleast_1d(Mh)
-        x = Mh / self._params_jax['M1']
-        return self._params_jax['M0'] * (x**self._params_jax['gamma1']) / \
-               ((1 + x)**(self._params_jax['gamma1'] - self._params_jax['gamma2']))
-    
-    def Mstar_satellite(self, Mh: jnp.ndarray) -> jnp.ndarray:
-        """Characteristic stellar mass for satellites"""
-        return 0.56 * self.Mstar_central(Mh)
-    
-    def phi_star_satellite(self, Mh: jnp.ndarray) -> jnp.ndarray:
-        """Normalization of satellite Schechter function"""
-        Mh = jnp.atleast_1d(Mh)
-        m13 = Mh / 1e13
-        log_phi = self._params_jax['b0'] + self._params_jax['b1'] * jnp.log10(m13)
-        return 10**log_phi
+        self.gamma1 = jnp.array(params['gamma1'])
+        self.gamma2 = jnp.array(params['gamma2'])
+        self.sigma_c = jnp.array(params['sigma_c'])
+        self.alpha_s = jnp.array(params['alpha_s'])
+        self.b0 = jnp.array(params['b0'])
+        self.b1 = jnp.array(params['b1'])
     
     def N_central(self, Mh: jnp.ndarray, Mstar_min: float, Mstar_max: float) -> jnp.ndarray:
-        """
-        Mean number of centrals in stellar mass bin [Mstar_min, Mstar_max].
-        
-        Parameters
-        ----------
-        Mh : array
-            Halo mass in NATURAL units (Msun)
-        Mstar_min, Mstar_max : float
-            Stellar mass bin edges in NATURAL units (Msun)
-        
-        Returns
-        -------
-        N_cen : array
-            Mean number of central galaxies
-        """
-        Mh = jnp.atleast_1d(Mh)
-        Mstar_c = self.Mstar_central(Mh)
-        
-        log_Mstar_c = jnp.log10(Mstar_c)
-        log_min = jnp.log10(Mstar_min)
-        log_max = jnp.log10(Mstar_max)
-        
-        sqrt2_sigma = jnp.sqrt(2) * self._params_jax['sigma_c']
-        
-        erf_max = erf_jax((log_max - log_Mstar_c) / sqrt2_sigma)
-        erf_min = erf_jax((log_min - log_Mstar_c) / sqrt2_sigma)
-        
-        return jnp.maximum(0.5 * (erf_max - erf_min), 0.0)
+        return csmf_N_central(
+            Mh, Mstar_min, Mstar_max,
+            self.M0, self.M1, self.gamma1, self.gamma2, self.sigma_c
+        )
     
-    def N_satellite(self, Mh: np.ndarray, Mstar_min: float, Mstar_max: float,
-                    n_points: int = 100) -> np.ndarray:
-        """
-        Mean number of satellites in stellar mass bin.
-        
-        Note: Uses scipy for integration, returns numpy array.
-        
-        Parameters
-        ----------
-        Mh : array
-            Halo mass in NATURAL units (Msun)
-        Mstar_min, Mstar_max : float
-            Stellar mass bin edges in NATURAL units (Msun)
-        n_points : int
-            Number of integration points
-        
-        Returns
-        -------
-        N_sat : array
-            Mean number of satellite galaxies
-        """
-        Mh = np.atleast_1d(Mh)
-        
-        log_Mstar = np.linspace(np.log10(Mstar_min), np.log10(Mstar_max), n_points)
-        Mstar = 10**log_Mstar
-        
-        Mstar_jax = jnp.array(Mstar)
-        Mh_jax = jnp.array(Mh)
-        
-        Phi_s = self._Phi_satellite_grid(Mstar_jax, Mh_jax)
-        
-        Phi_s_np = np.array(Phi_s)
-        integrand = Phi_s_np * Mstar[:, np.newaxis] * np.log(10)
-        
-        N_s = simpson(integrand, x=log_Mstar, axis=0)
-        return np.maximum(N_s, 0)
-    
-    def _Phi_satellite_grid(self, Mstar: jnp.ndarray, Mh: jnp.ndarray) -> jnp.ndarray:
-        """Satellite CSMF on grid"""
-        Mstar_s = self.Mstar_satellite(Mh)
-        phi_s = self.phi_star_satellite(Mh)
-        
-        if Mstar.shape != Mh.shape:
-            Mstar = Mstar[:, jnp.newaxis] if Mstar.ndim == 1 else Mstar
-            Mstar_s = Mstar_s[jnp.newaxis, :] if Mstar_s.ndim == 1 else Mstar_s
-            phi_s = phi_s[jnp.newaxis, :] if phi_s.ndim == 1 else phi_s
-        
-        x = Mstar / Mstar_s
-        return (phi_s / Mstar_s) * (x**self._params_jax['alpha_s']) * jnp.exp(-x**2)
+    def N_satellite(self, Mh: jnp.ndarray, Mstar_min: float, Mstar_max: float) -> jnp.ndarray:
+        return csmf_N_satellite(
+            Mh, Mstar_min, Mstar_max,
+            self.M0, self.M1, self.gamma1, self.gamma2,
+            self.alpha_s, self.b0, self.b1
+        )
 
-
-# ============================================================================
-# HOD Factory Function
-# ============================================================================
 
 def create_hod(hod_type: Union[HODType, str], params: Dict,
-               units_per_h: bool = False, h: Optional[float] = None,
                **kwargs) -> Union[StandardHOD, CSMF_HOD]:
-    """
-    Factory function to create HOD models.
-    
-    Parameters
-    ----------
-    hod_type : HODType or str
-        Type of HOD model ('standard' or 'csmf')
-    params : dict
-        HOD parameters
-    units_per_h : bool
-        If True, mass parameters are in h-units
-    h : float
-        Hubble parameter (required if units_per_h=True)
-    **kwargs : dict
-        Additional keyword arguments passed to HOD constructor
-    
-    Returns
-    -------
-    hod : StandardHOD or CSMF_HOD
-        Initialized HOD model
-    """
+    """Factory function for HOD models."""
     if isinstance(hod_type, str):
         hod_type = HODType(hod_type.lower())
     
     if hod_type == HODType.STANDARD:
-        return StandardHOD(params, units_per_h=units_per_h, h=h)
+        return StandardHOD(params)
     elif hod_type == HODType.CSMF:
-        masses_are_log10 = kwargs.get('masses_are_log10', True)
-        return CSMF_HOD(params, masses_are_log10=masses_are_log10,
-                        units_per_h=units_per_h, h=h)
+        return CSMF_HOD(params, masses_are_log10=kwargs.get('masses_are_log10', True))
     else:
         raise ValueError(f"Unknown HOD type: {hod_type}")
 
 
 # ============================================================================
-# Multi-Redshift Halo Model with Full Vmap Optimization
+# Multi-Redshift Halo Model
 # ============================================================================
 
 class MultiRedshiftHaloModel:
     """
-    Maximum optimization halo model: vmap over ALL dimensions including redshift.
+    Optimized halo model with Gauss-Legendre integration.
     
-    This class pre-computes everything and uses a single vmap call
-    to compute P(k,z) for all k and z simultaneously.
+    Design
+    ------
+    - z_array defines exact output redshifts (no interpolation)
+    - Single z: output shapes are squeezed (n_k,) instead of (1, n_k)
+    - Multi z with CSMF: Mstar arrays must have length == len(z_array)
+    - All mass integrals use GL quadrature (precomputed at GL nodes)
     
     Parameters
     ----------
     cosmo : ccl.Cosmology
         CCL cosmology object
     hod_type : HODType or str
-        Type of HOD model ('standard' or 'csmf')
+        'standard' or 'csmf'
     hod_params : dict
-        HOD parameters (masses in h-units if units_per_h=True)
-    z_array : array-like
-        Redshifts to compute
-    k_array : array-like, optional
-        k values in NATURAL units (1/Mpc). Default: logspace(1e-3, 100, 256)
-    M_min, M_max : float, optional
-        Mass integration range in NATURAL units (Msun)
-    n_M_points : int, optional
-        Number of mass integration points
+        HOD parameters
+    z_array : float or array
+        Redshift(s) for output
+    k_array : array, optional
+        k values in natural units (1/Mpc)
+    M_min, M_max : float
+        Mass integration range in natural units (Msun)
     units_per_h : bool
-        If True, input HOD masses are in h-units and output will be in h-units
+        If True, output in h-units
     masses_are_log10 : bool
-        For CSMF: whether M0, M1 are log10 values (default True)
+        For CSMF: whether M0, M1 are log10 values
     verbose : bool
-        Print timing information during initialization
-    
-    Attributes
-    ----------
-    k_array : ndarray
-        k values in output units (h/Mpc if units_per_h else 1/Mpc)
-    z_array : ndarray
-        Redshift array
+        Print timing info
+    median_Mstar : float or array, optional
+        Median stellar mass for stellar point mass GGL contribution.
+        Only available for CSMF models.
+        - If scalar: same stellar mass for all redshifts
+        - If array: must have length == len(z_array)
+        - Units: [Msun/h²] (consistent with CSMF M0, M1)
+        - If None: no stellar component added (default)
     """
     
     def __init__(self, cosmo, hod_type: Union[HODType, str], hod_params: Dict,
                  z_array, k_array: Optional[np.ndarray] = None,
-                 M_min: float = 1e9, M_max: float = 1e16, n_M_points: int = 256,
+                 M_min: float = 1e9, M_max: float = 1e16,
                  units_per_h: bool = False, masses_are_log10: bool = True,
-                 verbose: bool = True):
+                 verbose: bool = True, median_Mstar: Optional[Union[float, np.ndarray]] = None):
         
         self.cosmo = cosmo
         self.h = cosmo['h']
         self.units_per_h = units_per_h
         self.verbose = verbose
         
-        # Parse HOD type
+        # Parse HOD
         if isinstance(hod_type, str):
             hod_type = HODType(hod_type.lower())
         self.hod_type = hod_type
         self.hod_params = hod_params.copy()
-        
-        # Create HOD model (handles unit conversion internally)
-        self.hod = create_hod(
-            hod_type, hod_params,
-            units_per_h=units_per_h, h=self.h,
-            masses_are_log10=masses_are_log10
-        )
-        
-        # Store redshifts
+        self.masses_are_log10 = masses_are_log10
+        self.hod = create_hod(hod_type, hod_params, masses_are_log10=masses_are_log10)
+
+        # Redshift setup
         self.z_array = np.atleast_1d(z_array)
-        self.a_array = 1.0 / (1.0 + self.z_array)
+        self.is_single_z = (len(self.z_array) == 1)
         self.n_z = len(self.z_array)
+        self.a_array = 1.0 / (1.0 + self.z_array)
+
+        # Validate median_Mstar parameter (must come after z_array setup)
+        if median_Mstar is not None:
+            if self.hod_type != HODType.CSMF:
+                raise ValueError(
+                    "median_Mstar parameter is only available for CSMF models. "
+                    "Standard HOD does not include stellar mass modeling."
+                )
+
+            # Convert to array and validate shape
+            median_Mstar_arr = np.atleast_1d(median_Mstar)
+            if len(median_Mstar_arr) == 1:
+                # Scalar: broadcast to all z
+                self.median_Mstar = np.full(self.n_z, float(median_Mstar_arr[0]))
+            elif len(median_Mstar_arr) == self.n_z:
+                # Array: use as-is
+                self.median_Mstar = np.array(median_Mstar_arr)
+            else:
+                raise ValueError(
+                    f"median_Mstar array length ({len(median_Mstar_arr)}) must be "
+                    f"1 (scalar) or match z_array length ({self.n_z})"
+                )
+        else:
+            self.median_Mstar = None
+
+        # Initialize cache for stellar component DeltaSigma
+        self._DeltaSigma_stellar_cache = {}
         
-        # k array in NATURAL units (1/Mpc) for internal computation
+        # k array (natural units)
         if k_array is None:
-            self.k_array_natural = np.geomspace(1e-3, 100, 256)
+            self.k_array_natural = np.geomspace(1e-5, 100, 2048)
         else:
             self.k_array_natural = np.atleast_1d(k_array)
         self.n_k = len(self.k_array_natural)
         
-        # Mass array in NATURAL units (Msun)
-        self.M_arr_natural = np.geomspace(M_min, M_max, n_M_points)
-        self.log10M = np.log10(self.M_arr_natural)
-        self.dlog10M = self.log10M[1] - self.log10M[0]
-        self.n_M = n_M_points
+        # Mass array at GL nodes
+        self.log10M_min = np.log10(M_min)
+        self.log10M_max = np.log10(M_max)
         
-        # JAX arrays
+        # Get GL nodes in log10(M) space
+        log10M_gl = np.array(gl_nodes_scaled(self.log10M_min, self.log10M_max))
+        self.M_arr_natural = 10.0 ** log10M_gl  # (N_GL,)
+        self.n_M = N_GL
+        
+        # JAX mass array (with unit conversion)
+        #if self.units_per_h:
+        #    self.M_arr_jax = jnp.array(self.M_arr_natural * self.h)
+        #else:
+        #    self.M_arr_jax = jnp.array(self.M_arr_natural)
+        
         self.M_arr_jax = jnp.array(self.M_arr_natural)
-        self.log10M_jax = jnp.array(self.log10M)
-        self.simpson_weights_M = get_simpson_weights(n_M_points)
+
+        # Comoving matter density
+        self.RHO_M_comoving = ccl.rho_x(self.cosmo, 1.0, 'matter', is_comoving=True)
         
-        # Setup CCL components
+        # CCL setup
         self.mass_def = ccl.halos.MassDef200c
         self.concentration = ccl.halos.ConcentrationDuffy08(mass_def=self.mass_def)
         self.mass_func = ccl.halos.MassFuncTinker08(mass_def=self.mass_def)
@@ -548,790 +522,569 @@ class MultiRedshiftHaloModel:
             concentration=self.concentration,
             fourier_analytic=True
         )
-
-        # Comoving matter density (redshift-independent due to mass conservation)
-        # Compute once at z=0 (a=1.0) in NATURAL units (Msun/Mpc³)
-        self.RHO_M_comoving = ccl.rho_x(self.cosmo, 1.0, 'matter', is_comoving=True)
-
-        # Pre-compute and build vmap functions
-        if verbose:
-            print("\nPre-computing all quantities...")
-            t_total = time.time()
         
-        t0 = time.time()
-        self._precompute_redshift_quantities()
+        # Precompute and build kernels
         if verbose:
-            print(f"  Redshift quantities: {time.time()-t0:.3f}s")
+            print("Initializing MultiRedshiftHaloModel...")
         
-        t0 = time.time()
-        self._precompute_fourier_profiles()
+        self._precompute_ccl_quantities()
+        self._build_jax_kernels()
+        
         if verbose:
-            print(f"  Fourier profiles: {time.time()-t0:.3f}s")
-        
-        t0 = time.time()
-        self._build_vmap_functions()
-        if verbose:
-            print(f"  JIT/vmap compilation: {time.time()-t0:.3f}s")
-            print(f"Total initialization: {time.time()-t_total:.3f}s\n")
-        
-        # Cache for occupation numbers (for CSMF with stellar mass bins)
-        self._Ncen_cache = {}
-        self._Nsat_cache = {}
+            print(f"  Ready: {self.n_z} redshift(s), {self.n_k} k points, {self.n_M} mass points (GL)")
     
-    def _precompute_redshift_quantities(self):
-        """Pre-compute n(M,z), b(M,z), P_lin(k,z) in NATURAL units"""
-        self.n_M_z = np.zeros((self.n_z, self.n_M))
-        self.b_h_z = np.zeros((self.n_z, self.n_M))
-        self.Pk_lin_z = np.zeros((self.n_z, self.n_k))
-
-        for i, a in enumerate(self.a_array):
-            # All quantities in NATURAL units from CCL
-            self.n_M_z[i] = self.mass_func(self.cosmo, self.M_arr_natural, a)  # Mpc⁻³
-            self.b_h_z[i] = self.halo_bias(self.cosmo, self.M_arr_natural, a)  # dimensionless
-            self.Pk_lin_z[i] = ccl.linear_power(self.cosmo, self.k_array_natural, a)  # Mpc³
-
-        # Convert to JAX arrays
-        self.n_M_z_jax = jnp.array(self.n_M_z)
-        self.b_h_z_jax = jnp.array(self.b_h_z)
-        self.Pk_lin_z_jax = jnp.array(self.Pk_lin_z)
-    
-    def _precompute_fourier_profiles(self):
-        """Pre-compute NFW Fourier profiles in NATURAL units"""
-        # Shape: (n_z, n_k, n_M)
-        self.u_fourier = np.zeros((self.n_z, self.n_k, self.n_M))
+    def _precompute_ccl_quantities(self):
+        """Compute CCL quantities at GL mass nodes, convert to JAX."""
+        if self.verbose:
+            print("  Precomputing CCL quantities at GL nodes...")
+        
+        # Temporary numpy arrays
+        n_M_np = np.zeros((self.n_z, self.n_M))
+        b_h_np = np.zeros((self.n_z, self.n_M))
+        Pk_lin_np = np.zeros((self.n_z, self.n_k))
+        u_fourier_np = np.zeros((self.n_z, self.n_k, self.n_M))
         
         for iz, a in enumerate(self.a_array):
+            n_M_np[iz] = self.mass_func(self.cosmo, self.M_arr_natural, a)
+            b_h_np[iz] = self.halo_bias(self.cosmo, self.M_arr_natural, a)
+            Pk_lin_np[iz] = ccl.linear_power(self.cosmo, self.k_array_natural, a)
+            
             for ik, k in enumerate(self.k_array_natural):
-                self.u_fourier[iz, ik, :] = np.array([
-                    self.nfw_profile._fourier(self.cosmo, k, M, a) 
+                u_fourier_np[iz, ik, :] = np.array([
+                    self.nfw_profile._fourier(self.cosmo, k, M, a)
                     for M in self.M_arr_natural
                 ])
         
-        # Derived profiles
-        self.u_sat = self.u_fourier / self.M_arr_natural[np.newaxis, np.newaxis, :]
-        self.u_matter = self.u_fourier / self.RHO_M_comoving  # Constant comoving density
-
-        # Convert to JAX
-        self.u_sat_jax = jnp.array(self.u_sat)
-        self.u_matter_jax = jnp.array(self.u_matter)
-    
-    def _build_vmap_functions(self):
-        """Build fully vmapped functions for P_gg and P_gm"""
-        dlog10M = self.dlog10M
-        weights = self.simpson_weights_M
-        M_arr = self.M_arr_jax
-        RHO_M = self.RHO_M_comoving  # Capture constant comoving density
+        # Unit conversions
+        if self.units_per_h:
+            n_M_np /= self.h**3
+            Pk_lin_np *= self.h**3
         
-        # P_gg kernel for single (k, z)
+        # Derived quantities
+        RHO_M = self.get_RHO_M()
+        u_sat_np = u_fourier_np / self.M_arr_natural[np.newaxis, np.newaxis, :]
+        u_matter_np = u_fourier_np / RHO_M
+        if self.units_per_h:
+            u_matter_np *= self.h
+        
+        # Convert to JAX
+        self.n_M_z = jnp.array(n_M_np)       # (n_z, N_GL)
+        self.b_h_z = jnp.array(b_h_np)       # (n_z, N_GL)
+        self.Pk_lin_z = jnp.array(Pk_lin_np) # (n_z, n_k)
+        self.u_sat = jnp.array(u_sat_np)     # (n_z, n_k, N_GL)
+        self.u_matter = jnp.array(u_matter_np)  # (n_z, n_k, N_GL)
+
+        # Print stellar mass info if enabled
+        if self.verbose and self.median_Mstar is not None:
+            print("  Stellar point mass component enabled:")
+            if self.is_single_z:
+                print(f"    z={self.z_array[0]:.3f}: M_star = {self.median_Mstar[0]:.2e} Msun/h²")
+            else:
+                for z, mstar in zip(self.z_array, self.median_Mstar):
+                    print(f"    z={z:.3f}: M_star = {mstar:.2e} Msun/h²")
+
+    def _build_jax_kernels(self):
+        """Build JAX kernels using GL integration."""
+        if self.verbose:
+            print("  Building JAX kernels...")
+        
+        log10M_min = self.log10M_min
+        log10M_max = self.log10M_max
+        RHO_M = self.get_RHO_M()
+        M_arr = self.M_arr_jax
+        
+        # --- P_gg kernel (single k, single z) ---
         @jit
-        def _Pgg_single_k_z(N_c, N_s, u_sat, b_h, n_M, Pk_lin, n_gal):
-            """P_gg for single k, single z"""
+        def _Pgg_kernel(N_c, N_s, u_sat_kz, b_h_z, n_M_z, Pk_lin_kz, n_gal_z):
             # 1-halo: central-satellite
-            integrand_cs = 2 * N_c * N_s * u_sat * n_M
-            I_1h_cs = jnp.sum(integrand_cs * weights) * dlog10M
+            integrand_cs = 2 * N_c * N_s * u_sat_kz * n_M_z
+            I_1h_cs = gl_integrate_precomputed(integrand_cs, log10M_min, log10M_max)
             
             # 1-halo: satellite-satellite
-            integrand_ss = N_s**2 * u_sat**2 * n_M
-            I_1h_ss = jnp.sum(integrand_ss * weights) * dlog10M
+            integrand_ss = N_s**2 * u_sat_kz**2 * n_M_z
+            I_1h_ss = gl_integrate_precomputed(integrand_ss, log10M_min, log10M_max)
             
-            P_1h = (I_1h_cs + I_1h_ss) / n_gal**2
+            P_1h = (I_1h_cs + I_1h_ss) / n_gal_z**2
             
             # 2-halo
-            integrand_2h = (N_c + N_s * u_sat) * b_h * n_M
-            I_2h = jnp.sum(integrand_2h * weights) * dlog10M
-            P_2h = Pk_lin * (I_2h / n_gal)**2
+            integrand_2h = (N_c + N_s * u_sat_kz) * b_h_z * n_M_z
+            I_2h = gl_integrate_precomputed(integrand_2h, log10M_min, log10M_max)
+            P_2h = Pk_lin_kz * (I_2h / n_gal_z)**2
             
             return P_1h + P_2h
         
-        # vmap over k
-        _Pgg_all_k_single_z = vmap(
-            _Pgg_single_k_z, 
+        # --- P_gm kernel (single k, single z) ---
+        @jit
+        def _Pgm_kernel(N_c, N_s, u_sat_kz, u_matter_kz, b_h_z, n_M_z, Pk_lin_kz, n_gal_z):
+            # Matter normalization
+            integrand_M1 = (M_arr / RHO_M) * b_h_z * n_M_z
+            I_M1 = 1.0 - gl_integrate_precomputed(integrand_M1, log10M_min, log10M_max)
+            
+            # 1-halo
+            integrand_1h = (N_c + N_s * u_sat_kz) * u_matter_kz * n_M_z
+            P_1h = gl_integrate_precomputed(integrand_1h, log10M_min, log10M_max) / n_gal_z
+            
+            # 2-halo galaxy term
+            integrand_g = (N_c + N_s * u_sat_kz) * b_h_z * n_M_z
+            I_2h_g = gl_integrate_precomputed(integrand_g, log10M_min, log10M_max) / n_gal_z
+            
+            # 2-halo matter term
+            integrand_m = u_matter_kz * b_h_z * n_M_z
+            I_M2 = gl_integrate_precomputed(integrand_m, log10M_min, log10M_max)
+            I_2h_m = I_M1 + I_M2
+            
+            P_2h = Pk_lin_kz * I_2h_g * I_2h_m
+            
+            return P_1h + P_2h
+        
+        # --- n_gal kernel (single z) ---
+        @jit
+        def _ngal_kernel(N_c, N_s, n_M_z):
+            integrand = (N_c + N_s) * n_M_z
+            return gl_integrate_precomputed(integrand, log10M_min, log10M_max)
+        
+        # --- vmap over k ---
+        _Pgg_all_k = vmap(
+            _Pgg_kernel,
             in_axes=(None, None, 0, None, None, 0, None)
         )
         
-        # vmap over z
-        @jit
-        def _Pgg_all_k_all_z(N_c, N_s, u_sat_all, b_h_all, n_M_all, Pk_lin_all, n_gal_all):
-            """P_gg for all k, all z"""
-            def single_z(u_sat_z, b_h_z, n_M_z, Pk_lin_z, n_gal_z):
-                return _Pgg_all_k_single_z(N_c, N_s, u_sat_z, b_h_z, n_M_z, Pk_lin_z, n_gal_z)
-            
-            return vmap(single_z)(u_sat_all, b_h_all, n_M_all, Pk_lin_all, n_gal_all)
-        
-        self._Pgg_all = _Pgg_all_k_all_z
-        
-        # P_gm kernel for single (k, z)
-        @jit
-        def _Pgm_single_k_z(N_c, N_s, u_sat, u_matter, b_h, n_M, Pk_lin, n_gal):
-            """P_gm for single k, single z"""
-            # Matter normalization correction (using constant comoving density)
-            integrand_M1 = (M_arr / RHO_M) * b_h * n_M
-            I_M1 = 1.0 - jnp.sum(integrand_M1 * weights) * dlog10M
-
-            # 1-halo
-            integrand_1h = (N_c + N_s * u_sat) * u_matter * n_M
-            P_1h = jnp.sum(integrand_1h * weights) * dlog10M / n_gal
-
-            # 2-halo galaxy term
-            integrand_g = (N_c + N_s * u_sat) * b_h * n_M
-            I_2h_g = jnp.sum(integrand_g * weights) * dlog10M / n_gal
-
-            # 2-halo matter term
-            integrand_m = u_matter * b_h * n_M
-            I_M2 = jnp.sum(integrand_m * weights) * dlog10M
-            I_2h_m = I_M1 + I_M2
-
-            P_2h = Pk_lin * I_2h_g * I_2h_m
-
-            return P_1h + P_2h
-
-        # vmap over k
-        _Pgm_all_k_single_z = vmap(
-            _Pgm_single_k_z,
+        _Pgm_all_k = vmap(
+            _Pgm_kernel,
             in_axes=(None, None, 0, 0, None, None, 0, None)
         )
-
-        # vmap over z
+        
+        # --- Full computation for single z ---
         @jit
-        def _Pgm_all_k_all_z(N_c, N_s, u_sat_all, u_matter_all, b_h_all, n_M_all,
-                            Pk_lin_all, n_gal_all):
-            def single_z(u_sat_z, u_matter_z, b_h_z, n_M_z, Pk_lin_z, n_gal_z):
-                return _Pgm_all_k_single_z(
-                    N_c, N_s, u_sat_z, u_matter_z, b_h_z, n_M_z, Pk_lin_z, n_gal_z
-                )
-
-            return vmap(single_z)(
-                u_sat_all, u_matter_all, b_h_all, n_M_all, Pk_lin_all, n_gal_all
+        def compute_single_z(N_c, N_s, u_sat_z, u_matter_z, b_h_z, n_M_z, Pk_lin_z):
+            n_gal = _ngal_kernel(N_c, N_s, n_M_z)
+            P_gg = _Pgg_all_k(N_c, N_s, u_sat_z, b_h_z, n_M_z, Pk_lin_z, n_gal)
+            P_gm = _Pgm_all_k(N_c, N_s, u_sat_z, u_matter_z, b_h_z, n_M_z, Pk_lin_z, n_gal)
+            return P_gg, P_gm, n_gal
+        
+        # --- vmap over z ---
+        @jit
+        def compute_all_z(N_c_all, N_s_all, u_sat_all, u_matter_all, b_h_all, n_M_all, Pk_lin_all):
+            return vmap(compute_single_z)(
+                N_c_all, N_s_all, u_sat_all, u_matter_all, b_h_all, n_M_all, Pk_lin_all
             )
         
-        self._Pgm_all = _Pgm_all_k_all_z
-        
-        # Warmup JIT compilation
-        dummy_Nc = jnp.ones(self.n_M)
-        dummy_Ns = jnp.ones(self.n_M)
-        dummy_ngal = jnp.ones(self.n_z) * 1e-3
+        # Store
+        self._compute_single_z = compute_single_z
+        self._compute_all_z = compute_all_z
+        self._ngal_kernel = _ngal_kernel
 
-        _ = self._Pgg_all(
-            dummy_Nc, dummy_Ns,
-            self.u_sat_jax, self.b_h_z_jax, self.n_M_z_jax,
-            self.Pk_lin_z_jax, dummy_ngal
-        )
-
-        _ = self._Pgm_all(
-            dummy_Nc, dummy_Ns,
-            self.u_sat_jax, self.u_matter_jax,
-            self.b_h_z_jax, self.n_M_z_jax,
-            self.Pk_lin_z_jax, dummy_ngal
-        )
-    
-    def _get_occupation_numbers(self, Mstar_min: Optional[float] = None,
-                                 Mstar_max: Optional[float] = None) -> Tuple[np.ndarray, np.ndarray]:
+    def _compute_stellar_point_mass_DeltaSigma(self, rp: np.ndarray) -> np.ndarray:
         """
-        Get occupation numbers with caching.
-        
-        For Standard HOD: Mstar_min/max are ignored
-        For CSMF: Mstar_min/max define the stellar mass bin
-        
+        Compute stellar point mass contribution to Delta Sigma.
+
+        Formula: ΔΣ_stellar(R) = M_star / (π * R²)
+
         Parameters
         ----------
-        Mstar_min, Mstar_max : float, optional
-            Stellar mass bin edges (required for CSMF)
-            If units_per_h=True, these should be in Msun/h²
-        
+        rp : array
+            Projected radii [Mpc/h] or [Mpc] depending on units_per_h
+
         Returns
         -------
-        N_c, N_s : arrays
-            Central and satellite occupation numbers
+        DeltaSigma_stellar : array
+            Shape (n_z, n_rp) or (n_rp,) if single z
+            Units: [Msun h/pc²] or [Msun/pc²]
+        """
+        if self.median_Mstar is None:
+            # No stellar component, return zeros
+            if self.is_single_z:
+                return np.zeros(len(rp))
+            else:
+                return np.zeros((self.n_z, len(rp)))
+
+        # Unit conversion for stellar mass
+        # Input: median_Mstar in [Msun/h²] (CSMF convention)
+        # Need: [Msun] (natural units)
+
+
+        # Compute in natural units: [Msun/Mpc²]
+        # Shape: (n_z, 1) * (n_rp,) -> (n_z, n_rp)
+        Mstar_2d = self.median_Mstar[:, np.newaxis]  # (n_z, 1)
+        rp_2d = rp[np.newaxis, :]  # (1, n_rp)
+        DeltaSigma_Mpc = Mstar_2d / (np.pi * rp_2d**2)  # [Msun/Mpc²]
+
+        # Convert to pc²: [Msun/pc²]
+        DeltaSigma_pc = DeltaSigma_Mpc / 1e12  # 1 Mpc² = 10^12 pc²
+
+        if self.units_per_h:
+            DeltaSigma_pc = DeltaSigma_pc*self.h
+
+        # Return proper shape
+        if self.is_single_z:
+            return DeltaSigma_pc[0]  # (n_rp,)
+        else:
+            return DeltaSigma_pc  # (n_z, n_rp)
+
+    def _get_occupation_numbers(self,
+                                 Mstar_min: Optional[Union[float, np.ndarray]] = None,
+                                 Mstar_max: Optional[Union[float, np.ndarray]] = None):
+        """
+        Get N_c, N_s at each redshift.
+        
+        Returns shape (n_z, N_GL).
+        
+        For CSMF:
+        - Scalar Mstar_min/max: same bin for all z
+        - Array Mstar_min/max: must have length == n_z
         """
         if self.hod_type == HODType.CSMF:
             if Mstar_min is None or Mstar_max is None:
                 raise ValueError("CSMF requires Mstar_min and Mstar_max")
             
-            # Convert stellar masses to natural units if needed
-            if self.units_per_h:
-                Mstar_min_natural = Mstar_min * self.h**2  # Msun/h² -> Msun
-                Mstar_max_natural = Mstar_max * self.h**2
-            else:
-                Mstar_min_natural = Mstar_min
-                Mstar_max_natural = Mstar_max
+            is_array = isinstance(Mstar_min, (list, np.ndarray, jnp.ndarray))
             
-            cache_key = (Mstar_min_natural, Mstar_max_natural)
-        else:
-            cache_key = (None, None)
-        
-        if cache_key in self._Ncen_cache:
-            return self._Ncen_cache[cache_key], self._Nsat_cache[cache_key]
-        
-        if self.hod_type == HODType.CSMF:
-            N_c = np.array(self.hod.N_central(self.M_arr_jax, Mstar_min_natural, Mstar_max_natural))
-            N_s = self.hod.N_satellite(self.M_arr_natural, Mstar_min_natural, Mstar_max_natural)
-        else:
-            N_c = np.array(self.hod.N_central(self.M_arr_jax))
-            N_s = np.array(self.hod.N_satellite(self.M_arr_jax))
-        
-        self._Ncen_cache[cache_key] = N_c
-        self._Nsat_cache[cache_key] = N_s
-        
-        return N_c, N_s
-    
-    def compute_ngal_all_z(self, Mstar_min: Optional[float] = None,
-                           Mstar_max: Optional[float] = None) -> np.ndarray:
-        """
-        Compute galaxy number density at all redshifts.
-        
-        Parameters
-        ----------
-        Mstar_min, Mstar_max : float, optional
-            Stellar mass bin edges (required for CSMF)
-        
-        Returns
-        -------
-        n_gal_z : array
-            Galaxy number density at each redshift
-            Units: (h/Mpc)³ if units_per_h else Mpc⁻³
-        """
-        N_c, N_s = self._get_occupation_numbers(Mstar_min, Mstar_max)
-        N_tot = N_c + N_s
-        
-        # Compute in natural units
-        n_gal_z_natural = np.sum(
-            N_tot[np.newaxis, :] * self.n_M_z * np.array(self.simpson_weights_M)[np.newaxis, :],
-            axis=1
-        ) * self.dlog10M
-        
-        # Convert to h-units if requested
-        if self.units_per_h:
-            return n_gal_z_natural / self.h**3  # Mpc⁻³ -> (h/Mpc)³
-        return n_gal_z_natural
-    
-    def compute_Pgg_all_z(self, Mstar_min: Optional[float] = None,
-                          Mstar_max: Optional[float] = None,
-                          verbose: Optional[bool] = None) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute P_gg(k,z) using full vmap over all k and z.
-        
-        Parameters
-        ----------
-        Mstar_min, Mstar_max : float, optional
-            Stellar mass bin edges (required for CSMF)
-        verbose : bool, optional
-            Print galaxy number densities (default: self.verbose)
-        
-        Returns
-        -------
-        Pk_gg_z : array, shape (n_z, n_k)
-            Galaxy-galaxy power spectrum
-            Units: (Mpc/h)³ if units_per_h else Mpc³
-        n_gal_z : array, shape (n_z,)
-            Galaxy number density at each redshift
-        """
-        if verbose is None:
-            verbose = self.verbose
-        
-        N_c, N_s = self._get_occupation_numbers(Mstar_min, Mstar_max)
-        N_c_jax = jnp.array(N_c)
-        N_s_jax = jnp.array(N_s)
-        
-        # Compute n_gal in natural units for internal calculation
-        N_tot = N_c + N_s
-        n_gal_z_natural = np.sum(
-            N_tot[np.newaxis, :] * self.n_M_z * np.array(self.simpson_weights_M)[np.newaxis, :],
-            axis=1
-        ) * self.dlog10M
-        n_gal_z_jax = jnp.array(n_gal_z_natural)
-        
-        if verbose:
-            n_unit = "(h/Mpc)³" if self.units_per_h else "Mpc⁻³"
-            print("Galaxy number densities:")
-            n_gal_display = n_gal_z_natural / self.h**3 if self.units_per_h else n_gal_z_natural
-            for iz, (z, ng) in enumerate(zip(self.z_array, n_gal_display)):
-                print(f"  z={z:.3f}: n_gal = {ng:.6e} {n_unit}")
-        
-        # Compute P_gg in natural units (Mpc³)
-        Pk_gg_z_natural = np.array(self._Pgg_all(
-            N_c_jax, N_s_jax,
-            self.u_sat_jax, self.b_h_z_jax, self.n_M_z_jax,
-            self.Pk_lin_z_jax, n_gal_z_jax
-        ))
-        
-        # Convert output if requested
-        if self.units_per_h:
-            Pk_gg_z = Pk_gg_z_natural * self.h**3  # Mpc³ -> (Mpc/h)³
-            n_gal_z = n_gal_z_natural / self.h**3
-        else:
-            Pk_gg_z = Pk_gg_z_natural
-            n_gal_z = n_gal_z_natural
-        
-        return Pk_gg_z, n_gal_z
-    
-    def compute_Pgm_all_z(self, Mstar_min: Optional[float] = None,
-                          Mstar_max: Optional[float] = None,
-                          verbose: Optional[bool] = None) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute P_gm(k,z) using full vmap over all k and z.
-        
-        Parameters
-        ----------
-        Mstar_min, Mstar_max : float, optional
-            Stellar mass bin edges (required for CSMF)
-        verbose : bool, optional
-            Print galaxy number densities (default: self.verbose)
-        
-        Returns
-        -------
-        Pk_gm_z : array, shape (n_z, n_k)
-            Galaxy-matter power spectrum
-            Units: (Mpc/h)³ if units_per_h else Mpc³
-        n_gal_z : array, shape (n_z,)
-            Galaxy number density at each redshift
-        """
-        if verbose is None:
-            verbose = self.verbose
-        
-        N_c, N_s = self._get_occupation_numbers(Mstar_min, Mstar_max)
-        N_c_jax = jnp.array(N_c)
-        N_s_jax = jnp.array(N_s)
-        
-        # Compute n_gal in natural units
-        N_tot = N_c + N_s
-        n_gal_z_natural = np.sum(
-            N_tot[np.newaxis, :] * self.n_M_z * np.array(self.simpson_weights_M)[np.newaxis, :],
-            axis=1
-        ) * self.dlog10M
-        n_gal_z_jax = jnp.array(n_gal_z_natural)
-        
-        if verbose:
-            n_unit = "(h/Mpc)³" if self.units_per_h else "Mpc⁻³"
-            print("Galaxy number densities:")
-            n_gal_display = n_gal_z_natural / self.h**3 if self.units_per_h else n_gal_z_natural
-            for iz, (z, ng) in enumerate(zip(self.z_array, n_gal_display)):
-                print(f"  z={z:.3f}: n_gal = {ng:.6e} {n_unit}")
-        
-        # Compute P_gm in natural units
-        Pk_gm_z_natural = np.array(self._Pgm_all(
-            N_c_jax, N_s_jax,
-            self.u_sat_jax, self.u_matter_jax,
-            self.b_h_z_jax, self.n_M_z_jax,
-            self.Pk_lin_z_jax, n_gal_z_jax
-        ))
-        
-        # Convert output if requested
-        if self.units_per_h:
-            Pk_gm_z = Pk_gm_z_natural * self.h**3
-            n_gal_z = n_gal_z_natural / self.h**3
-        else:
-            Pk_gm_z = Pk_gm_z_natural
-            n_gal_z = n_gal_z_natural
-        
-        return Pk_gm_z, n_gal_z
-    
-    def compute_both_all_z(self, Mstar_min: Optional[float] = None,
-                           Mstar_max: Optional[float] = None,
-                           verbose: Optional[bool] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Compute both P_gg and P_gm efficiently at all redshifts.
-        
-        Parameters
-        ----------
-        Mstar_min, Mstar_max : float, optional
-            Stellar mass bin edges (required for CSMF)
-        verbose : bool, optional
-            Print galaxy number densities (default: self.verbose)
-        
-        Returns
-        -------
-        Pk_gg_z : array, shape (n_z, n_k)
-            Galaxy-galaxy power spectrum
-        Pk_gm_z : array, shape (n_z, n_k)
-            Galaxy-matter power spectrum
-        n_gal_z : array, shape (n_z,)
-            Galaxy number density at each redshift
-        """
-        if verbose is None:
-            verbose = self.verbose
-        
-        N_c, N_s = self._get_occupation_numbers(Mstar_min, Mstar_max)
-        N_c_jax = jnp.array(N_c)
-        N_s_jax = jnp.array(N_s)
-        
-        # Compute n_gal in natural units
-        N_tot = N_c + N_s
-        n_gal_z_natural = np.sum(
-            N_tot[np.newaxis, :] * self.n_M_z * np.array(self.simpson_weights_M)[np.newaxis, :],
-            axis=1
-        ) * self.dlog10M
-        n_gal_z_jax = jnp.array(n_gal_z_natural)
-        
-        if verbose:
-            n_unit = "(h/Mpc)³" if self.units_per_h else "Mpc⁻³"
-            print("Galaxy number densities:")
-            n_gal_display = n_gal_z_natural / self.h**3 if self.units_per_h else n_gal_z_natural
-            for iz, (z, ng) in enumerate(zip(self.z_array, n_gal_display)):
-                print(f"  z={z:.3f}: n_gal = {ng:.6e} {n_unit}")
-        
-        # Compute both in natural units
-        Pk_gg_z_natural = np.array(self._Pgg_all(
-            N_c_jax, N_s_jax,
-            self.u_sat_jax, self.b_h_z_jax, self.n_M_z_jax,
-            self.Pk_lin_z_jax, n_gal_z_jax
-        ))
-        
-        Pk_gm_z_natural = np.array(self._Pgm_all(
-            N_c_jax, N_s_jax,
-            self.u_sat_jax, self.u_matter_jax,
-            self.b_h_z_jax, self.n_M_z_jax,
-            self.Pk_lin_z_jax, n_gal_z_jax
-        ))
-        
-        # Convert output if requested
-        if self.units_per_h:
-            Pk_gg_z = Pk_gg_z_natural * self.h**3
-            Pk_gm_z = Pk_gm_z_natural * self.h**3
-            n_gal_z = n_gal_z_natural / self.h**3
-        else:
-            Pk_gg_z = Pk_gg_z_natural
-            Pk_gm_z = Pk_gm_z_natural
-            n_gal_z = n_gal_z_natural
-        
-        return Pk_gg_z, Pk_gm_z, n_gal_z
-
-    def compute_wgg_all_z(self, rp_bins: np.ndarray,
-                          bin_avg: bool = False,
-                          Mstar_min: Optional[float] = None,
-                          Mstar_max: Optional[float] = None,
-                          verbose: Optional[bool] = None) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute projected galaxy clustering w_gg(r_p) at all redshifts.
-
-        Parameters
-        ----------
-        rp_bins : array
-            Projected separation bins [Mpc/h or Mpc]
-        bin_avg : bool, default=False
-            If True, average w_gg within each bin (like DeltaSigmaCalculator.compute_deltasigma_averaged)
-            If False, evaluate at bin centers
-        Mstar_min, Mstar_max : float, optional
-            Stellar mass bin edges (required for CSMF)
-        verbose : bool, optional
-            Print information
-
-        Returns
-        -------
-        rp : array, shape (n_bins,) or (n_bins-1,)
-            Projected radii. If bin_avg=False: bin centers. If bin_avg=True: n_bins-1
-        wgg_z : array, shape (n_z, n_bins) or (n_z, n_bins-1)
-            Projected correlation function at each redshift
-
-        Notes
-        -----
-        Uses FAST-PT's direct Hankel transform: P_gg(k) -> w_gg(r_p)
-        """
-        if verbose is None:
-            verbose = self.verbose
-
-        # Get P_gg at all redshifts in appropriate units
-        Pk_gg_z, n_gal_z = self.compute_Pgg_all_z(
-            Mstar_min=Mstar_min, Mstar_max=Mstar_max, verbose=verbose
-        )
-
-        # Get k array in appropriate units
-        k = self.get_k_array()
-
-        # Compute w_gg for each redshift
-        wgg_z_list = []
-
-        for iz in range(self.n_z):
-            # Transform P_gg(k) -> w_gg(r) using FAST-PT
-            r_wgg, wgg_full = Pk_to_wgg_direct(k, Pk_gg_z[iz])
-
-            if bin_avg:
-                # Average w_gg within each bin
-                # Create spline interpolation
-                spline_wgg = interp1d(r_wgg, wgg_full, bounds_error=False,
-                                     kind='cubic', fill_value=(wgg_full[0], wgg_full[-1]))
-
-                # Integrand for averaging: w_gg(r) * r
-                def wgg_integrand(r):
-                    return spline_wgg(r) * r
-
-                # Average over each bin: <w_gg> = (2/Δr²) ∫ w_gg(r) r dr
-                diff_sq = np.diff(rp_bins**2)
-                wgg_averaged = 2 * gauss_legendre_integration(
-                    wgg_integrand, rp_bins[:-1], rp_bins[1:]
-                ) / diff_sq
-
-                wgg_z_list.append(wgg_averaged)
+            if not is_array:
+                # Scalar: same bin for all z
+                N_c_single = self.hod.N_central(self.M_arr_jax, Mstar_min, Mstar_max)
+                N_s_single = self.hod.N_satellite(self.M_arr_jax, Mstar_min, Mstar_max)
+                N_c = jnp.broadcast_to(N_c_single, (self.n_z, self.n_M))
+                N_s = jnp.broadcast_to(N_s_single, (self.n_z, self.n_M))
             else:
-                # Evaluate at bin centers
-                rp_centers = np.sqrt(rp_bins[:-1] * rp_bins[1:])
-                wgg_interp = np.interp(rp_centers, r_wgg, wgg_full)
-                wgg_z_list.append(wgg_interp)
-
-        wgg_z = np.array(wgg_z_list)
-
-        # Determine output radii
-        if bin_avg:
-            rp = rp_bins[:-1]  # Return lower bin edges (n_bins-1)
+                # Array: must match n_z
+                Mstar_min = jnp.asarray(Mstar_min)
+                Mstar_max = jnp.asarray(Mstar_max)
+                
+                if len(Mstar_min) != self.n_z:
+                    raise ValueError(
+                        f"Mstar arrays length ({len(Mstar_min)}) must match "
+                        f"z_array length ({self.n_z})"
+                    )
+                
+                # vmap over stellar mass bins
+                N_c_bound = partial(self.hod.N_central, self.M_arr_jax)
+                N_s_bound = partial(self.hod.N_satellite, self.M_arr_jax)
+                
+                N_c = vmap(N_c_bound)(Mstar_min, Mstar_max)
+                N_s = vmap(N_s_bound)(Mstar_min, Mstar_max)
+            
+            return N_c, N_s
+        
         else:
-            rp = np.sqrt(rp_bins[:-1] * rp_bins[1:])  # Bin centers
-
-        return rp, wgg_z
-
-    def compute_DeltaSigma_all_z(self, rp_bins: np.ndarray,
-                                 method: str = 'direct',
-                                 bin_avg: bool = False,
-                                 chi_max: float = 100.0,
-                                 Mstar_min: Optional[float] = None,
-                                 Mstar_max: Optional[float] = None,
-                                 verbose: Optional[bool] = None) -> Tuple[np.ndarray, np.ndarray]:
+            # Standard HOD
+            N_c_single = self.hod.N_central(self.M_arr_jax)
+            N_s_single = self.hod.N_satellite(self.M_arr_jax)
+            N_c = jnp.broadcast_to(N_c_single, (self.n_z, self.n_M))
+            N_s = jnp.broadcast_to(N_s_single, (self.n_z, self.n_M))
+            return N_c, N_s
+    
+    # ========================================================================
+    # Public API: Power Spectra
+    # ========================================================================
+    
+    def compute_power_spectra(self,
+                              compute_gg: bool = True,
+                              compute_gm: bool = True,
+                              Mstar_min: Optional[Union[float, np.ndarray]] = None,
+                              Mstar_max: Optional[Union[float, np.ndarray]] = None,
+                              verbose: Optional[bool] = None) -> Tuple[Optional[np.ndarray],
+                                                                        Optional[np.ndarray],
+                                                                        np.ndarray]:
         """
-        Compute galaxy-galaxy lensing ΔΣ(R) at all redshifts.
-
+        Compute power spectra at all redshifts.
+        
         Parameters
         ----------
-        rp_bins : array
-            Projected separation bins [Mpc/h or Mpc]
-        method : str, default='direct'
-            'direct' - Direct Hankel transform (Method 2, faster)
-            'traditional' - Via xi_gm integration (Method 1, matches numerical code)
-        bin_avg : bool, default=False
-            If True, average ΔΣ within each bin (like DeltaSigmaCalculator.compute_deltasigma_averaged)
-            If False, evaluate at bin centers
-        chi_max : float, default=100.0
-            Maximum line-of-sight distance for traditional method [Mpc/h or Mpc]
-        Mstar_min, Mstar_max : float, optional
-            Stellar mass bin edges (required for CSMF)
+        compute_gg, compute_gm : bool
+            Which spectra to compute
+        Mstar_min, Mstar_max : float or array, optional
+            Stellar mass bin(s) for CSMF.
+            If array, must have length == len(z_array)
         verbose : bool, optional
-            Print information
-
+            Print info
+        
         Returns
         -------
-        rp : array, shape (n_bins,) or (n_bins-1,)
-            Projected radii. If bin_avg=False: bin centers. If bin_avg=True: n_bins-1
-        DeltaSigma_z : array, shape (n_z, n_bins) or (n_z, n_bins-1)
-            Surface mass density contrast [Msun h/pc²] at each redshift
-
-        Notes
-        -----
-        Method 'direct': Uses FAST-PT direct transform P_gm(k) -> ΔΣ(R)
-        Method 'traditional': P_gm(k) -> xi_gm(r) -> ΔΣ(R) (matches numerical code)
+        P_gg : array or None
+            Shape (n_k,) if single z, (n_z, n_k) if multi z
+        P_gm : array or None
+            Shape (n_k,) if single z, (n_z, n_k) if multi z
+        n_gal : array
+            Shape () if single z, (n_z,) if multi z
         """
         if verbose is None:
             verbose = self.verbose
-
-        if method not in ['direct', 'traditional']:
-            raise ValueError(f"Unknown method: {method}. Use 'direct' or 'traditional'")
-
-        # Get P_gm at all redshifts in appropriate units
-        Pk_gm_z, n_gal_z = self.compute_Pgm_all_z(
+        
+        # Get occupation numbers
+        N_c, N_s = self._get_occupation_numbers(Mstar_min, Mstar_max)
+        
+        # Compute
+        P_gg_all, P_gm_all, n_gal_all = self._compute_all_z(
+            N_c, N_s, self.u_sat, self.u_matter, self.b_h_z, self.n_M_z, self.Pk_lin_z
+        )
+        
+        # Squeeze if single z
+        if self.is_single_z:
+            P_gg_all = P_gg_all[0]
+            P_gm_all = P_gm_all[0]
+            n_gal_all = n_gal_all[0]
+        
+        if verbose:
+            self._print_ngal(n_gal_all)
+        
+        P_gg = np.array(P_gg_all) if compute_gg else None
+        P_gm = np.array(P_gm_all) if compute_gm else None
+        n_gal = np.array(n_gal_all)
+        
+        return P_gg, P_gm, n_gal
+    
+    def compute_Pgg_all_z(self, **kwargs) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute P_gg at all redshifts."""
+        P_gg, _, n_gal = self.compute_power_spectra(compute_gg=True, compute_gm=False, **kwargs)
+        return P_gg, n_gal
+    
+    def compute_Pgm_all_z(self, **kwargs) -> Tuple[np.ndarray, np.ndarray]:
+        """Compute P_gm at all redshifts."""
+        _, P_gm, n_gal = self.compute_power_spectra(compute_gg=False, compute_gm=True, **kwargs)
+        return P_gm, n_gal
+    
+    def compute_both_all_z(self, **kwargs) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Compute both P_gg and P_gm at all redshifts."""
+        return self.compute_power_spectra(compute_gg=True, compute_gm=True, **kwargs)
+    
+    def compute_ngal_all_z(self, **kwargs) -> np.ndarray:
+        """Compute galaxy number density at all redshifts."""
+        _, _, n_gal = self.compute_power_spectra(compute_gg=False, compute_gm=False, **kwargs)
+        return n_gal
+    
+    # ========================================================================
+    # Public API: Real-Space Observables
+    # ========================================================================
+    
+    def compute_wgg_all_z(self, rp: np.ndarray,
+                          bin_avg: bool = False,
+                          rp_bins: Optional[np.ndarray] = None,
+                          Mstar_min: Optional[Union[float, np.ndarray]] = None,
+                          Mstar_max: Optional[Union[float, np.ndarray]] = None,
+                          verbose: Optional[bool] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute projected clustering w_gg(rp) at all redshifts.
+        
+        Parameters
+        ----------
+        rp : array
+            Projected separations
+        bin_avg : bool
+            If True, average within bins defined by rp_bins
+        rp_bins : array, optional
+            Bin edges (required if bin_avg=True)
+        Mstar_min, Mstar_max : float or array, optional
+            Stellar mass bin(s) for CSMF
+        verbose : bool, optional
+            Print info
+        
+        Returns
+        -------
+        rp_out : array
+            Output radii
+        wgg : array
+            Shape (n_rp,) if single z, (n_z, n_rp) if multi z
+        """
+        if verbose is None:
+            verbose = self.verbose
+        
+        Pk_gg, _ = self.compute_Pgg_all_z(
             Mstar_min=Mstar_min, Mstar_max=Mstar_max, verbose=verbose
         )
-
-        # Get k array and RHO_M in appropriate units
+        
+        k = self.get_k_array()
+        
+        # Ensure 2D for uniform processing
+        if self.is_single_z:
+            Pk_gg = Pk_gg[np.newaxis, :]
+        
+        # Hankel transform each z
+        wgg_list = []
+        for iz in range(self.n_z):
+            if bin_avg:
+                rp_out, wgg = Pk_to_wgg_direct(k, Pk_gg[iz], rp, rp_bins=rp_bins)
+            else:
+                rp_out, wgg = Pk_to_wgg_direct(k, Pk_gg[iz], rp)
+            wgg_list.append(wgg)
+        
+        wgg = np.array(wgg_list)
+        
+        # Squeeze if single z
+        if self.is_single_z:
+            wgg = wgg[0]
+        
+        return rp_out, wgg
+    
+    def compute_DeltaSigma_all_z(self, rp: np.ndarray,
+                                  bin_avg: bool = False,
+                                  rp_bins: Optional[np.ndarray] = None,
+                                  method: str = 'direct',
+                                  Mstar_min: Optional[Union[float, np.ndarray]] = None,
+                                  Mstar_max: Optional[Union[float, np.ndarray]] = None,
+                                  verbose: Optional[bool] = None) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute galaxy-galaxy lensing ΔΣ(rp) at all redshifts.
+        
+        Parameters
+        ----------
+        rp : array
+            Projected separations
+        bin_avg : bool
+            If True, average within bins defined by rp_bins
+        rp_bins : array, optional
+            Bin edges (required if bin_avg=True)
+        method : str
+            'direct' or 'traditional'
+        Mstar_min, Mstar_max : float or array, optional
+            Stellar mass bin(s) for CSMF
+        verbose : bool, optional
+            Print info
+        
+        Returns
+        -------
+        rp_out : array
+            Output radii
+        DeltaSigma : array
+            Shape (n_rp,) if single z, (n_z, n_rp) if multi z
+            Includes both halo model and stellar point mass contributions
+            (if median_Mstar was provided during initialization)
+        """
+        if verbose is None:
+            verbose = self.verbose
+        
+        if method not in ['direct', 'traditional']:
+            raise ValueError(f"Unknown method: {method}")
+        
+        Pk_gm, _ = self.compute_Pgm_all_z(
+            Mstar_min=Mstar_min, Mstar_max=Mstar_max, verbose=verbose
+        )
+        
         k = self.get_k_array()
         rho_m = self.get_RHO_M()
-
-        # Compute ΔΣ for each redshift
-        ds_z_list = []
-
+        
+        # Ensure 2D for uniform processing
+        if self.is_single_z:
+            Pk_gm = Pk_gm[np.newaxis, :]
+        
+        # Transform each z
+        ds_list = []
         for iz in range(self.n_z):
             if method == 'direct':
-                # Method 2: Direct Hankel transform
-                r_ds, ds_full = Pk_to_DeltaSigma_direct(k, Pk_gm_z[iz], rho_m)
-                # Output is in [(Msun/h) / (Mpc/h)²] or [Msun/Mpc²]
-                # Convert to [Msun h/pc²]: divide by 1e12 (Mpc² -> pc²)
-                ds_full = ds_full / 1e12
-
-            else:  # method == 'traditional'
-                # Method 1: Via xi_gm integration
-                # Determine output radii for interpolation
                 if bin_avg:
-                    # Need to compute at fine grid for later averaging
-                    r_output = rp_bins
+                    rp_out, ds = Pk_to_DeltaSigma_direct(k, Pk_gm[iz], rho_m, rp, rp_bins=rp_bins)
                 else:
-                    # Compute at bin centers
-                    r_output = np.sqrt(rp_bins[:-1] * rp_bins[1:])
-
-                # This already returns in [Msun h/pc²]
-                ds_full = Pk_gm_to_DeltaSigma_traditional(
-                    k, Pk_gm_z[iz], r_output, rho_m, chi_max=chi_max
-                )
-                r_ds = r_output
-
-            if bin_avg:
-                # Average ΔΣ within each bin
-                # Create spline interpolation
-                spline_ds = interp1d(r_ds, ds_full, bounds_error=False,
-                                    kind='cubic', fill_value=(ds_full[0], ds_full[-1]))
-
-                # Integrand for averaging: ΔΣ(r) * r
-                def ds_integrand(r):
-                    return spline_ds(r) * r
-
-                # Average over each bin: <ΔΣ> = (2/Δr²) ∫ ΔΣ(r) r dr
-                diff_sq = np.diff(rp_bins**2)
-                ds_averaged = 2 * gauss_legendre_integration(
-                    ds_integrand, rp_bins[:-1], rp_bins[1:]
-                ) / diff_sq
-
-                ds_z_list.append(ds_averaged)
+                    rp_out, ds = Pk_to_DeltaSigma_direct(k, Pk_gm[iz], rho_m, rp)
             else:
-                # Evaluate at bin centers (or already at bin centers for traditional method)
-                if method == 'direct':
-                    rp_centers = np.sqrt(rp_bins[:-1] * rp_bins[1:])
-                    ds_interp = np.interp(rp_centers, r_ds, ds_full)
-                    ds_z_list.append(ds_interp)
+                if bin_avg:
+                    rp_out, ds = Pk_gm_to_DeltaSigma_traditional(k, Pk_gm[iz], rho_m, rp, rp_bins=rp_bins)
                 else:
-                    # Already at bin centers for traditional method
-                    ds_z_list.append(ds_full)
-
-        ds_z = np.array(ds_z_list)
-
-        # Determine output radii
-        if bin_avg:
-            rp = rp_bins[:-1]  # Return lower bin edges (n_bins-1)
-        else:
-            rp = np.sqrt(rp_bins[:-1] * rp_bins[1:])  # Bin centers
-
-        return rp, ds_z
-
-    def get_k_array(self) -> np.ndarray:
-        """
-        Return k array in appropriate units.
+                    rp_out, ds = Pk_gm_to_DeltaSigma_traditional(k, Pk_gm[iz], rho_m, rp)
+            ds_list.append(ds)
         
-        Returns
-        -------
-        k : array
-            k values in h/Mpc if units_per_h else 1/Mpc
-        """
+        DeltaSigma = np.array(ds_list)
+
+        # Add stellar component if available
+        if self.median_Mstar is not None:
+            # Check cache
+            rp_key = tuple(rp_out)
+            if rp_key not in self._DeltaSigma_stellar_cache:
+                # Compute and cache
+                DeltaSigma_stellar = self._compute_stellar_point_mass_DeltaSigma(rp_out)
+                self._DeltaSigma_stellar_cache[rp_key] = DeltaSigma_stellar
+            else:
+                DeltaSigma_stellar = self._DeltaSigma_stellar_cache[rp_key]
+
+            # Add to total (handle both single z and multi z cases)
+            if self.is_single_z and DeltaSigma_stellar.ndim == 1:
+                # Single z case: both are (n_rp,)
+                DeltaSigma += DeltaSigma_stellar
+            elif not self.is_single_z and DeltaSigma_stellar.ndim == 2:
+                # Multi z case: both are (n_z, n_rp)
+                DeltaSigma += DeltaSigma_stellar
+            else:
+                # Shape mismatch - this shouldn't happen
+                raise ValueError(
+                    f"Shape mismatch in stellar component addition: "
+                    f"DeltaSigma.shape={DeltaSigma.shape}, "
+                    f"DeltaSigma_stellar.shape={DeltaSigma_stellar.shape}"
+                )
+
+        # Squeeze if single z
+        if self.is_single_z:
+            DeltaSigma = DeltaSigma[0]
+
+        return rp_out, DeltaSigma
+    
+    # ========================================================================
+    # Utility Methods
+    # ========================================================================
+    
+    def get_k_array(self) -> np.ndarray:
+        """Return k array in appropriate units."""
         if self.units_per_h:
-            return self.k_array_natural / self.h  # 1/Mpc -> h/Mpc
+            return self.k_array_natural / self.h
         return self.k_array_natural
     
     def get_M_array(self) -> np.ndarray:
-        """
-        Return mass array in appropriate units.
-
-        Returns
-        -------
-        M : array
-            Masses in Msun/h if units_per_h else Msun
-        """
+        """Return mass array (at GL nodes) in appropriate units."""
         if self.units_per_h:
-            return self.M_arr_natural * self.h  # Msun -> Msun/h
+            return self.M_arr_natural * self.h
         return self.M_arr_natural
-
+    
     def get_RHO_M(self) -> float:
-        """
-        Return comoving matter density in appropriate units.
-
-        Returns
-        -------
-        RHO_M : float
-            Comoving matter density
-            [(Msun/h) / (Mpc/h)³] if units_per_h else [Msun/Mpc³]
-
-        Notes
-        -----
-        The comoving matter density is constant across redshift due to
-        mass conservation in comoving coordinates.
-        """
+        """Return comoving matter density in appropriate units."""
         if self.units_per_h:
-            # [(Msun/h) / (Mpc/h)³] = [Msun/Mpc³] / h²
             return self.RHO_M_comoving / self.h**2
         return self.RHO_M_comoving
-
-    def clear_cache(self):
-        """Clear the occupation number cache"""
-        self._Ncen_cache = {}
-        self._Nsat_cache = {}
     
-    def update_hod_params(self, new_params: Dict, Mstar_min: Optional[float] = None,
-                          Mstar_max: Optional[float] = None):
-        """
-        Update HOD parameters without reinitializing CCL quantities.
-        
-        This is efficient for MCMC sampling where only HOD parameters change.
-        
-        Parameters
-        ----------
-        new_params : dict
-            New HOD parameters
-        Mstar_min, Mstar_max : float, optional
-            Stellar mass bin edges (for CSMF)
-        """
+    def update_hod_params(self, new_params: Dict):
+        """Update HOD parameters without reinitializing CCL quantities."""
         self.hod_params = new_params.copy()
-        
-        # Recreate HOD with new parameters
         self.hod = create_hod(
-            self.hod_type, new_params,
-            units_per_h=self.units_per_h, h=self.h,
-            masses_are_log10=True
+            self.hod_type, new_params, masses_are_log10=self.masses_are_log10
         )
-        
-        # Clear cache to force recomputation
-        self.clear_cache()
+    
+    def _print_ngal(self, n_gal):
+        """Print galaxy number densities."""
+        n_unit = "(h/Mpc)³" if self.units_per_h else "Mpc⁻³"
+        if self.is_single_z:
+            print(f"  z={self.z_array[0]:.3f}: n_gal = {float(n_gal):.6e} {n_unit}")
+        else:
+            print("Galaxy number densities:")
+            for z, ng in zip(self.z_array, n_gal):
+                print(f"  z={z:.3f}: n_gal = {float(ng):.6e} {n_unit}")
 
 
 # ============================================================================
-# Convenience Function for MCMC
+# Module-level exports
 # ============================================================================
 
-def compute_power_spectra(cosmo, hod_type: str, hod_params: Dict,
-                          z_array, k_array: Optional[np.ndarray] = None,
-                          Mstar_min: Optional[float] = None,
-                          Mstar_max: Optional[float] = None,
-                          units_per_h: bool = False,
-                          **kwargs) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Convenience function to compute power spectra.
-    
-    This creates a new model each time, so it's less efficient than
-    reusing a MultiRedshiftHaloModel instance for MCMC.
-    
-    Parameters
-    ----------
-    cosmo : ccl.Cosmology
-        CCL cosmology
-    hod_type : str
-        'standard' or 'csmf'
-    hod_params : dict
-        HOD parameters
-    z_array : array
-        Redshifts
-    k_array : array, optional
-        k values (1/Mpc)
-    Mstar_min, Mstar_max : float, optional
-        Stellar mass bin (for CSMF)
-    units_per_h : bool
-        If True, use h-units
-    **kwargs : dict
-        Additional arguments for MultiRedshiftHaloModel
-    
-    Returns
-    -------
-    k : array
-        k values
-    Pk_gg : array
-        Galaxy-galaxy power spectrum
-    Pk_gm : array
-        Galaxy-matter power spectrum
-    n_gal : array
-        Galaxy number density
-    """
-    model = MultiRedshiftHaloModel(
-        cosmo, hod_type, hod_params, z_array,
-        k_array=k_array, units_per_h=units_per_h,
-        verbose=False, **kwargs
-    )
-    
-    Pk_gg, Pk_gm, n_gal = model.compute_both_all_z(
-        Mstar_min=Mstar_min, Mstar_max=Mstar_max, verbose=False
-    )
-    
-    return model.get_k_array(), Pk_gg, Pk_gm, n_gal
-
-
+__all__ = [
+    # GL integration utilities
+    'N_GL',
+    'GL_X',
+    'GL_W',
+    'gl_nodes_scaled',
+    'gl_integrate_precomputed',
+    'make_gl_integrator',
+    # HOD types
+    'HODType',
+    'STANDARD_HOD_PARAMS',
+    'CSMF_HOD_PARAMS',
+    'validate_hod_params',
+    # Pure HOD functions
+    'standard_N_central',
+    'standard_N_satellite',
+    'csmf_Mstar_central',
+    'csmf_N_central',
+    'csmf_N_satellite',
+    # HOD classes
+    'StandardHOD',
+    'CSMF_HOD',
+    'create_hod',
+    # Main model
+    'MultiRedshiftHaloModel',
+]
 # ============================================================================
 # Unit Conversion Summary
 # ============================================================================
