@@ -1,7 +1,7 @@
 """
-Three-Method Diagnostic: Compare ΔΣ computation methods on massive halos.
+Two-Method Diagnostic: Compare ΔΣ computation methods on massive halos.
 
-This diagnostic test compares three different approaches to computing galaxy-galaxy
+This diagnostic test compares two different approaches to computing galaxy-galaxy
 lensing signal ΔΣ(rp) around the 10 most massive halos:
 
 Method 1: STANDARD (ξ_gm → integration)
@@ -14,20 +14,15 @@ Method 2: SPHERICAL (ρ(r) → cylindrical projection)
   - Project to Σ(rp) using cylindrical line-of-sight integration
   - Uses compute_deltasigma_spherical()
 
-Method 3: CYLINDRICAL 2D (direct projected counting)
-  - Directly count particles in projected cylindrical annuli
-  - No intermediate ρ(r) profile
-  - Uses compute_deltasigma_at_position()
-
 Purpose:
 --------
-If Method 1 and either Method 2 or 3 agree, the issue in test_direct_central_validation.py
+If Method 1 and Method 2 agree, the issue in test_direct_central_validation.py
 is NOT in the computation method itself, but in:
   - Averaging over many galaxies with poor statistics
   - Particle downsampling effects
   - Stacking/ensemble averaging methodology
 
-If all methods disagree, there's a fundamental issue in one or more implementations.
+If methods disagree, there's a fundamental issue in one or more implementations.
 """
 
 import pandas as pd
@@ -43,7 +38,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 from HOD_NRV.HOD_numerical.twopoint_calculator.precompute_deltasigma import (
     build_particle_kdtree,
     compute_deltasigma_spherical,
-    compute_deltasigma_at_position,
     periodic_distance,
     compute_xigm_at_position
 )
@@ -53,7 +47,7 @@ from test_utils import print_header, print_timing
 
 def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
     """
-    Three-method diagnostic test on massive halos.
+    Two-method diagnostic test on massive halos.
 
     Parameters
     ----------
@@ -69,7 +63,7 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
     # ========================================================================
     # Configuration
     # ========================================================================
-    print_header("Three-Method Diagnostic Configuration")
+    print_header("Two-Method Diagnostic Configuration")
 
     # Paths
     halo_path = '/Users/ler13nrv/Documents/flamingo_data/parquet_halo_catalogue_L1000N1800.parquet'
@@ -176,19 +170,17 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
     # ========================================================================
     # Step 4: Compute ΔΣ for Each Halo with Three Methods
     # ========================================================================
-    print_header("Step 4: Compute ΔΣ for Each Halo (Three Methods)")
+    print_header("Step 4: Compute ΔΣ for Each Halo (Two Methods)")
 
     # Storage for results
     deltasigma_method1 = []  # Standard (ξ_gm → integration)
     deltasigma_method2 = []  # Spherical (ρ(r) → cylindrical projection)
-    deltasigma_method3 = []  # Cylindrical 2D (direct projected counting)
     xigm_profiles = []  # Store ξ_gm for reference
 
     print(f"\n  Processing {n_halos} halos...")
     print(f"  Methods:")
     print(f"    1. Standard (ξ_gm → integration via DeltaSigmaCalculator)")
     print(f"    2. Spherical (ρ(r) → cylindrical projection)")
-    print(f"    3. Cylindrical 2D (direct projected counting)")
     print()
 
     start_total = time.time()
@@ -253,26 +245,6 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
 
         elapsed_method2 = time.time() - start
         print(f"    Method 2: {elapsed_method2:.3f} s")
-
-        # ----------------------------------------------------------------------
-        # Method 3: Cylindrical 2D (direct projected counting)
-        # ----------------------------------------------------------------------
-        start = time.time()
-
-        ds_method3 = compute_deltasigma_at_position(
-            position=halo_pos,
-            nearby_particles=nearby_particles,
-            RHO_M=RHO_M,
-            rp_bins=rp_bins,
-            chi_max=chi_max,
-            particle_mass=m_particle,
-            Lbox=Lbox,
-            los_axis='z'
-        )
-        deltasigma_method3.append(ds_method3)
-
-        elapsed_method3 = time.time() - start
-        print(f"    Method 3: {elapsed_method3:.3f} s")
         print()
 
     elapsed_total = time.time() - start_total
@@ -282,13 +254,12 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
     print(f"\n  Successfully processed {n_success}/{n_halos} halos")
 
     if n_success == 0:
-        print("\n  ❌ No halos processed successfully!")
+        print("\n  No halos processed successfully!")
         return
 
     # Convert to arrays
     deltasigma_method1 = np.array(deltasigma_method1)  # shape (n_success, n_rp_bins)
     deltasigma_method2 = np.array(deltasigma_method2)
-    deltasigma_method3 = np.array(deltasigma_method3)
     xigm_profiles = np.array(xigm_profiles)  # shape (n_success, n_r_bins)
 
 
@@ -307,22 +278,14 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
     ds2_std = np.std(deltasigma_method2, axis=0)
     ds2_sem = ds2_std / np.sqrt(n_success)
 
-    ds3_mean = np.mean(deltasigma_method3, axis=0)
-    ds3_std = np.std(deltasigma_method3, axis=0)
-    ds3_sem = ds3_std / np.sqrt(n_success)
-
     print(f"\n  Aggregated over {n_success} halos:")
     print(f"\n  Method 1 (Standard):")
-    print(f"    Mean ΔΣ range: [{ds1_mean.min():.2e}, {ds1_mean.max():.2e}] Msun h/pc²")
-    print(f"    Mean scatter: {np.mean(ds1_std):.2e} Msun h/pc²")
+    print(f"    Mean DS range: [{ds1_mean.min():.2e}, {ds1_mean.max():.2e}] Msun h/pc^2")
+    print(f"    Mean scatter: {np.mean(ds1_std):.2e} Msun h/pc^2")
 
     print(f"\n  Method 2 (Spherical):")
-    print(f"    Mean ΔΣ range: [{ds2_mean.min():.2e}, {ds2_mean.max():.2e}] Msun h/pc²")
-    print(f"    Mean scatter: {np.mean(ds2_std):.2e} Msun h/pc²")
-
-    print(f"\n  Method 3 (Cylindrical 2D):")
-    print(f"    Mean ΔΣ range: [{ds3_mean.min():.2e}, {ds3_mean.max():.2e}] Msun h/pc²")
-    print(f"    Mean scatter: {np.mean(ds3_std):.2e} Msun h/pc²")
+    print(f"    Mean DS range: [{ds2_mean.min():.2e}, {ds2_mean.max():.2e}] Msun h/pc^2")
+    print(f"    Mean scatter: {np.mean(ds2_std):.2e} Msun h/pc^2")
 
     # ========================================================================
     # Step 6: Compare Methods
@@ -331,40 +294,30 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
 
     # Relative differences (vs Method 1 as reference)
     rel_diff_2vs1 = (ds2_mean - ds1_mean) / np.abs(ds1_mean) * 100
-    rel_diff_3vs1 = (ds3_mean - ds1_mean) / np.abs(ds1_mean) * 100
 
-    print(f"\n  📊 Detailed Comparison (Method 1 = Reference):")
-    print(f"    {'rp [Mpc/h]':<12s} {'Method 1':<14s} {'Method 2':<14s} {'Method 3':<14s} "
-          f"{'M2 err[%]':<12s} {'M3 err[%]':<12s}")
-    print(f"    {'-'*12} {'-'*14} {'-'*14} {'-'*14} {'-'*12} {'-'*12}")
+    print(f"\n  Detailed Comparison (Method 1 = Reference):")
+    print(f"    {'rp [Mpc/h]':<12s} {'Method 1':<14s} {'Method 2':<14s} {'M2 err[%]':<12s}")
+    print(f"    {'-'*12} {'-'*14} {'-'*14} {'-'*12}")
 
     for i, rp in enumerate(rp_centers):
-        print(f"    {rp:11.4f}  {ds1_mean[i]:13.4e}  {ds2_mean[i]:13.4e}  {ds3_mean[i]:13.4e}  "
-              f"{rel_diff_2vs1[i]:+11.2f}  {rel_diff_3vs1[i]:+11.2f}")
+        print(f"    {rp:11.4f}  {ds1_mean[i]:13.4e}  {ds2_mean[i]:13.4e}  {rel_diff_2vs1[i]:+11.2f}")
 
     # Statistical summary
     abs_rel_diff_2vs1 = np.abs(rel_diff_2vs1)
-    abs_rel_diff_3vs1 = np.abs(rel_diff_3vs1)
 
-    print(f"\n  📈 Statistical Summary:")
+    print(f"\n  Statistical Summary:")
     print(f"\n  Method 2 vs Method 1:")
     print(f"    Mean absolute relative difference:   {np.mean(abs_rel_diff_2vs1):6.2f}%")
     print(f"    Median absolute relative difference: {np.median(abs_rel_diff_2vs1):6.2f}%")
     print(f"    Max absolute relative difference:    {np.max(abs_rel_diff_2vs1):6.2f}%")
     print(f"    RMS relative difference:             {np.sqrt(np.mean(rel_diff_2vs1**2)):6.2f}%")
 
-    print(f"\n  Method 3 vs Method 1:")
-    print(f"    Mean absolute relative difference:   {np.mean(abs_rel_diff_3vs1):6.2f}%")
-    print(f"    Median absolute relative difference: {np.median(abs_rel_diff_3vs1):6.2f}%")
-    print(f"    Max absolute relative difference:    {np.max(abs_rel_diff_3vs1):6.2f}%")
-    print(f"    RMS relative difference:             {np.sqrt(np.mean(rel_diff_3vs1**2)):6.2f}%")
-
     # ========================================================================
     # Step 7: Save Results
     # ========================================================================
     print_header("Step 7: Save Results")
 
-    output_file = output_dir / 'three_method_diagnostic.npz'
+    output_file = output_dir / 'two_method_diagnostic.npz'
 
     np.savez(
         output_file,
@@ -376,7 +329,6 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
         # Individual halo profiles
         deltasigma_method1=deltasigma_method1,
         deltasigma_method2=deltasigma_method2,
-        deltasigma_method3=deltasigma_method3,
         xigm_profiles=xigm_profiles,
         # Aggregated profiles
         ds1_mean=ds1_mean,
@@ -385,12 +337,8 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
         ds2_mean=ds2_mean,
         ds2_std=ds2_std,
         ds2_sem=ds2_sem,
-        ds3_mean=ds3_mean,
-        ds3_std=ds3_std,
-        ds3_sem=ds3_sem,
         # Comparisons
         rel_diff_2vs1=rel_diff_2vs1,
-        rel_diff_3vs1=rel_diff_3vs1,
         # Metadata
         n_halos=n_success,
         halo_masses=halo_masses[:n_success],
@@ -400,7 +348,7 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
         downsample_factor=downsample_factor
     )
 
-    print(f"\n  💾 Results saved to: {output_file.name}")
+    print(f"\n  Results saved to: {output_file.name}")
     print(f"    File size: {output_file.stat().st_size / 1e6:.2f} MB")
 
     # ========================================================================
@@ -419,13 +367,11 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
     for i in range(n_plot_halos):
         ax = axes[i]
 
-        # Plot all three methods
+        # Plot both methods
         ax.loglog(rp_centers, deltasigma_method1[i], 'o-', label='Method 1 (Standard)',
                  color='blue', markersize=4, linewidth=2)
         ax.loglog(rp_centers, deltasigma_method2[i], 's--', label='Method 2 (Spherical)',
                  color='red', markersize=4, linewidth=1.5, alpha=0.8)
-        ax.loglog(rp_centers, deltasigma_method3[i], '^:', label='Method 3 (Cylindrical)',
-                 color='green', markersize=4, linewidth=1.5, alpha=0.8)
 
         ax.set_xlabel(r'$r_p$ [Mpc/h]', fontsize=10)
         ax.set_ylabel(r'$\Delta\Sigma$ [M$_\odot$ h/pc$^2$]', fontsize=10)
@@ -443,7 +389,7 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
     plot1_file = output_dir / 'diagnostic_individual_halos.png'
     plt.savefig(plot1_file, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"    ✓ Individual halo profiles: {plot1_file.name}")
+    print(f"    Individual halo profiles: {plot1_file.name}")
 
     # Plot 2: Stacked Mean Profile Comparison
     # ------------------------------------------------------------------
@@ -454,9 +400,6 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
                markersize=6, linewidth=2, capsize=3, capthick=1.5)
     ax.errorbar(rp_centers, ds2_mean, yerr=ds2_sem, fmt='s--',
                label='Method 2 (Spherical)', color='red',
-               markersize=6, linewidth=1.5, capsize=3, capthick=1.5, alpha=0.8)
-    ax.errorbar(rp_centers, ds3_mean, yerr=ds3_sem, fmt='^:',
-               label='Method 3 (Cylindrical)', color='green',
                markersize=6, linewidth=1.5, capsize=3, capthick=1.5, alpha=0.8)
 
     ax.set_xscale('log')
@@ -472,7 +415,7 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
     plot2_file = output_dir / 'diagnostic_stacked_mean.png'
     plt.savefig(plot2_file, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"    ✓ Stacked mean profile: {plot2_file.name}")
+    print(f"    Stacked mean profile: {plot2_file.name}")
 
     # Plot 3: Relative Error Plot
     # ------------------------------------------------------------------
@@ -480,12 +423,10 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
 
     ax.plot(rp_centers, rel_diff_2vs1, 'o-', label='Method 2 vs Method 1',
            color='red', markersize=6, linewidth=2)
-    ax.plot(rp_centers, rel_diff_3vs1, 's--', label='Method 3 vs Method 1',
-           color='green', markersize=6, linewidth=2)
 
     # Reference lines
     ax.axhline(0, color='black', linestyle='-', linewidth=1, alpha=0.5)
-    ax.axhspan(-5, 5, color='gray', alpha=0.2, label='±5% range')
+    ax.axhspan(-5, 5, color='gray', alpha=0.2, label='+/-5% range')
 
     ax.set_xscale('log')
     ax.set_xlabel(r'$r_p$ [Mpc/h]', fontsize=14)
@@ -498,9 +439,9 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
     plot3_file = output_dir / 'diagnostic_relative_errors.png'
     plt.savefig(plot3_file, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"    ✓ Relative error plot: {plot3_file.name}")
+    print(f"    Relative error plot: {plot3_file.name}")
 
-    # Plot 4: ξ_gm Profiles (for reference)
+    # Plot 4: xi_gm Profiles (for reference)
     # ------------------------------------------------------------------
     xigm_mean = np.mean(xigm_profiles, axis=0)
     xigm_std = np.std(xigm_profiles, axis=0)
@@ -525,9 +466,9 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
     plot4_file = output_dir / 'diagnostic_xigm_profile.png'
     plt.savefig(plot4_file, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"    ✓ ξ_gm profile: {plot4_file.name}")
+    print(f"    xi_gm profile: {plot4_file.name}")
 
-    print(f"\n  📊 All plots saved to: {output_dir}/")
+    print(f"\n  All plots saved to: {output_dir}/")
 
     # ========================================================================
     # Summary
@@ -541,44 +482,41 @@ def main(n_halos=10, downsample_factor=2, search_radius=150.0, chi_max=150.0):
 
     # Verdict
     mean_error_2vs1 = np.mean(abs_rel_diff_2vs1)
-    mean_error_3vs1 = np.mean(abs_rel_diff_3vs1)
 
     def get_verdict(error):
         if error < 1.0:
-            return "✓ EXCELLENT agreement"
+            return "EXCELLENT agreement"
         elif error < 5.0:
-            return "✓ VERY GOOD agreement"
+            return "VERY GOOD agreement"
         elif error < 10.0:
-            return "✓ GOOD agreement"
+            return "GOOD agreement"
         elif error < 20.0:
-            return "⚠ MODERATE agreement"
+            return "MODERATE agreement"
         else:
-            return "✗ POOR agreement"
+            return "POOR agreement"
 
     print(f"\n  Verdict:")
     print(f"    Method 2 vs Method 1: {get_verdict(mean_error_2vs1)}")
     print(f"      Mean error: {mean_error_2vs1:.2f}%")
-    print(f"\n    Method 3 vs Method 1: {get_verdict(mean_error_3vs1)}")
-    print(f"      Mean error: {mean_error_3vs1:.2f}%")
 
     print(f"\n  Interpretation:")
-    if mean_error_2vs1 < 5.0 and mean_error_3vs1 < 5.0:
-        print(f"    ✓ All three methods agree well on massive halos!")
-        print(f"    → Issue in test_direct_central_validation.py is likely:")
+    if mean_error_2vs1 < 5.0:
+        print(f"    Both methods agree well on massive halos!")
+        print(f"    -> Issue in test_direct_central_validation.py is likely:")
         print(f"      - Poor statistics from low target_ngal")
         print(f"      - Stacking/averaging artifacts")
         print(f"      - Cosmic variance in galaxy selection")
-    elif mean_error_2vs1 > 20.0 or mean_error_3vs1 > 20.0:
-        print(f"    ⚠ Methods disagree significantly!")
-        print(f"    → Check implementation of methods with large errors")
+    elif mean_error_2vs1 > 20.0:
+        print(f"    Methods disagree significantly!")
+        print(f"    -> Check implementation of methods with large errors")
     else:
-        print(f"    ~ Methods show moderate differences")
-        print(f"    → May be due to finite particle sampling or method differences")
+        print(f"    Methods show moderate differences")
+        print(f"    -> May be due to finite particle sampling or method differences")
 
     print("\n" + "="*70 + "\n")
 
-    return (rp_centers, ds1_mean, ds2_mean, ds3_mean,
-            deltasigma_method1, deltasigma_method2, deltasigma_method3)
+    return (rp_centers, ds1_mean, ds2_mean,
+            deltasigma_method1, deltasigma_method2)
 
 
 if __name__ == "__main__":

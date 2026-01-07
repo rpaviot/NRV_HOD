@@ -81,8 +81,7 @@ def main():
     # Downsampling factor for particles (reduced for better statistics)
     downsample_factor = 40  # Was 40, but spherical method needs more particles
 
-    # Computation method
-    method = 'spherical'  # 'spherical' (recommended) or 'cylindrical' (legacy)
+    # Computation method: spherical shell with cylindrical projection
 
     # Output path for pre-computed lensing grid
     output_dir = Path(__file__).parent / 'output'
@@ -95,7 +94,7 @@ def main():
     print(f"  Box size: {Lbox} Mpc/h")
     print(f"  RHO_M: {RHO_M:.3e} Msun/h / (Mpc/h)^3")
     print(f"\n  ΔΣ computation parameters:")
-    print(f"    Method: {method}")
+    print(f"    Method: spherical (ρ(r) → cylindrical projection)")
     print(f"    rp bins: {len(rp_bins)-1} bins from {rp_bins[0]:.2f} to {rp_bins[-1]:.2f} Mpc/h")
     print(f"    Particle selection: within {r_factor_selection:.1f}×Rvir of halos")
     print(f"    Search radius: {search_radius_spherical:.1f} Mpc/h")
@@ -187,7 +186,7 @@ def main():
     print_header("Step 4: Pre-compute ΔΣ at Selected Particle Positions")
 
     print(f"\n  Computing ΔΣ for {len(selected_particle_indices):,} selected particles...")
-    print(f"  Using {method} method with search radius {search_radius_spherical:.1f} Mpc/h")
+    print(f"  Using spherical method with search radius {search_radius_spherical:.1f} Mpc/h")
     print(f"  This may take a while...\n")
 
     start = time.time()
@@ -267,7 +266,7 @@ def main():
         'downsample_factor': downsample_factor,
         'r_factor_selection': r_factor_selection,
         'search_radius_spherical': search_radius_spherical,
-        'method': method,
+        'method': 'spherical',
         'n_success': n_success,
         'n_failed': n_failed,
     }

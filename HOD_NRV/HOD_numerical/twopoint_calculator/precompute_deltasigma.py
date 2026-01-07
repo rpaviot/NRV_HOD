@@ -133,77 +133,6 @@ def compute_rho_profile_spherical(
     return r_centers, rho, counts
 
 
-def project_rho_to_sigma_abel(
-    r_profile: np.ndarray,
-    rho_profile: np.ndarray,
-    rp_bins: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Project 3D density ρ(r) to 2D surface density Σ(rp) using Abel transform.
-
-    .. deprecated::
-        This Abel transform method assumes perfect spherical symmetry and can
-        produce systematic errors. Use :func:`project_rho_to_sigma_cylindrical`
-        instead, which matches the standard ξ_gm pipeline methodology.
-
-    The projection is: Σ(rp) = 2 ∫_{rp}^{r_max} ρ(r) r / √(r² - rp²) dr
-
-    Parameters
-    ----------
-    r_profile : np.ndarray
-        3D radial coordinates [Mpc/h]
-    rho_profile : np.ndarray
-        3D density profile [Msun/h / (Mpc/h)^3]
-    rp_bins : np.ndarray
-        Projected radial bin edges [Mpc/h]
-
-    Returns
-    -------
-    rp_centers : np.ndarray
-        Projected bin centers [Mpc/h]
-    sigma : np.ndarray
-        Surface density [Msun/h / (Mpc/h)^2]
-
-    Notes
-    -----
-    This uses the Abel transform to project a spherically symmetric 3D
-    density profile into a 2D projected surface density.
-
-    Uses Gauss-Legendre quadrature for fast and accurate integration.
-
-    **Warning**: This method assumes perfect spherical symmetry, which does not
-    exist in real particle distributions. It can lead to systematic biases
-    at small (underestimation) and large (overestimation) projected radii.
-
-    References
-    ----------
-    .. [1] Bracewell, R. N. (2000), "The Fourier Transform and Its Applications"
-    """
-    # Create interpolator for ρ(r)
-    rho_interp = interp1d(r_profile, rho_profile, kind='cubic',
-                          bounds_error=False, fill_value=0.0)
-
-    rp_centers = np.sqrt(rp_bins[:-1] * rp_bins[1:])
-    sigma = np.zeros(len(rp_centers))
-
-    r_max = r_profile[-1]
-
-    for i, rp in enumerate(rp_centers):
-        if rp >= r_max:
-            sigma[i] = 0.0
-            continue
-
-        # Abel transform integrand: ρ(r) * r / √(r² - rp²)
-        def integrand(r):
-            return rho_interp(r) * r / np.sqrt(r**2 - rp**2)
-
-        # Integrate from rp to r_max using Gauss-Legendre quadrature
-        result = gauss_legendre_integration(integrand, rp, r_max)
-        sigma[i] = 2.0 * result
-
-    return rp_centers, sigma
-
-
 def project_rho_to_sigma_cylindrical(
     r_profile: np.ndarray,
     rho_profile: np.ndarray,
@@ -505,137 +434,6 @@ def compute_xigm_at_position(
     return xi_gm
 
 
-def compute_deltasigma_at_position(
-    position: np.ndarray,
-    nearby_particles: np.ndarray,
-    RHO_M: float,
-    rp_bins: np.ndarray,
-    chi_max: float = 150.0,
-    particle_mass: Optional[float] = None,
-    n_particles_total: Optional[int] = None,
-    Lbox: Optional[float] = None,
-    los_axis: str = 'z'
-) -> np.ndarray:
-    """
-    Compute ΔΣ(rp) at a single position using direct projected particle counting.
-
-    For dark matter particles with uniform mass, this directly computes the
-    projected surface density by counting particles in projected radial bins,
-    avoiding the need to compute correlation functions.
-
-    Parameters
-    ----------
-    position : np.ndarray, shape (3,)
-        Position at which to compute ΔΣ [Mpc/h]
-    nearby_particles : np.ndarray, shape (N_nearby, 3)
-        Positions of nearby particles [Mpc/h]
-    RHO_M : float
-        Mean matter density [Msun/h / (Mpc/h)^3]
-    rp_bins : np.ndarray
-        Projected separation bin edges [Mpc/h]
-    chi_max : float, default=150.0
-        Maximum line-of-sight distance for particle selection [Mpc/h]
-    particle_mass : float, optional
-        Mass of individual particles [Msun/h]. If provided, uses this directly.
-        If not provided, computes from n_particles_total and Lbox.
-    n_particles_total : int, optional
-        Total number of particles in full catalog (for particle mass calculation)
-        Only used if particle_mass is not provided.
-    Lbox : float, optional
-        Simulation box size [Mpc/h] (for particle mass calculation)
-        Only used if particle_mass is not provided.
-    los_axis : str, default='z'
-        Line-of-sight axis for projection ('x', 'y', or 'z')
-
-    Returns
-    -------
-    delta_sigma : np.ndarray, shape (len(rp_bins)-1,)
-        Surface mass density contrast [Msun h/pc²]
-
-    Notes
-    -----
-    The computation follows:
-    1. Project particles onto plane perpendicular to line-of-sight
-    2. Filter particles within chi_max along line-of-sight
-    3. Compute Σ(rp) = (N_particles × m_particle) / A_annulus
-    4. Compute ΔΣ = Σ̄(<rp) - Σ(rp)
-
-    For uniform-mass particles: m_particle = RHO_M × V_box / N_total
-
-    References
-    ----------
-    .. [1] Mandelbaum et al. (2006), MNRAS 368, 715
-    .. [2] Cacciato et al. (2009), MNRAS 394, 929
-    """
-    # Determine axis indices
-    axis_map = {'x': 0, 'y': 1, 'z': 2}
-    los_idx = axis_map[los_axis.lower()]
-    perp_idx = [i for i in range(3) if i != los_idx]
-
-    # Compute displacement vectors
-    displacement = nearby_particles - position
-
-    # Filter particles within chi_max along line-of-sight
-    chi = np.abs(displacement[:, los_idx])
-    mask_los = chi <= chi_max
-
-    # Compute projected separation (perpendicular to line-of-sight)
-    rp = np.sqrt(displacement[:, perp_idx[0]]**2 + displacement[:, perp_idx[1]]**2)
-
-    # Apply line-of-sight filter
-    rp_filtered = rp[mask_los]
-
-    # Histogram particles in projected radial bins
-    counts, _ = np.histogram(rp_filtered, bins=rp_bins)
-
-    # Determine particle mass (all DM particles have same mass)
-    if particle_mass is not None:
-        # Use provided particle mass directly
-        m_particle = particle_mass
-    elif n_particles_total is not None and Lbox is not None:
-        # Compute from total particles and box volume
-        V_box = Lbox**3
-        m_particle = RHO_M * V_box / n_particles_total  # [Msun/h]
-    else:
-        # Fallback: assume particles represent local density
-        m_particle = 1.0  # Will normalize later
-
-    # Compute annulus areas [Mpc²/h²]
-    area_annulus = np.pi * (rp_bins[1:]**2 - rp_bins[:-1]**2)
-
-    # Compute surface density Σ(rp) [Msun/h / (Mpc/h)²]
-    # counts = number of particles in cylindrical annulus with |chi| <= chi_max
-    # Volume of annulus = area_annulus × 2×chi_max
-    # Density ρ = (counts × m_particle) / (area_annulus × 2×chi_max)
-    # Surface density Σ = ∫ ρ dχ from -chi_max to +chi_max = 2×chi_max × ρ
-    # Therefore: Σ = (counts × m_particle) / area_annulus
-    sigma = (counts * m_particle) / area_annulus
-
-    # Compute mean surface density inside each radius using spline interpolation
-    # Σ̄(<rp) = (2/rp²) ∫₀^rp Σ(r') r' dr'
-    rp_centers = np.sqrt(rp_bins[:-1] * rp_bins[1:])
-
-    # Create spline interpolation of sigma
-    spline_sigma = interp1d(rp_centers, sigma, bounds_error=False,
-                           kind='cubic', fill_value=(sigma[0], 0))
-
-    # Integrand for mean surface density: sigma(r) * r
-    def sigma_mean_integrand(r):
-        return spline_sigma(r) * r
-
-    # Compute sigma_mean using Gauss-Legendre integration
-    sigma_mean = 2 * gauss_legendre_integration(
-        sigma_mean_integrand, 0, rp_centers) / rp_centers**2
-
-    # Compute ΔΣ = Σ̄(<rp) - Σ(rp)
-    delta_sigma = sigma_mean - sigma
-
-    # Convert to [Msun h/pc²]: 1 Mpc² = 10^12 pc²
-    delta_sigma = delta_sigma / 1e12
-
-    return delta_sigma
-
-
 def precompute_lensing_grid(
     halo_positions: np.ndarray,
     halo_rvir: np.ndarray,
@@ -644,16 +442,15 @@ def precompute_lensing_grid(
     rp_bins: np.ndarray,
     Lbox: float,
     r_factor: float = 3.0,
-    los_axis: str = 'z',
     particle_mass: Optional[float] = None,
-    method: str = 'spherical',
     verbose: bool = True
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Pre-compute ΔΣ at particle positions within r_factor×R_vir of halos.
 
     This is the main pre-computation function that processes all halos
-    and creates a database of ΔΣ values at particle positions.
+    and creates a database of ΔΣ values at particle positions using the
+    spherical shell method with cylindrical projection.
 
     Parameters
     ----------
@@ -671,15 +468,9 @@ def precompute_lensing_grid(
         Simulation box size [Mpc/h]
     r_factor : float, default=3.0
         Factor by which to extend search radius beyond R_vir
-    los_axis : str, default='z'
-        Line-of-sight axis for projection ('x', 'y', or 'z')
-        Only used if method='cylindrical'
     particle_mass : float, optional
         Mass of individual particles [Msun/h]. If not provided, computes
         automatically from RHO_M × V_box / N_particles (Option 1: upweighting).
-    method : str, default='spherical'
-        Method to compute ΔΣ: 'spherical' (Abel transform, recommended) or
-        'cylindrical' (direct projection, legacy)
     verbose : bool, default=True
         Print progress information
 
@@ -727,7 +518,7 @@ def precompute_lensing_grid(
 
         # Find particles within r_factor * R_vir
         search_radius = 100
-        nearby_indices = kdtree.query_ball_point(halo_pos, r=search_radius,workers=-1)
+        nearby_indices = kdtree.query_ball_point(halo_pos, r=search_radius, workers=-1)
 
         if len(nearby_indices) < 10:
             # Skip halos with too few particles
@@ -738,31 +529,20 @@ def precompute_lensing_grid(
         # Compute ΔΣ at each particle position
         for particle_pos in nearby_particles:
             # Use particles within search_radius of THIS particle position
-            local_indices = kdtree.query_ball_point(particle_pos, r=search_radius,workers=-1)
+            local_indices = kdtree.query_ball_point(particle_pos, r=search_radius, workers=-1)
             local_particles = particle_positions[local_indices]
 
             if len(local_particles) < 10:
                 continue
 
             try:
-                if method == 'spherical':
-                    delta_sigma = compute_deltasigma_spherical(
-                        particle_pos, local_particles, RHO_M, rp_bins,
-                        particle_mass=particle_mass,
-                        n_particles_total=len(particle_positions),
-                        Lbox=Lbox,
-                        chi_max=100.0  # Line-of-sight integration limit
-                    )
-                elif method == 'cylindrical':
-                    delta_sigma = compute_deltasigma_at_position(
-                        particle_pos, local_particles, RHO_M, rp_bins,
-                        particle_mass=particle_mass,
-                        n_particles_total=len(particle_positions),
-                        Lbox=Lbox,
-                        los_axis=los_axis
-                    )
-                else:
-                    raise ValueError(f"Unknown method: {method}. Use 'spherical' or 'cylindrical'.")
+                delta_sigma = compute_deltasigma_spherical(
+                    particle_pos, local_particles, RHO_M, rp_bins,
+                    particle_mass=particle_mass,
+                    n_particles_total=len(particle_positions),
+                    Lbox=Lbox,
+                    chi_max=100.0  # Line-of-sight integration limit
+                )
 
                 all_positions.append(particle_pos)
                 all_deltasigma.append(delta_sigma)

@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from HOD_NRV.HOD_numerical.twopoint_calculator.precompute_deltasigma import (
     build_particle_kdtree,
-    compute_deltasigma_at_position
+    compute_deltasigma_spherical
 )
 
 

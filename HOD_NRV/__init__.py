@@ -47,7 +47,6 @@ from .HOD_numerical.twopoint_calculator.standard_two_point_calculator import (
 from .HOD_numerical.twopoint_calculator.fast_two_point import FastDeltaSigmaCalculator
 from .HOD_numerical.twopoint_calculator.precompute_deltasigma import (
     build_particle_kdtree,
-    compute_deltasigma_at_position,
     precompute_lensing_grid,
     save_precomputed_lensing,
     load_precomputed_lensing
@@ -84,7 +83,6 @@ __all__ = [
     # Fast two-point calculator
     "FastDeltaSigmaCalculator",
     "build_particle_kdtree",
-    "compute_deltasigma_at_position",
     "precompute_lensing_grid",
     "save_precomputed_lensing",
     "load_precomputed_lensing",

@@ -52,7 +52,7 @@ from HOD_NRV.HOD_numerical.HOD.HOD_catalogue import HaloOccupation
 from HOD_NRV.utilsf.emulator_utils import rescale_Ac_to_target_ngal
 from HOD_NRV.HOD_numerical.twopoint_calculator.precompute_deltasigma import (
     build_particle_kdtree,
-    compute_deltasigma_spherical, compute_deltasigma_at_position
+    compute_deltasigma_spherical
 )
 from test_utils import print_header, print_timing
 
