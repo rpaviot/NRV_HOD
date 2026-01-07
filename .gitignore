@@ -194,3 +194,11 @@ HOD_NRV2_part2.ipynb
 
 # macOS
 .DS_Store
+
+# Output files (PNG, NPZ, H5)
+*.png
+*.npz
+HOD_NRV/HOD_numerical/test/output/
+
+# Jupyter notebooks
+*.ipynb
