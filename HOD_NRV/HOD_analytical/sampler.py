@@ -1,10 +1,12 @@
 """
-CSMF HOD Fitter using Nautilus Sampler
-=======================================
+CSMF HOD Fitter using Nautilus Sampler and iminuit Minimization
+================================================================
 
 This module provides a class for fitting the Conditional Stellar Mass Function
 (CSMF) HOD model to galaxy-galaxy lensing measurements (Delta Sigma) and
-optionally galaxy clustering (WGG) using the Nautilus nested sampling algorithm.
+optionally galaxy clustering (WGG) using:
+- Nautilus nested sampling algorithm (for full posterior)
+- iminuit minimization (for fast best-fit finding)
 
 Features:
 - Support for fitting multiple stellar mass bins simultaneously
@@ -14,13 +16,14 @@ Features:
 - Choice of observables to fit (DeltaSigma, WGG, or both)
 - Support for different rp bins for WGG and DeltaSigma
 - Efficient model evaluation using pre-computed halo model quantities
+- Fast best-fit finding with iminuit (MIGRAD, HESSE, MINOS)
 
 Author: CSMF Fitting Pipeline
-Modified: December 2025 - Updated for new halo model API
+Modified: December 2025 - Added iminuit minimization support
 """
 
 import numpy as np
-from typing import Dict, List, Optional, Union, Tuple, Any
+from typing import Dict, List, Optional, Union, Tuple, Any, Callable
 from dataclasses import dataclass, field
 from scipy.stats import norm
 import pyccl as ccl
@@ -41,6 +44,19 @@ try:
 except ImportError:
     HAS_NAUTILUS = False
     warnings.warn("nautilus-sampler not installed. Install with: pip install nautilus-sampler")
+
+# Try to import iminuit
+try:
+    from iminuit import Minuit
+    from iminuit.util import describe
+    HAS_IMINUIT = True
+except ImportError:
+    HAS_IMINUIT = False
+    warnings.warn("iminuit not installed. Install with: pip install iminuit")
+
+# scipy is always available
+from scipy.optimize import differential_evolution, minimize as scipy_minimize
+from scipy.optimize import OptimizeResult
 
 
 # ============================================================================
@@ -105,95 +121,64 @@ class ParameterPrior:
 
 
 DEFAULT_CSMF_PRIORS = {
-    # Characteristic stellar mass log10(M*/[Msun/h²])
-    # Table shows log(L0/[h^-2 L_sun]) with prior [7, 13]
-    # Converting to stellar mass: roughly [9.0, 14.0] in log10(Msun/h²)
     'M0': ParameterPrior(
         name='M0',
         prior_type='uniform',
         bounds=(8.0, 13.0)
     ),
-    
-    # Characteristic halo mass log10(Mh/[Msun/h])
-    # Table shows [9.0, 14.0]
     'M1': ParameterPrior(
         name='M1',
         prior_type='uniform',
         bounds=(9.0, 14.0)
     ),
-    
-    # Low-mass slope of SHMR
     'gamma1': ParameterPrior(
         name='gamma1',
         prior_type='uniform',
-        bounds=(2.5, 10.0)
+        bounds=(1.0, 15.0)
     ),
-    
-    # High-mass slope of SHMR
-    # Table shows [0, 2]
     'gamma2': ParameterPrior(
         name='gamma2',
         prior_type='uniform',
         bounds=(0.0, 3.0)
     ),
-    
-    # Scatter in central stellar mass
-    # Table shows [0.1, 0.3]
     'sigma_c': ParameterPrior(
         name='sigma_c',
         prior_type='uniform',
         bounds=(0.1, 0.9)
     ),
-    
-    # Satellite Schechter function slope
-    # Table shows N(-1.1, 0.9)
     'alpha_s': ParameterPrior(
         name='alpha_s',
         prior_type='gaussian',
         mean=-1.1,
         std=1.5
     ),
-    
-    # Satellite normalization intercept
-    # Table shows N(0, 1.5)
     'b0': ParameterPrior(
         name='b0',
         prior_type='gaussian',
         mean=0.0,
         std=1.5
     ),
-    
-    # Satellite normalization slope
-    # Table shows N(1.5, 2.0)
     'b1': ParameterPrior(
         name='b1',
         prior_type='gaussian',
         mean=1.5,
         std=2.0
     ),
-    
-    # Central concentration parameter (Fc in table)
-    # Table shows [0.1, 1] - this is f_conc
-    # Note: Not in standard CSMF, but can be added as extension
     'f_c': ParameterPrior(
         name='f_c',
         prior_type='uniform',
         bounds=(0.4, 1.0)
     ),
-    
-    # Satellite concentration parameter (Fs)
-    # Can be fixed to 1 or varied
     'f_s': ParameterPrior(
         name='f_s',
-        prior_type='fixed',
-        fixed_value=1.0
+        prior_type='uniform',
+        bounds=(0.4, 1.0)
     ),
 }
 
-# CSMF HOD parameters
 FIDUCIAL_CSMF_PARAMS = {
-    'M0': 10.5,         # log10(M*) [Msun/h²]
-    'M1': 12.0,         # log10(Mh) [Msun/h]
+    'M0': 10.5,
+    'M1': 12.0,
     'gamma1': 7.0,
     'gamma2': 0.2,
     'sigma_c': 0.2,
@@ -209,54 +194,17 @@ FIDUCIAL_CSMF_PARAMS = {
 class MassBinData:
     """
     Container for a single stellar mass bin's data.
-    
-    Attributes
-    ----------
-    massbin_id : int
-        Mass bin identifier (0-7)
-    z_eff : float
-        Effective redshift
-    logmstar_min : float
-        Minimum log stellar mass
-    logmstar_max : float
-        Maximum log stellar mass
-    logmstar_median : float, optional
-        Median log stellar mass for stellar point mass GGL contribution
-    rp : np.ndarray
-        Projected radii for Delta Sigma [Mpc/h]
-    rp_bins : np.ndarray
-        Bin edges for Delta Sigma [Mpc/h]
-    delta_sigma : np.ndarray
-        Delta Sigma measurements [Msun h/pc²]
-    delta_sigma_err : np.ndarray
-        Delta Sigma errors
-    cov_delta_sigma : np.ndarray
-        Covariance matrix for Delta Sigma
-    rp_wgg : np.ndarray, optional
-        Projected radii for WGG [Mpc/h] (defaults to rp if not provided)
-    rp_bins_wgg : np.ndarray, optional
-        Bin edges for WGG [Mpc/h] (defaults to rp_bins if not provided)
-    wp : np.ndarray, optional
-        Projected clustering w_p(r_p)
-    wp_err : np.ndarray, optional
-        Errors on w_p
-    cov_wgg : np.ndarray, optional
-        Covariance matrix for w_p
-    mag_contribution : np.ndarray, optional
-        Magnification bias contribution
-    mean_sigma_crit : np.ndarray, optional
-        Mean critical surface density
     """
     massbin_id: int
     z_eff: float
     logmstar_min: float
     logmstar_max: float
     logmstar_median: Optional[float] = None
-    rp: np.ndarray
-    rp_bins: np.ndarray
-    delta_sigma: np.ndarray
-    delta_sigma_err: np.ndarray
-    cov_delta_sigma: np.ndarray
+    rp: np.ndarray = field(default_factory=lambda: np.array([]))
+    rp_bins: np.ndarray = field(default_factory=lambda: np.array([]))
+    delta_sigma: np.ndarray = field(default_factory=lambda: np.array([]))
+    delta_sigma_err: np.ndarray = field(default_factory=lambda: np.array([]))
+    cov_delta_sigma: np.ndarray = field(default_factory=lambda: np.array([]))
     rp_wgg: Optional[np.ndarray] = None
     rp_bins_wgg: Optional[np.ndarray] = None
     wp: Optional[np.ndarray] = None
@@ -266,8 +214,6 @@ class MassBinData:
     mean_sigma_crit: Optional[np.ndarray] = None
     
     def __post_init__(self):
-        """Set default values for WGG rp if not provided."""
-        # By default, use same rp bins for WGG as for Delta Sigma
         if self.rp_wgg is None:
             self.rp_wgg = self.rp.copy()
         if self.rp_bins_wgg is None:
@@ -275,26 +221,8 @@ class MassBinData:
     
     @classmethod
     def from_npz(cls, filepath: str, massbin_id: int, h: float) -> 'MassBinData':
-        """
-        Load mass bin data from an npz file.
-        
-        Parameters
-        ----------
-        filepath : str
-            Path to npz file
-        massbin_id : int
-            Mass bin identifier
-        h : float
-            Hubble parameter (for unit conversions if needed)
-        
-        Returns
-        -------
-        MassBinData
-            Loaded data container
-        """
         data = np.load(filepath)
 
-        # Handle different possible key names for rp
         if 'rp_delta_sigma' in data:
             rp = data['rp_delta_sigma']
         elif 'rp' in data:
@@ -302,11 +230,9 @@ class MassBinData:
         else:
             raise KeyError("Could not find 'rp' or 'rp_delta_sigma' in data file")
 
-        # If rp_wgg is not provided, use rp_deltasigma
         rp_wgg = data.get('rp_wgg', rp)
         rp_bins_wgg = data.get('rp_bins_wgg', data['rp_bins'])
 
-        # Handle covariance matrix key names
         if 'cov_delta_sigma' in data:
             cov_delta_sigma = data['cov_delta_sigma']
         elif 'covariance_matrix' in data:
@@ -317,9 +243,9 @@ class MassBinData:
         return cls(
             massbin_id=massbin_id,
             z_eff=float(data['z_eff']),
-            logmstar_min=float(data['logmstar_min']),
-            logmstar_max=float(data['logmstar_max']),
-            logmstar_median=float(data['logmstar_median']) if 'logmstar_median' in data else None,
+            logmstar_min=float(data['logmstar_min']),# - 2*np.log10(DEFAULT_COSMO_PARAMS['h']),
+            logmstar_max=float(data['logmstar_max']),# - 2*np.log10(DEFAULT_COSMO_PARAMS['h']),
+            logmstar_median=float(data['logmstar_median']),#- 2*np.log10(DEFAULT_COSMO_PARAMS['h']),
             rp=rp,
             rp_bins=data['rp_bins'],
             delta_sigma=data['delta_sigma'],
@@ -336,21 +262,184 @@ class MassBinData:
 
 
 # ============================================================================
+# Minuit Result Container
+# ============================================================================
+
+@dataclass
+class MinuitResult:
+    """
+    Container for iminuit minimization results.
+    
+    Attributes
+    ----------
+    best_fit : dict
+        Best-fit parameter values (including fixed params)
+    errors : dict
+        Parameter errors from HESSE (symmetric)
+    minos_errors : dict, optional
+        Asymmetric errors from MINOS (if computed)
+    covariance : np.ndarray
+        Covariance matrix for free parameters
+    correlation : np.ndarray
+        Correlation matrix for free parameters
+    chi2 : float
+        Chi-squared at best fit (-2 * log_likelihood)
+    ndof : int
+        Number of degrees of freedom
+    reduced_chi2 : float
+        Reduced chi-squared (chi2 / ndof)
+    fval : float
+        Function value at minimum (-log_likelihood or chi2/2)
+    is_valid : bool
+        Whether the fit converged
+    has_accurate_covar : bool
+        Whether covariance matrix is accurate
+    param_names : list
+        Names of free parameters (in order)
+    minuit : Minuit
+        The underlying Minuit object for further analysis
+    """
+    best_fit: Dict[str, float]
+    errors: Dict[str, float]
+    minos_errors: Optional[Dict[str, Tuple[float, float]]]
+    covariance: np.ndarray
+    correlation: np.ndarray
+    chi2: float
+    ndof: int
+    reduced_chi2: float
+    fval: float
+    is_valid: bool
+    has_accurate_covar: bool
+    param_names: List[str]
+    minuit: Any  # Minuit object
+    
+    def print_summary(self):
+        """Print a summary of the fit results."""
+        print("\n" + "="*70)
+        print("MINUIT FIT RESULTS")
+        print("="*70)
+        
+        print(f"\nFit status: {'CONVERGED' if self.is_valid else 'FAILED'}")
+        print(f"Covariance: {'ACCURATE' if self.has_accurate_covar else 'APPROXIMATE'}")
+        print(f"\nχ² = {self.chi2:.2f}")
+        print(f"ndof = {self.ndof}")
+        print(f"χ²/ndof = {self.reduced_chi2:.3f}")
+        
+        print(f"\nBest-fit parameters:")
+        print("-"*50)
+        
+        for name in self.param_names:
+            val = self.best_fit[name]
+            err = self.errors.get(name, 0)
+            
+            if self.minos_errors and name in self.minos_errors:
+                err_lo, err_hi = self.minos_errors[name]
+                print(f"  {name:12s} = {val:12.5f}  +{err_hi:.5f}  {err_lo:.5f}")
+            else:
+                print(f"  {name:12s} = {val:12.5f} ± {err:.5f}")
+        
+        # Print fixed parameters
+        fixed_params = {k: v for k, v in self.best_fit.items() if k not in self.param_names}
+        if fixed_params:
+            print(f"\nFixed parameters:")
+            print("-"*50)
+            for name, val in fixed_params.items():
+                print(f"  {name:12s} = {val:12.5f} (FIXED)")
+        
+        print("="*70)
+
+
+@dataclass
+class DifferentialEvolutionResult:
+    """
+    Container for scipy differential evolution results.
+    
+    Attributes
+    ----------
+    best_fit : dict
+        Best-fit parameter values (including fixed params)
+    chi2 : float
+        Chi-squared at best fit (-2 * log_likelihood)
+    ndof : int
+        Number of degrees of freedom
+    reduced_chi2 : float
+        Reduced chi-squared (chi2 / ndof)
+    success : bool
+        Whether the optimization converged
+    message : str
+        Convergence message from scipy
+    n_iterations : int
+        Number of iterations
+    n_function_evals : int
+        Number of function evaluations
+    param_names : list
+        Names of free parameters (in order)
+    scipy_result : OptimizeResult
+        The underlying scipy result object
+    errors : dict, optional
+        Parameter errors (if computed via finite differences)
+    covariance : np.ndarray, optional
+        Covariance matrix (if computed)
+    """
+    best_fit: Dict[str, float]
+    chi2: float
+    ndof: int
+    reduced_chi2: float
+    success: bool
+    message: str
+    n_iterations: int
+    n_function_evals: int
+    param_names: List[str]
+    scipy_result: Any
+    errors: Optional[Dict[str, float]] = None
+    covariance: Optional[np.ndarray] = None
+    
+    def print_summary(self):
+        """Print a summary of the fit results."""
+        print("\n" + "="*70)
+        print("DIFFERENTIAL EVOLUTION FIT RESULTS")
+        print("="*70)
+        
+        print(f"\nFit status: {'CONVERGED' if self.success else 'FAILED'}")
+        print(f"Message: {self.message}")
+        print(f"Iterations: {self.n_iterations}")
+        print(f"Function evaluations: {self.n_function_evals}")
+        print(f"\nχ² = {self.chi2:.2f}")
+        print(f"ndof = {self.ndof}")
+        print(f"χ²/ndof = {self.reduced_chi2:.3f}")
+        
+        print(f"\nBest-fit parameters:")
+        print("-"*50)
+        
+        for name in self.param_names:
+            val = self.best_fit[name]
+            if self.errors and name in self.errors:
+                err = self.errors[name]
+                print(f"  {name:12s} = {val:12.5f} ± {err:.5f}")
+            else:
+                print(f"  {name:12s} = {val:12.5f}")
+        
+        # Print fixed parameters
+        fixed_params = {k: v for k, v in self.best_fit.items() if k not in self.param_names}
+        if fixed_params:
+            print(f"\nFixed parameters:")
+            print("-"*50)
+            for name, val in fixed_params.items():
+                print(f"  {name:12s} = {val:12.5f} (FIXED)")
+        
+        print("="*70)
+
+
+# ============================================================================
 # Main CSMF Fitter Class
 # ============================================================================
 
 class CSMFFitter:
     """
-    CSMF HOD Fitter using Nautilus nested sampling.
+    CSMF HOD Fitter using Nautilus nested sampling and iminuit minimization.
     
     This class handles fitting the CSMF HOD model to galaxy-galaxy lensing
     (Delta Sigma) and optionally galaxy clustering (w_p) measurements.
-    
-    IMPORTANT: This version uses the multi-redshift CSMF functionality where
-    a single MultiRedshiftHaloModel is created with all redshifts, and
-    stellar mass bin arrays are passed for multi-bin computation.
-    
-    The rp bins for WGG and DeltaSigma can be the same or different.
     
     Parameters
     ----------
@@ -358,30 +447,18 @@ class CSMFFitter:
         Cosmology parameters. Default uses the fiducial cosmology.
     observables : list of str
         Which observables to fit. Options: ['DeltaSigma', 'WGG']
-        Default: ['DeltaSigma']
     rp_min : float, optional
-        Minimum r_p to include in fit [Mpc/h]. Default: None (use all)
+        Minimum r_p to include in fit [Mpc/h]
     rp_max : float, optional
-        Maximum r_p to include in fit [Mpc/h]. Default: None (use all)
+        Maximum r_p to include in fit [Mpc/h]
     rp_min_wgg : float, optional
-        Minimum r_p for WGG fit [Mpc/h]. Default: None (use rp_min)
+        Minimum r_p for WGG fit [Mpc/h]
     rp_max_wgg : float, optional
-        Maximum r_p for WGG fit [Mpc/h]. Default: None (use rp_max)
+        Maximum r_p for WGG fit [Mpc/h]
     units_per_h : bool
         Whether to use h-units. Default: True
     verbose : bool
         Print progress information. Default: True
-    
-    Attributes
-    ----------
-    cosmo : ccl.Cosmology
-        CCL cosmology object
-    mass_bins : list of MassBinData
-        Data for each mass bin
-    priors : dict
-        Prior configuration for each parameter
-    fixed_params : dict
-        Fixed parameter values
     """
     
     def __init__(
@@ -395,42 +472,38 @@ class CSMFFitter:
         units_per_h: bool = True,
         verbose: bool = True
     ):
-        if not HAS_NAUTILUS:
-            raise ImportError("nautilus-sampler is required. Install with: pip install nautilus-sampler")
-        
-        # Store configuration
         self.observables = observables or ['DeltaSigma']
         self.rp_min = rp_min
         self.rp_max = rp_max
-        # WGG scale cuts default to same as DeltaSigma if not specified
         self.rp_min_wgg = rp_min_wgg if rp_min_wgg is not None else rp_min
         self.rp_max_wgg = rp_max_wgg if rp_max_wgg is not None else rp_max
         self.units_per_h = units_per_h
         self.verbose = verbose
         
-        # Set up cosmology
         if cosmo_params is None:
             cosmo_params = DEFAULT_COSMO_PARAMS
         self.cosmo_params = cosmo_params
         self._setup_cosmology()
         
-        # Initialize data and prior storage
         self.mass_bins: List[MassBinData] = []
         self.priors: Dict[str, ParameterPrior] = {}
         self.fixed_params: Dict[str, float] = {}
         
-        # Single unified halo model
         self._halo_model: Optional[MultiRedshiftHaloModel] = None
-        
-        # Store arrays for multi-bin computation
         self._z_eff_array: Optional[np.ndarray] = None
         self._mstar_min_array: Optional[np.ndarray] = None
         self._mstar_max_array: Optional[np.ndarray] = None
         self._massbin_id_to_index: Optional[Dict[int, int]] = None
+        self._median_mstar_array: Optional[np.ndarray] = None
         
-        # Results
-        self.sampler: Optional[Sampler] = None
+        # Results storage
+        self.sampler: Optional[Any] = None
         self.results: Optional[Dict] = None
+        self.minuit_result: Optional[MinuitResult] = None
+        self.de_result: Optional[DifferentialEvolutionResult] = None
+        
+        # Cache for number of data points (for chi2/ndof calculation)
+        self._n_data_points: Optional[int] = None
     
     def _setup_cosmology(self):
         """Initialize CCL cosmology object"""
@@ -439,7 +512,7 @@ class CSMFFitter:
         h = self.cosmo_params['h']
         As = self.cosmo_params['A_s']
         ns = self.cosmo_params['n_s']
-        mnu = 0.06  # Default neutrino mass
+        mnu = 0.06
         
         self.cosmo = ccl.Cosmology(
             Omega_c=Omc,
@@ -461,20 +534,9 @@ class CSMFFitter:
         self,
         data_dir: str,
         mass_bins: Optional[List[int]] = None,
-        file_pattern: str = 'dsigma_massbin{}.npz'
+        file_pattern: str = 'dsigma_wgg_massbin{}_SFR.npz'
     ):
-        """
-        Load Delta Sigma measurements for specified mass bins.
-        
-        Parameters
-        ----------
-        data_dir : str
-            Directory containing the data files
-        mass_bins : list of int, optional
-            Which mass bins to load. Default: [0, 1, 2, 3, 4, 5, 6, 7]
-        file_pattern : str
-            Filename pattern with {} placeholder for mass bin number
-        """
+        """Load Delta Sigma measurements for specified mass bins."""
         if mass_bins is None:
             mass_bins = list(range(8))
         
@@ -492,62 +554,28 @@ class CSMFFitter:
             if self.verbose:
                 print(f"Loaded mass bin {mb}: z_eff={data.z_eff:.3f}, "
                       f"log(M*)=[{data.logmstar_min:.2f}, {data.logmstar_max:.2f}]")
-                # Report if WGG uses different rp bins
-                if data.wp is not None:
-                    if not np.allclose(data.rp, data.rp_wgg):
-                        print(f"  Note: WGG uses different rp bins than DeltaSigma")
 
-        # Sort by z_eff for consistency
         self.mass_bins.sort(key=lambda x: x.z_eff)
 
         if self.verbose:
             print(f"Total: {len(self.mass_bins)} mass bins loaded")
-            if self.mass_bins:
-                print(f"Redshift range: z=[{self.mass_bins[0].z_eff:.3f}, {self.mass_bins[-1].z_eff:.3f}]")
     
     def set_priors(
         self,
         priors: Optional[Dict[str, ParameterPrior]] = None,
         fixed_params: Optional[Dict[str, float]] = None
     ):
-        """
-        Set parameter priors.
-        
-        Parameters
-        ----------
-        priors : dict, optional
-            Dictionary mapping parameter names to ParameterPrior objects.
-            If None, uses default CSMF priors.
-        fixed_params : dict, optional
-            Dictionary of parameters to fix at specific values.
-            These override any priors set for the same parameters.
-        
-        Examples
-        --------
-        >>> fitter.set_priors(
-        ...     fixed_params={'f_c': 1.0, 'f_s': 1.0}  # Fix concentration params
-        ... )
-        
-        >>> # Custom prior for gamma1
-        >>> custom_priors = {
-        ...     'gamma1': ParameterPrior('gamma1', 'gaussian', mean=3.5, std=1.0)
-        ... }
-        >>> fitter.set_priors(priors=custom_priors)
-        """
-        # Start with defaults
+        """Set parameter priors."""
         self.priors = DEFAULT_CSMF_PRIORS.copy()
         
-        # Update with user-provided priors
         if priors is not None:
             for name, prior in priors.items():
                 self.priors[name] = prior
         
-        # Handle fixed parameters
         self.fixed_params = {}
         if fixed_params is not None:
             for name, value in fixed_params.items():
                 self.fixed_params[name] = value
-                # Update the prior to be fixed
                 self.priors[name] = ParameterPrior(
                     name=name,
                     prior_type='fixed',
@@ -564,21 +592,13 @@ class CSMFFitter:
                 elif prior.prior_type == 'gaussian':
                     print(f"  {name}: N({prior.mean}, {prior.std})")
     
-    def _build_nautilus_prior(self) -> Prior:
-        """
-        Build nautilus Prior object from parameter configuration.
+    def _build_nautilus_prior(self) -> 'Prior':
+        """Build nautilus Prior object from parameter configuration."""
+        if not HAS_NAUTILUS:
+            raise ImportError("nautilus-sampler is required")
         
-        Returns
-        -------
-        prior : nautilus.Prior
-            Configured prior object
-        """
         prior = Prior()
-        
-        # Core CSMF parameters
         csmf_param_names = ['M0', 'M1', 'gamma1', 'gamma2', 'sigma_c', 'alpha_s', 'b0', 'b1']
-        
-        # Add optional parameters if not fixed
         optional_params = ['f_c', 'f_s']
         
         for name in csmf_param_names + optional_params:
@@ -588,7 +608,6 @@ class CSMFFitter:
             param_prior = self.priors[name]
             
             if param_prior.prior_type == 'fixed':
-                # Don't add fixed parameters to nautilus prior
                 continue
             elif param_prior.prior_type == 'uniform':
                 prior.add_parameter(name, dist=param_prior.bounds)
@@ -601,92 +620,59 @@ class CSMFFitter:
         return prior
     
     def _get_free_param_names(self) -> List[str]:
-        """Get list of free (non-fixed) parameter names"""
+        """Get list of free (non-fixed) parameter names in consistent order."""
+        # Define the canonical order
+        canonical_order = ['M0', 'M1', 'gamma1', 'gamma2', 'sigma_c', 'alpha_s', 'b0', 'b1', 'f_c', 'f_s']
         return [
-            name for name, prior in self.priors.items()
-            if prior.prior_type != 'fixed'
+            name for name in canonical_order
+            if name in self.priors and self.priors[name].prior_type != 'fixed'
         ]
     
     def _build_full_params(self, free_params: Dict[str, float]) -> Dict[str, float]:
-        """
-        Build full parameter dictionary including fixed params.
-        
-        Parameters
-        ----------
-        free_params : dict
-            Dictionary of free parameter values from sampler
-        
-        Returns
-        -------
-        full_params : dict
-            Complete parameter dictionary
-        """
+        """Build full parameter dictionary including fixed params."""
         full_params = {}
         
-        # Add fixed parameters
         for name, prior in self.priors.items():
             if prior.prior_type == 'fixed':
                 full_params[name] = prior.fixed_value
         
-        # Add free parameters
         full_params.update(free_params)
-        
         return full_params
     
     def _initialize_halo_model(self):
-        """
-        Initialize a SINGLE unified halo model for all mass bins.
-        
-        The model is created with z_array matching the z_eff of each mass bin.
-        This allows passing Mstar_min/Mstar_max arrays where each element
-        corresponds to a different stellar mass bin at its respective redshift.
-        """
+        """Initialize a SINGLE unified halo model for all mass bins."""
         if not self.mass_bins:
             raise ValueError("No data loaded. Call load_data() first.")
         
-        # Extract z_eff from all mass bins (in order)
-        # This array will be used as z_array for the model
         self._z_eff_array = np.array([mb.z_eff for mb in self.mass_bins])
         
         if self.verbose:
             print(f"\nInitializing unified halo model...")
             print(f"  Number of mass bins: {len(self.mass_bins)}")
-            print(f"  Redshift array: {self._z_eff_array}")
         
-        # Create arrays for stellar mass bin edges
         self._mstar_min_array = np.array([10**mb.logmstar_min for mb in self.mass_bins])
         self._mstar_max_array = np.array([10**mb.logmstar_max for mb in self.mass_bins])
 
-        # Extract median stellar masses for stellar point mass contribution
-        # Store as array matching z_eff_array length
         median_mstar_list = []
         for mb in self.mass_bins:
             if mb.logmstar_median is not None:
-                # Convert from log10 to linear [Msun/h²]
                 median_mstar_list.append(10**mb.logmstar_median)
             else:
-                # Use None to indicate no stellar component for this bin
                 median_mstar_list.append(None)
 
-        # Convert to array, handling None values
-        # If ALL are None, set to None (no stellar component)
-        # If SOME are None, raise error (not supported by model)
         if all(m is None for m in median_mstar_list):
             self._median_mstar_array = None
         elif any(m is None for m in median_mstar_list):
             raise ValueError(
-                "Mixed stellar mass bins detected: some bins have logmstar_median, "
-                "some don't. All bins must either have or not have median stellar masses."
+                "Mixed stellar mass bins: all bins must either have or not have median stellar masses."
             )
         else:
             self._median_mstar_array = np.array(median_mstar_list)
 
-        # Create mapping from massbin_id to index in arrays
         self._massbin_id_to_index = {
             mb.massbin_id: i for i, mb in enumerate(self.mass_bins)
         }
         
-        # Use fiducial parameters for initialization
         init_params = {
             'M0': FIDUCIAL_CSMF_PARAMS['M0'],
             'M1': FIDUCIAL_CSMF_PARAMS['M1'],
@@ -698,8 +684,6 @@ class CSMFFitter:
             'b1': FIDUCIAL_CSMF_PARAMS['b1'],
         }
         
-        # Create the unified model with z_array = z_eff for each mass bin
-        # This allows Mstar_min/Mstar_max arrays of same length
         self._halo_model = MultiRedshiftHaloModel(
             self.cosmo,
             hod_type=HODType.CSMF,
@@ -711,44 +695,33 @@ class CSMFFitter:
             verbose=self.verbose
         )
         
+        # Count total data points for chi2/ndof calculation
+        self._count_data_points()
+        
         if self.verbose:
-            print(f"\nStellar mass bins configuration:")
-            for i, mb in enumerate(self.mass_bins):
-                median_str = ""
-                if self._median_mstar_array is not None:
-                    median_str = f", M*_median={self._median_mstar_array[i]:.2e} Msun/h²"
-                print(f"  Bin {i} (ID={mb.massbin_id}): z_eff={mb.z_eff:.3f}, "
-                      f"log(M*)=[{mb.logmstar_min:.2f}, {mb.logmstar_max:.2f}], "
-                      f"M*=[{self._mstar_min_array[i]:.2e}, {self._mstar_max_array[i]:.2e}]"
-                      f"{median_str}")
-            if self._median_mstar_array is not None:
-                print(f"\n  Stellar point mass component ENABLED for GGL")
             print(f"\nUnified halo model initialized successfully!")
+            print(f"Total data points: {self._n_data_points}")
+    
+    def _count_data_points(self):
+        """Count total number of data points after scale cuts."""
+        n_total = 0
+        
+        for mass_bin in self.mass_bins:
+            if 'DeltaSigma' in self.observables:
+                _, _, _, mask = self._apply_scale_cuts(mass_bin)
+                n_total += np.sum(mask)
+            
+            if 'WGG' in self.observables and mass_bin.wp is not None:
+                _, _, _, mask_wgg = self._apply_scale_cuts_wgg(mass_bin)
+                n_total += np.sum(mask_wgg)
+        
+        self._n_data_points = n_total
     
     def _compute_model_observables(
         self,
         params: Dict[str, float],
     ) -> Tuple[Dict[int, np.ndarray], Dict[int, Optional[np.ndarray]]]:
-        """
-        Compute model observables for ALL mass bins simultaneously.
-
-        This uses the multi-bin functionality where Mstar_min/Mstar_max arrays
-        are passed with length matching z_array. The model computes all bins
-        in a single vectorized call.
-
-        Parameters
-        ----------
-        params : dict
-            HOD parameters
-
-        Returns
-        -------
-        ds_dict : dict
-            Dictionary mapping massbin_id to Delta Sigma predictions
-        wgg_dict : dict
-            Dictionary mapping massbin_id to w_p predictions (or None)
-        """
-        # Extract CSMF parameters
+        """Compute model observables for ALL mass bins simultaneously."""
         csmf_params = {
             'M0': params['M0'],
             'M1': params['M1'],
@@ -760,16 +733,11 @@ class CSMFFitter:
             'b1': params['b1'],
         }
 
-        # Update halo model with new parameters
         self._halo_model.update_hod_params(csmf_params)
 
-        # Use the first mass bin's rp values as reference
-        # (assumes all bins use the same rp grid - this is the common case)
         rp_ds = self.mass_bins[0].rp
         rp_bins_ds = self.mass_bins[0].rp_bins
         
-        # Compute Delta Sigma for ALL redshifts/mass bins in one call
-        # Pass Mstar arrays that match z_array length
         _, ds_all = self._halo_model.compute_DeltaSigma_all_z(
             rp=rp_ds,
             bin_avg=True,
@@ -779,8 +747,6 @@ class CSMFFitter:
             verbose=False
         )
 
-        # Build dictionary mapping massbin_id to predictions
-        # ds_all has shape (n_z, n_rp) where n_z matches number of mass bins
         ds_dict = {}
         for i, mass_bin in enumerate(self.mass_bins):
             if self._halo_model.is_single_z:
@@ -788,18 +754,14 @@ class CSMFFitter:
             else:
                 ds_dict[mass_bin.massbin_id] = ds_all[i]
 
-        # Compute WGG if requested
         wgg_dict = {}
         if 'WGG' in self.observables:
-            # Check if any mass bin has WGG data
             has_wgg = any(mb.wp is not None for mb in self.mass_bins)
             
             if has_wgg:
-                # Use the first mass bin's rp_wgg values as reference
                 rp_wgg = self.mass_bins[0].rp_wgg
                 rp_bins_wgg = self.mass_bins[0].rp_bins_wgg
                 
-                # Compute WGG for ALL redshifts/mass bins in one call
                 _, wgg_all = self._halo_model.compute_wgg_all_z(
                     rp=rp_wgg,
                     bin_avg=True,
@@ -827,25 +789,11 @@ class CSMFFitter:
         return ds_dict, wgg_dict
     
     def _apply_scale_cuts(self, mass_bin: MassBinData) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Apply r_p scale cuts to Delta Sigma data.
-        
-        Returns
-        -------
-        rp_cut : np.ndarray
-            r_p values after cuts
-        ds_cut : np.ndarray
-            Delta Sigma after cuts
-        cov_cut : np.ndarray
-            Covariance matrix after cuts
-        mask : np.ndarray
-            Boolean mask
-        """
+        """Apply r_p scale cuts to Delta Sigma data."""
         rp = mass_bin.rp
         ds = mass_bin.delta_sigma
         cov = mass_bin.cov_delta_sigma
         
-        # Create mask
         mask = np.ones(len(rp), dtype=bool)
         
         if self.rp_min is not None:
@@ -853,7 +801,6 @@ class CSMFFitter:
         if self.rp_max is not None:
             mask &= (rp <= self.rp_max)
         
-        # Apply mask
         rp_cut = rp[mask]
         ds_cut = ds[mask]
         cov_cut = cov[np.ix_(mask, mask)]
@@ -861,27 +808,11 @@ class CSMFFitter:
         return rp_cut, ds_cut, cov_cut, mask
     
     def _apply_scale_cuts_wgg(self, mass_bin: MassBinData) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """
-        Apply r_p scale cuts to WGG data.
-        
-        Note: Uses separate rp_min_wgg and rp_max_wgg if specified.
-        
-        Returns
-        -------
-        rp_cut : np.ndarray
-            r_p values after cuts
-        wp_cut : np.ndarray
-            w_p after cuts
-        cov_cut : np.ndarray
-            Covariance matrix after cuts
-        mask : np.ndarray
-            Boolean mask
-        """
+        """Apply r_p scale cuts to WGG data."""
         rp = mass_bin.rp_wgg
         wp = mass_bin.wp
         cov = mass_bin.cov_wgg
         
-        # Create mask using WGG-specific cuts
         mask = np.ones(len(rp), dtype=bool)
         
         if self.rp_min_wgg is not None:
@@ -889,7 +820,6 @@ class CSMFFitter:
         if self.rp_max_wgg is not None:
             mask &= (rp <= self.rp_max_wgg)
         
-        # Apply mask
         rp_cut = rp[mask]
         wp_cut = wp[mask]
         cov_cut = cov[np.ix_(mask, mask)]
@@ -897,127 +827,766 @@ class CSMFFitter:
         return rp_cut, wp_cut, cov_cut, mask
     
     def log_likelihood(self, param_dict: Dict[str, float]) -> float:
-        """
-        Compute log-likelihood for the CSMF model.
-
-        This version computes the model predictions for ALL mass bins
-        directly at the data points (no interpolation needed).
-
-        Parameters
-        ----------
-        param_dict : dict
-            Dictionary of free parameter values
-
-        Returns
-        -------
-        log_L : float
-            Log-likelihood value
-        """
-        # Build full parameter set
+        """Compute log-likelihood for the CSMF model."""
         params = self._build_full_params(param_dict)
 
         try:
-            # Compute model predictions for ALL bins
             ds_dict, wgg_dict = self._compute_model_observables(params)
-
         except Exception as e:
-            # Return very low likelihood for failed evaluations
             if self.verbose:
                 print(f"Warning: Model evaluation failed: {e}")
             return -1e100
 
         total_log_L = 0.0
 
-        # Loop over mass bins to evaluate likelihood
         for mass_bin in self.mass_bins:
-            # Delta Sigma likelihood
             if 'DeltaSigma' in self.observables:
-                # Apply scale cuts
                 rp_cut, ds_data, cov, mask = self._apply_scale_cuts(mass_bin)
 
                 if len(rp_cut) == 0:
                     continue
 
                 try:
-                    # Get model prediction for this bin
                     ds_model_full = ds_dict[mass_bin.massbin_id]
-
-                    # Apply the same scale cuts to model
                     ds_model = ds_model_full[mask]
 
                     if not np.all(np.isfinite(ds_model)):
-                        if self.verbose:
-                            print(f"[WARNING] NaN DeltaSigma in bin {mass_bin.massbin_id} → -inf")
                         return -1e100
 
-                    # Compute chi-squared
                     residual = ds_data - ds_model
 
-                    # Use covariance matrix
                     try:
                         cov_inv = np.linalg.inv(cov)
                         chi2 = residual @ cov_inv @ residual
                     except np.linalg.LinAlgError:
-                        # Fall back to diagonal
                         err = mass_bin.delta_sigma_err[mask]
                         chi2 = np.sum((residual / err)**2)
 
-                    # Log-likelihood
                     log_L_bin = -0.5 * chi2
                     total_log_L += log_L_bin
 
                 except Exception as e:
                     if self.verbose:
-                        print(f"Warning: DeltaSigma likelihood failed for mass bin "
-                              f"{mass_bin.massbin_id}: {e}")
+                        print(f"Warning: DeltaSigma likelihood failed: {e}")
                     return -1e100
 
-            # WGG likelihood
             if 'WGG' in self.observables and mass_bin.wp is not None:
-                # Apply scale cuts for WGG
                 rp_wgg_cut, wp_data, cov_wgg, mask_wgg = self._apply_scale_cuts_wgg(mass_bin)
 
                 if len(rp_wgg_cut) == 0:
                     continue
 
                 try:
-                    # Get model prediction for this bin
                     wgg_model_full = wgg_dict[mass_bin.massbin_id]
 
                     if wgg_model_full is None:
                         continue
 
-                    # Apply the same scale cuts to model
                     wgg_model = wgg_model_full[mask_wgg]
 
                     if not np.all(np.isfinite(wgg_model)):
-                        if self.verbose:
-                            print(f"[WARNING] NaN w_p in bin {mass_bin.massbin_id} → -inf")
                         return -1e100
 
-                    # Compute chi-squared
                     residual = wp_data - wgg_model
 
-                    # Use covariance matrix
                     try:
                         cov_inv = np.linalg.inv(cov_wgg)
                         chi2 = residual @ cov_inv @ residual
                     except np.linalg.LinAlgError:
-                        # Fall back to diagonal
                         err = mass_bin.wp_err[mask_wgg]
                         chi2 = np.sum((residual / err)**2)
 
-                    # Log-likelihood
                     log_L_bin = -0.5 * chi2
                     total_log_L += log_L_bin
 
                 except Exception as e:
                     if self.verbose:
-                        print(f"Warning: WGG likelihood failed for mass bin "
-                              f"{mass_bin.massbin_id}: {e}")
+                        print(f"Warning: WGG likelihood failed: {e}")
                     return -1e100
 
         return total_log_L
+    
+    # ========================================================================
+    # iminuit Minimization Methods
+    # ========================================================================
+    
+    def _create_minuit_cost_function(self) -> Tuple[Callable, List[str]]:
+        """
+        Create a cost function compatible with iminuit.
+        
+        iminuit expects a function where parameter names are the argument names.
+        We create a wrapper that converts positional/keyword arguments to our
+        param_dict format.
+        
+        Returns
+        -------
+        cost_func : callable
+            Function with signature cost_func(M0, M1, gamma1, ...) -> float
+            Returns -log_likelihood (to minimize)
+        param_names : list
+            List of parameter names in order
+        """
+        param_names = self._get_free_param_names()
+        
+        # Create a function with explicit parameter names
+        # iminuit uses introspection, so we need to define parameters explicitly
+        def cost_function(*args, **kwargs):
+            # Build param dict from args and kwargs
+            param_dict = {}
+            
+            # Handle positional arguments
+            for i, val in enumerate(args):
+                if i < len(param_names):
+                    param_dict[param_names[i]] = val
+            
+            # Handle keyword arguments
+            param_dict.update(kwargs)
+            
+            # Return negative log-likelihood (for minimization)
+            log_L = self.log_likelihood(param_dict)
+            return -log_L
+        
+        # Set the function signature for iminuit introspection
+        # This is a workaround since we can't dynamically create function signatures
+        cost_function._parameters = {name: None for name in param_names}
+        
+        return cost_function, param_names
+    
+    def _get_initial_values(self, start_params: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+        """
+        Get initial parameter values for minimization.
+        
+        Parameters
+        ----------
+        start_params : dict, optional
+            User-provided starting values
+        
+        Returns
+        -------
+        init_vals : dict
+            Initial values for all free parameters
+        """
+        param_names = self._get_free_param_names()
+        init_vals = {}
+        
+        for name in param_names:
+            if start_params and name in start_params:
+                init_vals[name] = start_params[name]
+            elif name in FIDUCIAL_CSMF_PARAMS:
+                init_vals[name] = FIDUCIAL_CSMF_PARAMS[name]
+            else:
+                # Use center of prior range for uniform, mean for Gaussian
+                prior = self.priors[name]
+                if prior.prior_type == 'uniform':
+                    init_vals[name] = 0.5 * (prior.bounds[0] + prior.bounds[1])
+                elif prior.prior_type == 'gaussian':
+                    init_vals[name] = prior.mean
+        
+        return init_vals
+    
+    def _get_parameter_limits(self) -> Dict[str, Tuple[Optional[float], Optional[float]]]:
+        """
+        Get parameter limits for iminuit.
+        
+        Returns
+        -------
+        limits : dict
+            Dictionary mapping param names to (min, max) tuples
+        """
+        param_names = self._get_free_param_names()
+        limits = {}
+        
+        for name in param_names:
+            prior = self.priors[name]
+            if prior.prior_type == 'uniform':
+                limits[name] = prior.bounds
+            elif prior.prior_type == 'gaussian':
+                # For Gaussian priors, use ±5 sigma as soft bounds
+                limits[name] = (prior.mean - 5*prior.std, prior.mean + 5*prior.std)
+            else:
+                limits[name] = (None, None)
+        
+        return limits
+    
+    def _get_parameter_errors(self) -> Dict[str, float]:
+        """
+        Get initial step sizes for iminuit.
+        
+        Returns
+        -------
+        errors : dict
+            Initial step sizes for each parameter
+        """
+        param_names = self._get_free_param_names()
+        errors = {}
+        
+        for name in param_names:
+            prior = self.priors[name]
+            if prior.prior_type == 'uniform':
+                # Use 1% of range as initial step
+                errors[name] = 0.01 * (prior.bounds[1] - prior.bounds[0])
+            elif prior.prior_type == 'gaussian':
+                # Use 10% of sigma as initial step
+                errors[name] = 0.1 * prior.std
+            else:
+                errors[name] = 0.1
+        
+        return errors
+    
+    def minimize(
+        self,
+        start_params: Optional[Dict[str, float]] = None,
+        run_hesse: bool = True,
+        run_minos: bool = False,
+        minos_params: Optional[List[str]] = None,
+        print_level: int = 1,
+        **minuit_kwargs
+    ) -> MinuitResult:
+        """
+        Find best-fit parameters using iminuit minimization.
+        
+        This method uses MIGRAD for minimization, optionally followed by
+        HESSE for error estimation and MINOS for asymmetric errors.
+        
+        Parameters
+        ----------
+        start_params : dict, optional
+            Starting parameter values. If not provided, uses fiducial values
+            or center of prior ranges.
+        run_hesse : bool
+            Run HESSE after MIGRAD for error estimation. Default: True
+        run_minos : bool
+            Run MINOS for asymmetric errors. Default: False (slower)
+        minos_params : list, optional
+            Parameters for which to run MINOS. If None, runs for all params.
+        print_level : int
+            Minuit print level (0=quiet, 1=normal, 2=verbose). Default: 1
+        **minuit_kwargs
+            Additional arguments passed to Minuit
+        
+        Returns
+        -------
+        result : MinuitResult
+            Container with best-fit values, errors, covariance, etc.
+        
+        Examples
+        --------
+        >>> # Basic usage
+        >>> result = fitter.minimize()
+        >>> result.print_summary()
+        
+        >>> # With custom starting point
+        >>> result = fitter.minimize(start_params={'M0': 10.0, 'M1': 12.5})
+        
+        >>> # With MINOS errors for specific parameters
+        >>> result = fitter.minimize(run_minos=True, minos_params=['M0', 'M1'])
+        """
+        if not HAS_IMINUIT:
+            raise ImportError("iminuit is required. Install with: pip install iminuit")
+        
+        if not self.mass_bins:
+            raise ValueError("No data loaded. Call load_data() first.")
+        
+        if not self.priors:
+            print("No priors set. Using defaults.")
+            self.set_priors()
+        
+        # Initialize halo model if needed
+        if self._halo_model is None:
+            self._initialize_halo_model()
+        
+        # Get parameter configuration
+        param_names = self._get_free_param_names()
+        init_vals = self._get_initial_values(start_params)
+        limits = self._get_parameter_limits()
+        init_errors = self._get_parameter_errors()
+        
+        if self.verbose:
+            print(f"\n{'='*70}")
+            print("MINUIT MINIMIZATION")
+            print(f"{'='*70}")
+            print(f"Free parameters ({len(param_names)}): {param_names}")
+            print(f"Fixed parameters: {list(self.fixed_params.keys())}")
+            print(f"\nInitial values:")
+            for name in param_names:
+                print(f"  {name}: {init_vals[name]:.4f}")
+        
+        # Create cost function that iminuit can use
+        # iminuit passes positional arguments, so we need to map them to param names
+        def cost_func(*args):
+            # Map positional arguments to parameter dictionary
+            param_dict = {name: val for name, val in zip(param_names, args)}
+            return -self.log_likelihood(param_dict)
+        
+        # Create Minuit object with positional function
+        m = Minuit(cost_func, *[init_vals[name] for name in param_names], name=param_names)
+        
+        # Set limits
+        for name, (lo, hi) in limits.items():
+            m.limits[name] = (lo, hi)
+        
+        # Set initial step sizes
+        for name, err in init_errors.items():
+            m.errors[name] = err
+        
+        # Set print level
+        m.print_level = print_level
+        
+        # Run MIGRAD
+        if self.verbose:
+            print("\nRunning MIGRAD...")
+        
+        m.migrad()
+        
+        if not m.valid:
+            warnings.warn("MIGRAD did not converge!")
+        
+        # Run HESSE for error estimation
+        if run_hesse:
+            if self.verbose:
+                print("Running HESSE...")
+            m.hesse()
+        
+        # Run MINOS for asymmetric errors
+        minos_errors = None
+        if run_minos:
+            if self.verbose:
+                print("Running MINOS...")
+            
+            if minos_params is None:
+                m.minos()
+            else:
+                for param in minos_params:
+                    if param in param_names:
+                        m.minos(param)
+            
+            # Extract MINOS errors
+            minos_errors = {}
+            for name in param_names:
+                if name in m.merrors:
+                    merr = m.merrors[name]
+                    minos_errors[name] = (merr.lower, merr.upper)
+        
+        # Build results
+        # m.values and m.errors are iminuit objects, need to extract properly
+        best_fit = {name: m.values[name] for name in param_names}
+        best_fit.update(self.fixed_params)
+        
+        errors = {name: m.errors[name] for name in param_names}
+        
+        # Get covariance and correlation matrices
+        if m.covariance is not None:
+            covariance = np.array(m.covariance)
+            correlation = np.array(m.covariance.correlation())
+        else:
+            n_free = len(param_names)
+            covariance = np.zeros((n_free, n_free))
+            correlation = np.eye(n_free)
+        
+        # Calculate chi2 and ndof
+        chi2 = 2 * m.fval  # fval is -log_likelihood, so chi2 = -2*log_L = 2*fval
+        n_free_params = len(param_names)
+        ndof = self._n_data_points - n_free_params
+        reduced_chi2 = chi2 / ndof if ndof > 0 else np.inf
+        
+        # Create result object
+        self.minuit_result = MinuitResult(
+            best_fit=best_fit,
+            errors=errors,
+            minos_errors=minos_errors,
+            covariance=covariance,
+            correlation=correlation,
+            chi2=chi2,
+            ndof=ndof,
+            reduced_chi2=reduced_chi2,
+            fval=m.fval,
+            is_valid=m.valid,
+            has_accurate_covar=m.accurate,
+            param_names=param_names,
+            minuit=m
+        )
+        
+        if self.verbose:
+            self.minuit_result.print_summary()
+        
+        return self.minuit_result
+    
+    def minimize_de(
+        self,
+        strategy: str = 'best1bin',
+        maxiter: int = 1000,
+        popsize: int = 15,
+        tol: float = 0.01,
+        mutation: Tuple[float, float] = (0.5, 1.0),
+        recombination: float = 0.7,
+        seed: Optional[int] = None,
+        workers: int = 1,
+        polish: bool = True,
+        compute_errors: bool = True,
+        disp: bool = False,
+        callback: Optional[Callable] = None,
+        **de_kwargs
+    ) -> DifferentialEvolutionResult:
+        """
+        Find best-fit parameters using scipy differential evolution.
+        
+        This is a robust global optimizer that works well even when the
+        likelihood surface has multiple local minima or returns -inf for
+        some parameter combinations.
+        
+        Parameters
+        ----------
+        strategy : str
+            Differential evolution strategy. Default: 'best1bin'
+            Options: 'best1bin', 'best1exp', 'rand1exp', 'randtobest1exp',
+                     'currenttobest1bin', 'currenttobest1exp', 'rand1bin',
+                     'rand2bin', 'rand2exp', 'best2bin', 'best2exp'
+        maxiter : int
+            Maximum number of generations. Default: 1000
+        popsize : int
+            Population size multiplier. Total population is popsize * n_params.
+            Default: 15
+        tol : float
+            Relative tolerance for convergence. Default: 0.01
+        mutation : tuple
+            Mutation constant (dithering range). Default: (0.5, 1.0)
+        recombination : float
+            Recombination constant (crossover probability). Default: 0.7
+        seed : int, optional
+            Random seed for reproducibility
+        workers : int
+            Number of parallel workers. -1 uses all CPUs. Default: 1
+        polish : bool
+            Use L-BFGS-B to polish the best result. Default: True
+        compute_errors : bool
+            Estimate parameter errors via finite differences at minimum.
+            Default: True
+        disp : bool
+            Print convergence messages. Default: False
+        callback : callable, optional
+            Function called after each iteration: callback(xk, convergence)
+        **de_kwargs
+            Additional arguments passed to differential_evolution
+        
+        Returns
+        -------
+        result : DifferentialEvolutionResult
+            Container with best-fit values, chi2, errors (if computed), etc.
+        
+        Examples
+        --------
+        >>> # Basic usage - robust global optimization
+        >>> result = fitter.minimize_de()
+        >>> result.print_summary()
+        
+        >>> # Faster but less thorough search
+        >>> result = fitter.minimize_de(maxiter=500, popsize=10, polish=False)
+        
+        >>> # Parallel execution
+        >>> result = fitter.minimize_de(workers=-1)  # Use all CPUs
+        
+        >>> # With custom callback to monitor progress
+        >>> def my_callback(xk, convergence):
+        ...     print(f"Convergence: {convergence:.4f}")
+        >>> result = fitter.minimize_de(callback=my_callback)
+        """
+        if not self.mass_bins:
+            raise ValueError("No data loaded. Call load_data() first.")
+        
+        if not self.priors:
+            print("No priors set. Using defaults.")
+            self.set_priors()
+        
+        # Initialize halo model if needed
+        if self._halo_model is None:
+            self._initialize_halo_model()
+        
+        # Get parameter configuration
+        param_names = self._get_free_param_names()
+        bounds = self._get_de_bounds()
+        
+        if self.verbose:
+            print(f"\n{'='*70}")
+            print("DIFFERENTIAL EVOLUTION MINIMIZATION")
+            print(f"{'='*70}")
+            print(f"Free parameters ({len(param_names)}): {param_names}")
+            print(f"Fixed parameters: {list(self.fixed_params.keys())}")
+            print(f"\nBounds:")
+            for name in param_names:
+                lo, hi = bounds[name]
+                print(f"  {name}: [{lo:.4f}, {hi:.4f}]")
+            print(f"\nSettings:")
+            print(f"  strategy: {strategy}")
+            print(f"  maxiter: {maxiter}")
+            print(f"  popsize: {popsize} (total pop: {popsize * len(param_names)})")
+            print(f"  tol: {tol}")
+            print(f"  workers: {workers}")
+            print(f"  polish: {polish}")
+        
+        # Create cost function that returns chi2 (handles -inf gracefully)
+        def cost_func(x):
+            param_dict = {name: val for name, val in zip(param_names, x)}
+            log_L = self.log_likelihood(param_dict)
+            
+            # Handle -inf by returning a large but finite value
+            if not np.isfinite(log_L):
+                return 1e100
+            
+            # Return chi2 = -2 * log_L
+            return -2.0 * log_L
+        
+        # Build bounds list in parameter order
+        bounds_list = [bounds[name] for name in param_names]
+        
+        # Run differential evolution
+        if self.verbose:
+            print("\nRunning differential evolution...")
+        
+        result = differential_evolution(
+            cost_func,
+            bounds=bounds_list,
+            strategy=strategy,
+            maxiter=maxiter,
+            popsize=popsize,
+            tol=tol,
+            mutation=mutation,
+            recombination=recombination,
+            seed=seed,
+            workers=workers,
+            polish=polish,
+            disp=disp,
+            callback=callback,
+            **de_kwargs
+        )
+        
+        # Build best-fit dictionary
+        best_fit = {name: val for name, val in zip(param_names, result.x)}
+        best_fit.update(self.fixed_params)
+        
+        # Calculate chi2 and ndof
+        chi2 = result.fun
+        n_free_params = len(param_names)
+        ndof = self._n_data_points - n_free_params
+        reduced_chi2 = chi2 / ndof if ndof > 0 else np.inf
+        
+        # Compute errors via finite differences if requested
+        errors = None
+        covariance = None
+        
+        if compute_errors and result.success:
+            if self.verbose:
+                print("Computing parameter errors via Hessian...")
+            
+            try:
+                errors, covariance = self._compute_errors_finite_diff(
+                    cost_func, result.x, param_names
+                )
+            except Exception as e:
+                if self.verbose:
+                    print(f"Warning: Could not compute errors: {e}")
+        
+        # Create result object
+        self.de_result = DifferentialEvolutionResult(
+            best_fit=best_fit,
+            chi2=chi2,
+            ndof=ndof,
+            reduced_chi2=reduced_chi2,
+            success=result.success,
+            message=result.message,
+            n_iterations=result.nit,
+            n_function_evals=result.nfev,
+            param_names=param_names,
+            scipy_result=result,
+            errors=errors,
+            covariance=covariance
+        )
+        
+        if self.verbose:
+            self.de_result.print_summary()
+        
+        return self.de_result
+    
+    def _get_de_bounds(self) -> Dict[str, Tuple[float, float]]:
+        """
+        Get parameter bounds for differential evolution.
+        
+        For Gaussian priors, uses ±5 sigma as bounds.
+        
+        Returns
+        -------
+        bounds : dict
+            Dictionary mapping param names to (min, max) tuples
+        """
+        param_names = self._get_free_param_names()
+        bounds = {}
+        
+        for name in param_names:
+            prior = self.priors[name]
+            if prior.prior_type == 'uniform':
+                bounds[name] = prior.bounds
+            elif prior.prior_type == 'gaussian':
+                # Use ±5 sigma as bounds for Gaussian priors
+                bounds[name] = (prior.mean - 5*prior.std, prior.mean + 5*prior.std)
+            else:
+                # Fallback to wide bounds
+                bounds[name] = (-100, 100)
+        
+        return bounds
+    
+    def _compute_errors_finite_diff(
+        self,
+        cost_func: Callable,
+        x_best: np.ndarray,
+        param_names: List[str],
+        eps: float = 1e-4
+    ) -> Tuple[Dict[str, float], np.ndarray]:
+        """
+        Compute parameter errors via finite difference Hessian.
+        
+        Parameters
+        ----------
+        cost_func : callable
+            Cost function (returns chi2)
+        x_best : array
+            Best-fit parameter values
+        param_names : list
+            Parameter names
+        eps : float
+            Step size for finite differences
+        
+        Returns
+        -------
+        errors : dict
+            Parameter errors (sqrt of diagonal of covariance)
+        covariance : ndarray
+            Covariance matrix
+        """
+        n_params = len(x_best)
+        hessian = np.zeros((n_params, n_params))
+        
+        f0 = cost_func(x_best)
+        
+        # Compute Hessian via finite differences
+        for i in range(n_params):
+            for j in range(i, n_params):
+                x_pp = x_best.copy()
+                x_pm = x_best.copy()
+                x_mp = x_best.copy()
+                x_mm = x_best.copy()
+                
+                # Scale step size by parameter value
+                hi = eps * max(abs(x_best[i]), 1.0)
+                hj = eps * max(abs(x_best[j]), 1.0)
+                
+                x_pp[i] += hi
+                x_pp[j] += hj
+                x_pm[i] += hi
+                x_pm[j] -= hj
+                x_mp[i] -= hi
+                x_mp[j] += hj
+                x_mm[i] -= hi
+                x_mm[j] -= hj
+                
+                f_pp = cost_func(x_pp)
+                f_pm = cost_func(x_pm)
+                f_mp = cost_func(x_mp)
+                f_mm = cost_func(x_mm)
+                
+                # Second derivative
+                hessian[i, j] = (f_pp - f_pm - f_mp + f_mm) / (4 * hi * hj)
+                hessian[j, i] = hessian[i, j]
+        
+        # Covariance is inverse of Hessian (for chi2, Hessian = 2 * Fisher)
+        # For chi2 minimization: cov = 2 * H^{-1}
+        try:
+            covariance = 2.0 * np.linalg.inv(hessian)
+            
+            # Ensure positive diagonal (errors)
+            diag = np.diag(covariance)
+            if np.any(diag < 0):
+                warnings.warn("Some covariance diagonal elements are negative. "
+                              "Errors may be unreliable.")
+                diag = np.abs(diag)
+            
+            errors = {name: np.sqrt(diag[i]) for i, name in enumerate(param_names)}
+            
+        except np.linalg.LinAlgError:
+            warnings.warn("Could not invert Hessian. Returning no errors.")
+            errors = None
+            covariance = None
+        
+        return errors, covariance
+
+    def profile_likelihood(
+        self,
+        param_name: str,
+        param_range: Optional[Tuple[float, float]] = None,
+        n_points: int = 50,
+        subtract_minimum: bool = True
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute profile likelihood for a single parameter.
+        
+        Parameters
+        ----------
+        param_name : str
+            Parameter to profile
+        param_range : tuple, optional
+            (min, max) range for the parameter. If None, uses ±3 sigma from best-fit.
+        n_points : int
+            Number of points in the profile. Default: 50
+        subtract_minimum : bool
+            If True, return Δχ² = χ² - χ²_min. Default: True
+        
+        Returns
+        -------
+        param_values : np.ndarray
+            Parameter values
+        delta_chi2 : np.ndarray
+            Δχ² values (or χ² if subtract_minimum=False)
+        """
+        if not HAS_IMINUIT:
+            raise ImportError("iminuit is required")
+        
+        if self.minuit_result is None:
+            print("Running minimization first...")
+            self.minimize()
+        
+        m = self.minuit_result.minuit
+        
+        # Determine range
+        if param_range is None:
+            best_val = self.minuit_result.best_fit[param_name]
+            err = self.minuit_result.errors.get(param_name, 0.1 * abs(best_val))
+            param_range = (best_val - 3*err, best_val + 3*err)
+        
+        # Compute profile
+        param_values = np.linspace(param_range[0], param_range[1], n_points)
+        chi2_values = []
+        
+        for val in param_values:
+            # Fix the parameter and minimize others
+            m.values[param_name] = val
+            m.fixed[param_name] = True
+            m.migrad()
+            chi2_values.append(2 * m.fval)
+            m.fixed[param_name] = False
+        
+        # Restore best-fit
+        for name, val in self.minuit_result.best_fit.items():
+            if name in m.parameters:
+                m.values[name] = val
+        
+        chi2_values = np.array(chi2_values)
+        
+        if subtract_minimum:
+            chi2_values -= chi2_values.min()
+        
+        return param_values, chi2_values
+    
+    # ========================================================================
+    # Nautilus Sampling Methods (unchanged)
+    # ========================================================================
     
     def run(
         self,
@@ -1029,36 +1598,10 @@ class CSMFFitter:
         pool: Optional[Any] = None,
         **nautilus_kwargs
     ) -> Dict:
-        """
-        Run the Nautilus sampler.
+        """Run the Nautilus sampler."""
+        if not HAS_NAUTILUS:
+            raise ImportError("nautilus-sampler is required")
         
-        Parameters
-        ----------
-        n_live : int
-            Number of live points. Default: 2000
-        n_eff : int
-            Target effective sample size. Default: 10000
-        discard_exploration : bool
-            Whether to discard exploration phase. Default: True
-        filepath : str, optional
-            Path to save checkpoint file
-        seed : int, optional
-            Random seed for reproducibility
-        pool : optional
-            Pool for parallelization (int for multiprocessing, or pool object)
-        **nautilus_kwargs
-            Additional arguments passed to Sampler
-        
-        Returns
-        -------
-        results : dict
-            Dictionary containing:
-            - 'points': posterior samples
-            - 'log_w': log weights
-            - 'log_l': log likelihoods
-            - 'log_z': log evidence
-            - 'param_names': parameter names
-        """
         if not self.mass_bins:
             raise ValueError("No data loaded. Call load_data() first.")
         
@@ -1066,24 +1609,14 @@ class CSMFFitter:
             print("No priors set. Using defaults.")
             self.set_priors()
         
-        # Initialize unified halo model
         self._initialize_halo_model()
         
-        # Build nautilus prior
         nautilus_prior = self._build_nautilus_prior()
         
         if self.verbose:
             print(f"\nFree parameters: {list(nautilus_prior.keys)}")
             print(f"Fixed parameters: {self.fixed_params}")
-            print(f"Number of mass bins: {len(self.mass_bins)}")
-            print(f"Observables: {self.observables}")
-            print(f"\n{'='*70}")
-            print("USING MULTI-REDSHIFT CSMF FUNCTIONALITY")
-            print(f"Single unified model with {len(self._halo_model.z_array)} redshift(s)")
-            print(f"Each redshift corresponds to a stellar mass bin")
-            print(f"{'='*70}\n")
         
-        # Create sampler
         self.sampler = Sampler(
             nautilus_prior,
             self.log_likelihood,
@@ -1094,7 +1627,6 @@ class CSMFFitter:
             **nautilus_kwargs
         )
         
-        # Run sampler
         if self.verbose:
             print("\nStarting Nautilus sampler...")
         
@@ -1104,7 +1636,6 @@ class CSMFFitter:
             verbose=self.verbose
         )
         
-        # Extract results
         points, log_w, log_l = self.sampler.posterior()
         
         self.results = {
@@ -1119,45 +1650,34 @@ class CSMFFitter:
         if self.verbose:
             print(f"\nSampling complete!")
             print(f"log(Z) = {self.sampler.log_z:.2f}")
-            print(f"Effective sample size: {len(points)}")
         
         return self.results
     
     def get_best_fit(self) -> Dict[str, float]:
-        """
-        Get best-fit (maximum likelihood) parameters.
+        """Get best-fit parameters (from sampling or minimization)."""
+        # Prefer DE result if available (most robust)
+        if self.de_result is not None:
+            return self.de_result.best_fit.copy()
         
-        Returns
-        -------
-        best_fit : dict
-            Best-fit parameter values
-        """
+        # Then minuit result
+        if self.minuit_result is not None:
+            return self.minuit_result.best_fit.copy()
+        
+        # Finally sampling result
         if self.results is None:
-            raise ValueError("No results available. Run the sampler first.")
+            raise ValueError("No results available. Run minimize_de(), minimize(), or run() first.")
         
-        # Find maximum likelihood point
         idx_best = np.argmax(self.results['log_l'])
         best_point = self.results['points'][idx_best]
-        
-        # Build dictionary
         best_fit = dict(zip(self.results['param_names'], best_point))
-        
-        # Add fixed parameters
         best_fit.update(self.results['fixed_params'])
         
         return best_fit
     
     def get_posterior_summary(self) -> Dict[str, Dict[str, float]]:
-        """
-        Get posterior summary statistics.
-        
-        Returns
-        -------
-        summary : dict
-            For each parameter: median, mean, std, 16th, 84th percentiles
-        """
+        """Get posterior summary statistics from sampling."""
         if self.results is None:
-            raise ValueError("No results available. Run the sampler first.")
+            raise ValueError("No sampling results available. Run run() first.")
         
         points = self.results['points']
         weights = np.exp(self.results['log_w'])
@@ -1168,12 +1688,10 @@ class CSMFFitter:
         for i, name in enumerate(self.results['param_names']):
             values = points[:, i]
             
-            # Weighted statistics
             mean = np.average(values, weights=weights)
             var = np.average((values - mean)**2, weights=weights)
             std = np.sqrt(var)
             
-            # Weighted percentiles
             sorted_idx = np.argsort(values)
             sorted_values = values[sorted_idx]
             sorted_weights = weights[sorted_idx]
@@ -1196,29 +1714,56 @@ class CSMFFitter:
         return summary
     
     def save_results(self, filepath: str):
-        """
-        Save results to npz file.
+        """Save results to npz file."""
+        save_dict = {}
         
-        Parameters
-        ----------
-        filepath : str
-            Output file path
-        """
-        if self.results is None:
-            raise ValueError("No results available. Run the sampler first.")
+        # Save sampling results if available
+        if self.results is not None:
+            save_dict.update({
+                'points': self.results['points'],
+                'log_w': self.results['log_w'],
+                'log_l': self.results['log_l'],
+                'log_z': self.results['log_z'],
+                'param_names': np.array(self.results['param_names'], dtype=str),
+            })
+            for name, value in self.results['fixed_params'].items():
+                save_dict[f'fixed_{name}'] = value
         
-        # Convert param_names to array-friendly format
-        save_dict = {
-            'points': self.results['points'],
-            'log_w': self.results['log_w'],
-            'log_l': self.results['log_l'],
-            'log_z': self.results['log_z'],
-            'param_names': np.array(self.results['param_names'], dtype=str),
-        }
+        # Save minuit results if available
+        if self.minuit_result is not None:
+            save_dict['minuit_best_fit'] = np.array([
+                self.minuit_result.best_fit[name] 
+                for name in self.minuit_result.param_names
+            ])
+            save_dict['minuit_errors'] = np.array([
+                self.minuit_result.errors[name] 
+                for name in self.minuit_result.param_names
+            ])
+            save_dict['minuit_covariance'] = self.minuit_result.covariance
+            save_dict['minuit_chi2'] = self.minuit_result.chi2
+            save_dict['minuit_ndof'] = self.minuit_result.ndof
+            save_dict['minuit_param_names'] = np.array(self.minuit_result.param_names, dtype=str)
         
-        # Add fixed params
-        for name, value in self.results['fixed_params'].items():
-            save_dict[f'fixed_{name}'] = value
+        # Save differential evolution results if available
+        if self.de_result is not None:
+            save_dict['de_best_fit'] = np.array([
+                self.de_result.best_fit[name] 
+                for name in self.de_result.param_names
+            ])
+            save_dict['de_chi2'] = self.de_result.chi2
+            save_dict['de_ndof'] = self.de_result.ndof
+            save_dict['de_param_names'] = np.array(self.de_result.param_names, dtype=str)
+            save_dict['de_success'] = self.de_result.success
+            save_dict['de_n_iterations'] = self.de_result.n_iterations
+            save_dict['de_n_function_evals'] = self.de_result.n_function_evals
+            
+            if self.de_result.errors is not None:
+                save_dict['de_errors'] = np.array([
+                    self.de_result.errors[name] 
+                    for name in self.de_result.param_names
+                ])
+            if self.de_result.covariance is not None:
+                save_dict['de_covariance'] = self.de_result.covariance
         
         np.savez(filepath, **save_dict)
         
@@ -1235,29 +1780,7 @@ def create_fitter_from_config(
     data_dir: str,
     mass_bins: Optional[List[int]] = None
 ) -> CSMFFitter:
-    """
-    Create a CSMFFitter from a configuration dictionary.
-    
-    Parameters
-    ----------
-    config_dict : dict
-        Configuration with keys:
-        - 'cosmo_params': cosmology parameters (optional)
-        - 'observables': list of observables to fit
-        - 'rp_min', 'rp_max': scale cuts for DeltaSigma
-        - 'rp_min_wgg', 'rp_max_wgg': scale cuts for WGG (optional)
-        - 'fixed_params': dict of fixed parameters
-        - 'priors': dict of prior configurations
-    data_dir : str
-        Directory containing data files
-    mass_bins : list, optional
-        Mass bins to load
-    
-    Returns
-    -------
-    fitter : CSMFFitter
-        Configured fitter object
-    """
+    """Create a CSMFFitter from a configuration dictionary."""
     fitter = CSMFFitter(
         cosmo_params=config_dict.get('cosmo_params'),
         observables=config_dict.get('observables', ['DeltaSigma']),
@@ -1270,7 +1793,6 @@ def create_fitter_from_config(
     
     fitter.load_data(data_dir, mass_bins)
     
-    # Set up priors
     priors = {}
     if 'priors' in config_dict:
         for name, prior_config in config_dict['priors'].items():
@@ -1289,56 +1811,64 @@ def create_fitter_from_config(
 # ============================================================================
 
 if __name__ == "__main__":
-    print("CSMF Fitter Module (Updated for new halo model API)")
+    print("CSMF Fitter Module with iminuit Minimization")
     print("=" * 70)
     print()
-    print("This version uses the multi-redshift CSMF halo model functionality!")
-    print()
-    print("Key features:")
-    print("  - Support for different rp bins for WGG and DeltaSigma")
-    print("  - Separate scale cuts for WGG (rp_min_wgg, rp_max_wgg)")
-    print("  - Single unified halo model for all mass bins")
+    print("This version supports both:")
+    print("  - Nautilus nested sampling (full posterior)")
+    print("  - iminuit minimization (fast best-fit)")
     print()
     print("Example usage:")
     print("""
-    from sampler_updated import CSMFFitter, ParameterPrior
+    from csmf_fitter_with_minuit import CSMFFitter
     
-    # Create fitter with potentially different scale cuts for WGG
+    # Create fitter
     fitter = CSMFFitter(
-        observables=['DeltaSigma', 'WGG'],
-        rp_min=0.1,      # Mpc/h for DeltaSigma
-        rp_max=30.0,     # Mpc/h for DeltaSigma
-        rp_min_wgg=0.5,  # Optional: different min for WGG
-        rp_max_wgg=50.0, # Optional: different max for WGG
+        observables=['DeltaSigma'],
+        rp_min=0.1,
+        rp_max=30.0,
     )
     
-    # Load data for all 8 mass bins
-    fitter.load_data('/path/to/data/', mass_bins=[0, 1, 2, 3, 4, 5, 6, 7])
+    # Load data
+    fitter.load_data('/path/to/data/', mass_bins=[0, 1, 2, 3])
     
-    # Set priors with some fixed parameters
+    # Set priors
     fitter.set_priors(
-        fixed_params={
-            'f_c': 1.0,  # Fix central concentration
-            'f_s': 1.0,  # Fix satellite concentration
-        }
+        fixed_params={'f_c': 1.0, 'f_s': 1.0}
     )
     
-    # Run sampler
-    results = fitter.run(
-        n_live=2000,
-        n_eff=10000,
-        filepath='csmf_chain.hdf5',
-        pool=4,  # Use 4 CPU cores
+    # Option 1: Robust global optimization with differential evolution
+    # (Recommended - handles -inf likelihood gracefully)
+    result = fitter.minimize_de(
+        maxiter=1000,
+        popsize=15,
+        workers=-1,  # Use all CPUs
+    )
+    result.print_summary()
+    
+    # Access results
+    print(f"Best-fit M0: {result.best_fit['M0']:.3f}")
+    print(f"Chi2/ndof: {result.reduced_chi2:.2f}")
+    
+    # Option 2: Fast local minimization with iminuit
+    # (Use after DE to refine, or if you have a good starting point)
+    result_minuit = fitter.minimize(
+        start_params=fitter.de_result.best_fit,  # Start from DE result
+        run_hesse=True,
     )
     
-    # Get results
-    best_fit = fitter.get_best_fit()
+    # Option 3: Full posterior with Nautilus
+    results = fitter.run(n_live=1000, n_eff=5000)
     summary = fitter.get_posterior_summary()
     
-    # Print summary
-    for param, stats in summary.items():
-        print(f"{param}: {stats['median']:.3f} +{stats['err_high']:.3f} -{stats['err_low']:.3f}")
+    # Compare best-fits
+    print("\\nDE best-fit:", fitter.de_result.best_fit)
+    print("Minuit best-fit:", fitter.minuit_result.best_fit)
+    print("Nautilus MAP:", fitter.get_best_fit())
     
-    # Save results
+    # Profile likelihood
+    param_vals, delta_chi2 = fitter.profile_likelihood('M0')
+    
+    # Save everything
     fitter.save_results('csmf_results.npz')
     """)

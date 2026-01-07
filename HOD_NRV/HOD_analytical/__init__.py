@@ -56,44 +56,38 @@ making it suitable for MCMC sampling and parameter inference.
 
 from .halo_model import (
     # Main classes
-    MultiRedshiftHaloModel,
+    HaloModel,
     StandardHOD,
     CSMF_HOD,
-    HODType,
 
     # Factory and convenience functions
     create_hod,
-
+    HOD_PARAM_DEFINITIONS,
     # Parameter definitions
-    STANDARD_HOD_PARAMS,
     CSMF_HOD_PARAMS,
 
     # Validation
     validate_hod_params,
 
     # Documentation
-    UNIT_CONVERSION_INFO,
 )
 
 __all__ = [
     # Main classes
-    'MultiRedshiftHaloModel',
+    'HaloModel',
     'StandardHOD',
     'CSMF_HOD',
-    'HODType',
 
     # Factory and convenience functions
     'create_hod',
 
     # Parameter definitions
-    'STANDARD_HOD_PARAMS',
     'CSMF_HOD_PARAMS',
-
+    'HOD_PARAM_DEFINITIONS'
     # Validation
     'validate_hod_params',
 
     # Documentation
-    'UNIT_CONVERSION_INFO',
 ]
 
 __version__ = '0.1.0'
