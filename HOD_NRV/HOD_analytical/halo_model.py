@@ -641,24 +641,6 @@ def _compute_Pgm(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
     return P_1h + Pk_lin * I_g * (I_m1 + I_m2)
 
 
-@jit
-def _compute_Pmm(n_M, b_h, R_s, c, Pk_lin, k, M, rho_m, log10M_min, log10M_max):
-    u_m = nfw_fourier_u(k, R_s, c, 1.0)
-    W_m = M / rho_m
-    
-    # 1-halo
-    integrand_1h = (u_m ** 2) * (W_m ** 2) * n_M
-    P_1h = vmap(lambda x: gl_integrate(x, log10M_min, log10M_max))(integrand_1h)
-    
-    # 2-halo
-    I_m1 = 1.0 - gl_integrate(W_m * b_h * n_M, log10M_min, log10M_max)
-    integrand_2h = u_m * W_m * b_h * n_M
-    I_m2 = vmap(lambda x: gl_integrate(x, log10M_min, log10M_max))(integrand_2h)
-    P_2h = Pk_lin * (I_m1 + I_m2) ** 2
-    
-    return P_1h + P_2h
-
-
 # ============================================================================
 # β^NL Correction Functions
 # ============================================================================
@@ -710,21 +692,6 @@ def _compute_I_NL_gm(beta_nl_gl, beta_nl_Mmin_col, H_g, H_m, b_h, n_M,
     return I_21 + I_22
 
 
-@jit
-def _compute_I_NL_mm(beta_nl_gl, beta_nl_Mmin_row, beta_nl_Mmin_col, beta_nl_Mmin_Mmin,
-                      H_m, b_h, n_M, u_m_Mmin, A_Mmin, log10M_min, log10M_max):
-    """I^NL for matter-matter (all four terms: I^11 + I^12 + I^21 + I^22)."""
-    I_22 = _compute_I_NL_22(beta_nl_gl, H_m, H_m, b_h, n_M, log10M_min, log10M_max)
-    I_11 = (A_Mmin ** 2) * (u_m_Mmin ** 2) * beta_nl_Mmin_Mmin
-    
-    integral_12 = _compute_I_NL_12(beta_nl_Mmin_row, H_m, b_h, n_M, log10M_min, log10M_max)
-    I_12 = A_Mmin * u_m_Mmin * integral_12
-    
-    integral_21 = _compute_I_NL_21(beta_nl_Mmin_col, H_m, b_h, n_M, log10M_min, log10M_max)
-    I_21 = A_Mmin * u_m_Mmin * integral_21
-    
-    return I_11 + I_12 + I_21 + I_22
-
 
 # ============================================================================
 # Power Spectrum with β^NL
@@ -768,34 +735,6 @@ def _compute_Pgm_with_beta_nl(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
     return P_gm + Pk_lin * I_NL
 
 
-@jit
-def _compute_Pmm_with_beta_nl(n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
-                               log10M_min, log10M_max,
-                               beta_nl_gl, beta_nl_Mmin_row,
-                               beta_nl_Mmin_col, beta_nl_Mmin_Mmin,
-                               R_s_Mmin, c_Mmin):
-    u_m = nfw_fourier_u(k, R_s, c, 1.0)
-    W_m = M / rho_m
-    H_m = u_m * W_m[None, :]
-    
-    # 1-halo
-    integrand_1h = (u_m ** 2) * (W_m ** 2)[None, :] * n_M[None, :]
-    P_1h = vmap(lambda x: gl_integrate(x, log10M_min, log10M_max))(integrand_1h)
-    
-    # 2-halo standard
-    A_Mmin = 1.0 - gl_integrate(W_m * b_h * n_M, log10M_min, log10M_max)
-    integrand_2h = u_m * W_m[None, :] * b_h[None, :] * n_M[None, :]
-    I_m = vmap(lambda x: gl_integrate(x, log10M_min, log10M_max))(integrand_2h)
-    P_2h = Pk_lin * (A_Mmin + I_m) ** 2
-    
-    # β^NL correction
-    u_m_Mmin = nfw_fourier_u_single(k, R_s_Mmin, c_Mmin)
-    I_NL = _compute_I_NL_mm(beta_nl_gl, beta_nl_Mmin_row, beta_nl_Mmin_col,
-                            beta_nl_Mmin_Mmin, H_m, b_h, n_M,
-                            u_m_Mmin, A_Mmin, log10M_min, log10M_max)
-    
-    return P_1h + P_2h + Pk_lin * I_NL
-
 
 # ============================================================================
 # HaloModel Class
@@ -814,13 +753,15 @@ class HaloModel(Cosmology):
         cosmo_params: Dict[str, float],
         z: Union[float, np.ndarray, List[float]],
         hod_type: str,
-        Mstar_min: Optional[Union[float, np.ndarray]] = None,
-        Mstar_max: Optional[Union[float, np.ndarray]] = None,
         f_c: float = 1.0,
         f_s: float = 1.0,
-        M_min: float = 1e10,
+        M_min: float = 1e9,
         M_max: float = 1e16,
         masses_are_log10: bool = True,
+        units_per_h: bool = True,
+        k_array: Optional[Union[float, np.ndarray]] = None,
+        Mstar_min: Optional[Union[float, np.ndarray]] = None,
+        Mstar_max: Optional[Union[float, np.ndarray]] = None,
         median_Mstar: Optional[Union[float, np.ndarray]] = None,
         include_beta_nl: bool = False,
         beta_nl_kwargs: Optional[Dict] = None,
@@ -829,7 +770,7 @@ class HaloModel(Cosmology):
     ):
         # Initialize Cosmology base class
         super().__init__(cosmo_params, beta_nl_kwargs=beta_nl_kwargs,
-                         verbose=verbose, **cosmo_kwargs)
+                         verbose=verbose,k_array=k_array, units_per_h=units_per_h, **cosmo_kwargs)
         
         self.verbose = verbose
         
@@ -848,7 +789,7 @@ class HaloModel(Cosmology):
             raise ValueError("CSMF HOD requires Mstar_min and Mstar_max")
         
         self._Mstar_min_jax, self._Mstar_max_jax = self._prepare_mstar_arrays(Mstar_min, Mstar_max)
-        
+        self.RHO_M = self.get_rho_m()
         self.f_c = f_c
         self.f_s = f_s
         
@@ -912,9 +853,25 @@ class HaloModel(Cosmology):
         raise ValueError(f"median_Mstar length must be 1 or {self.n_z}")
     
     def _precompute_ccl(self):
-        """Precompute CCL quantities at GL nodes and M_min."""
+        """Precompute CCL quantities at GL nodes and M_min.
+
+        When units_per_h=True, user provides HOD masses in Msun/h.
+        CCL requires natural units (Msun), so we convert: M_ccl = M_h / h.
+        Output quantities are rescaled for h-unit consistency:
+        - n_M: multiply by h^3
+        - R_s: multiply by h
+        """
         M_min_val = 10.0 ** self.log10M_min
-        
+
+        # When units_per_h=True, M_array is in Msun/h (matches user's HOD params)
+        # CCL needs natural units (Msun), so convert for CCL calls
+        if self.units_per_h:
+            M_ccl = self.M_array / self.h  # Msun/h -> Msun
+            M_min_ccl = M_min_val / self.h
+        else:
+            M_ccl = self.M_array
+            M_min_ccl = M_min_val
+
         self._n_M = np.zeros((self.n_z, N_GL))
         self._b_h = np.zeros((self.n_z, N_GL))
         self._R_s = np.zeros((self.n_z, N_GL))
@@ -922,23 +879,33 @@ class HaloModel(Cosmology):
         self._Pk_lin = np.zeros((self.n_z, self.n_k))
         self._R_s_Mmin = np.zeros(self.n_z)
         self._c_Mmin = np.zeros(self.n_z)
-        
+
         for iz, a in enumerate(self.a_array):
-            self._n_M[iz] = self.mass_func(self.ccl_cosmo, self.M_array, a)
-            self._b_h[iz] = self.halo_bias_model(self.ccl_cosmo, self.M_array, a)
-            self._Pk_lin[iz] = ccl.linear_power(self.ccl_cosmo, self._k_array_internal, a)
-            
-            R_vir = self.mass_def.get_radius(self.ccl_cosmo, self.M_array, a) / a
-            self._c[iz] = self.concentration_model(self.ccl_cosmo, self.M_array, a)
+            # CCL calls with natural unit masses
+            self._n_M[iz] = self.mass_func(self.ccl_cosmo, M_ccl, a)
+            self._b_h[iz] = self.halo_bias_model(self.ccl_cosmo, M_ccl, a)
+
+            # Use parent class linear_power() - already handles h-units
+            self._Pk_lin[iz] = self.linear_power(z=self.z_array[iz])
+
+            # R_s and concentration from CCL (natural units)
+            R_vir = self.mass_def.get_radius(self.ccl_cosmo, M_ccl, a) / a
+            self._c[iz] = self.concentration_model(self.ccl_cosmo, M_ccl, a)
             self._R_s[iz] = R_vir / self._c[iz]
-            
-            R_vir_Mmin = self.mass_def.get_radius(self.ccl_cosmo, M_min_val, a) / a
-            self._c_Mmin[iz] = self.concentration_model(self.ccl_cosmo, M_min_val, a)
+
+            R_vir_Mmin = self.mass_def.get_radius(self.ccl_cosmo, M_min_ccl, a) / a
+            self._c_Mmin[iz] = self.concentration_model(self.ccl_cosmo, M_min_ccl, a)
             self._R_s_Mmin[iz] = R_vir_Mmin / self._c_Mmin[iz]
-        
+
+            # Apply h-unit conversions for internal consistency
+            if self.units_per_h:
+                self._n_M[iz] /= self.h**3   # dn/dlogM factor (includes mass dependence)
+                self._R_s[iz] *= self.h       # [Mpc] -> [Mpc/h]
+                self._R_s_Mmin[iz] *= self.h
+
         # Convert to JAX arrays
-        self._M_jax = jnp.array(self.M_array)
-        self._k_jax = jnp.array(self._k_array_internal)
+        self._M_jax = jnp.array(self.M_array)  # Stays in user's units (h-units if units_per_h)
+        self._k_jax = jnp.array(self.get_k())  # Uses get_k() which handles h-units
         self._n_M_jax = jnp.array(self._n_M)
         self._b_h_jax = jnp.array(self._b_h)
         self._R_s_jax = jnp.array(self._R_s)
@@ -982,9 +949,14 @@ class HaloModel(Cosmology):
             print("  Interpolating β^NL to GL nodes...")
         
         # Convert masses to h-units for emulator
-        log10M_gl_h = self._log10M_gl_jax + jnp.log10(self.h)
-        k_h = self._k_array_internal / self.h
-        log10M_min_h = self.log10M_min + np.log10(self.h)
+        if self.units_per_h:
+            log10M_gl_h=self._log10M_gl_jax
+            log10M_min_h = self.log10M_min 
+        else:
+            log10M_gl_h = self._log10M_gl_jax - jnp.log10(self.h)
+            log10M_min_h = self.log10M_min - np.log10(self.h)
+
+        k_h = self.get_k()
         M_min_h = 10.0 ** log10M_min_h
         
         for iz, z in enumerate(self.z_array):
@@ -1056,8 +1028,8 @@ class HaloModel(Cosmology):
             result.append(n)
         
         ngal = jnp.array(result)
-        if self.units_per_h:
-            ngal *= self.h ** 3
+        # if self.units_per_h:
+        #     ngal *= self.h ** 3
         return self._squeeze(np.asarray(ngal))
     
     def Pgg(self, hod_params=None):
@@ -1091,8 +1063,8 @@ class HaloModel(Cosmology):
             result.append(P)
         
         Pgg = jnp.stack(result)
-        if self.units_per_h:
-            Pgg *= self.h ** 3
+        # if self.units_per_h:
+        #     Pgg *= self.h ** 3
         return self._squeeze(np.asarray(Pgg))
     
     def Pgm(self, hod_params=None):
@@ -1113,7 +1085,7 @@ class HaloModel(Cosmology):
                     N_c, N_s, self._n_M_jax[iz], self._b_h_jax[iz],
                     self._R_s_jax[iz], self._c_jax[iz],
                     self._Pk_lin_jax[iz], self._k_jax,
-                    self._M_jax, self._rho_m_internal,
+                    self._M_jax, self.RHO_M,
                     self.log10M_min, self.log10M_max, self.f_c, self.f_s,
                     self._beta_nl_gl_cache[iz],
                     self._beta_nl_Mmin_col_cache[iz],
@@ -1124,53 +1096,20 @@ class HaloModel(Cosmology):
                     N_c, N_s, self._n_M_jax[iz], self._b_h_jax[iz],
                     self._R_s_jax[iz], self._c_jax[iz],
                     self._Pk_lin_jax[iz], self._k_jax,
-                    self._M_jax, self._rho_m_internal,
+                    self._M_jax, self.RHO_M,
                     self.log10M_min, self.log10M_max, self.f_c, self.f_s,
                 )
             result.append(P)
         
         Pgm = jnp.stack(result)
-        if self.units_per_h:
-            Pgm *= self.h ** 3
+        # if self.units_per_h:
+        #     Pgm *= self.h ** 3
         return self._squeeze(np.asarray(Pgm))
     
-    def Pmm(self, hod_params=None):
-        """Compute matter-matter power spectrum."""
-        use_beta_nl = self.include_beta_nl and len(self._beta_nl_gl_cache) > 0
-        
-        result = []
-        for iz in range(self.n_z):
-            if use_beta_nl:
-                P = _compute_Pmm_with_beta_nl(
-                    self._n_M_jax[iz], self._b_h_jax[iz],
-                    self._R_s_jax[iz], self._c_jax[iz],
-                    self._Pk_lin_jax[iz], self._k_jax,
-                    self._M_jax, self._rho_m_internal,
-                    self.log10M_min, self.log10M_max,
-                    self._beta_nl_gl_cache[iz],
-                    self._beta_nl_Mmin_row_cache[iz],
-                    self._beta_nl_Mmin_col_cache[iz],
-                    self._beta_nl_Mmin_Mmin_cache[iz],
-                    self._R_s_Mmin_jax[iz], self._c_Mmin_jax[iz],
-                )
-            else:
-                P = _compute_Pmm(
-                    self._n_M_jax[iz], self._b_h_jax[iz],
-                    self._R_s_jax[iz], self._c_jax[iz],
-                    self._Pk_lin_jax[iz], self._k_jax,
-                    self._M_jax, self._rho_m_internal,
-                    self.log10M_min, self.log10M_max,
-                )
-            result.append(P)
-        
-        Pmm = jnp.stack(result)
-        if self.units_per_h:
-            Pmm *= self.h ** 3
-        return self._squeeze(np.asarray(Pmm))
     
     def get_A_Mmin(self, iz: int = 0) -> float:
         """Get A(M_min) = 1 - ∫(M/ρ_m)*b*n dM."""
-        W_m = self._M_jax / self._rho_m_internal
+        W_m = self._M_jax / self.RHO_M
         return float(1.0 - gl_integrate(
             W_m * self._b_h_jax[iz] * self._n_M_jax[iz],
             self.log10M_min, self.log10M_max
@@ -1233,7 +1172,7 @@ class HaloModel(Cosmology):
         
         # H_g and H_m with profiles
         H_g = (N_c[None, :] * u_c + N_s[None, :] * u_s) / n_gal
-        W_m = self._M_jax / self._rho_m_internal
+        W_m = self._M_jax / self.RHO_M
         H_m = u_m * W_m[None, :]
         
         A_Mmin = self.get_A_Mmin(iz)
@@ -1337,7 +1276,6 @@ class HaloModel(Cosmology):
         
         Pgm = self.Pgm(hod_params)
         k = self.get_k()
-        rho_m = self.get_rho_m()
         
         if self.is_single_z:
             Pgm = Pgm[np.newaxis, :]
@@ -1345,17 +1283,18 @@ class HaloModel(Cosmology):
         result = []
         for iz in range(self.n_z):
             if method == 'direct':
-                rp_out, ds_iz = Pk_to_DeltaSigma_direct(k, Pgm[iz], rho_m, rp, rp_bins=rp_bins)
+                rp_out, ds_iz = Pk_to_DeltaSigma_direct(k, Pgm[iz], self.RHO_M, rp, rp_bins=rp_bins)
             elif method == 'traditional':
-                rp_out, ds_iz = Pk_gm_to_DeltaSigma_traditional(k, Pgm[iz], rho_m, rp, rp_bins=rp_bins)
+                rp_out, ds_iz = Pk_gm_to_DeltaSigma_traditional(k, Pgm[iz], self.RHO_M, rp, rp_bins=rp_bins)
             else:
                 raise ValueError(f"Unknown method: {method}")
             
             if include_stellar and self.median_Mstar is not None:
                 ds_stellar = self.median_Mstar[iz] / (np.pi * rp_out**2) / 1e12
-                ds_iz = ds_iz + ds_stellar
                 if self.units_per_h:
-                    ds_iz *= self.h
+                    ds_stellar *=self.h
+
+                ds_iz = ds_iz + ds_stellar
             
             result.append(ds_iz)
         

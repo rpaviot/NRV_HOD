@@ -165,7 +165,7 @@ def main(n_centrals_max=None, downsample_factor=20):
         'kappa': 0.8
     }
 
-    target_ngal = 2e-3  # (h/Mpc)^3
+    target_ngal = 2e-4  # (h/Mpc)^3
 
     # Radial bins for xi_gm
     # Match the bins_comp from standard pipeline for direct comparison

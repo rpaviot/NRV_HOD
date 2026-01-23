@@ -314,7 +314,6 @@ class DeltaSigmaCalculator:
     def _compute_deltasigma_values(self):
         """
         Compute Delta Sigma at internal radii.
-f
         Returns
         -------
         DeltaSigma : ndarray

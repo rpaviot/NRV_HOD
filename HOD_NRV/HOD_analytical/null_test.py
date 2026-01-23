@@ -25,10 +25,7 @@ import pyccl as ccl
 import time
 
 # Import our halo model
-from halo_model import (
-    MultiRedshiftHaloModel, HODType, StandardHOD, CSMF_HOD,
-    UNIT_CONVERSION_INFO
-)
+from halo_model import HaloModel, StandardHOD, CSMF_HOD
 
 # Enable 64-bit precision in JAX
 jax.config.update("jax_enable_x64", True)
@@ -121,7 +118,7 @@ for key, val in hod_params_h_units.items():
 z_array = np.array([0.1, 0.3, 0.4, 0.5])
 k_min = 1e-3  # 1/Mpc (natural)
 k_max = 100   # 1/Mpc (natural)
-n_k = 256
+n_k = 512
 M_min = 1e9   # Msun (natural)
 M_max = 1e16  # Msun (natural)
 n_M = 256
@@ -176,7 +173,7 @@ def compute_pyccl_power_spectra(cosmo, hod_params_h, z_array,
     # CCL halo model setup
     mass_def = ccl.halos.MassDef200c
     concentration = ccl.halos.ConcentrationDuffy08(mass_def=mass_def)
-    mass_func = ccl.halos.MassFuncTinker08(mass_def=mass_def)
+    mass_func = ccl.halos.MassFuncTinker10(mass_def=mass_def)
     halo_bias = ccl.halos.HaloBiasTinker10(mass_def=mass_def)
 
     hod_params_h2 = hod_params_h.copy()
@@ -299,11 +296,11 @@ def run_null_test(units_per_h: bool):
     # ====================================================================
     # Optimized JAX Implementation
     # ====================================================================
-    
+
     print("\n" + "-"*50)
-    print("COMPUTING OPTIMIZED JAX (MultiRedshiftHaloModel)")
+    print("COMPUTING OPTIMIZED JAX (HaloModel)")
     print("-"*50)
-    
+
     # Choose parameters based on unit convention
     # units_per_h=True: params in h-units, model converts internally
     # units_per_h=False: params already in natural units
@@ -311,28 +308,30 @@ def run_null_test(units_per_h: bool):
         input_params = hod_params_h_units
     else:
         input_params = hod_params_natural
-    
+
     t0 = time.time()
-    model = MultiRedshiftHaloModel(
-        cosmo,
-        hod_type=HODType.STANDARD,
-        hod_params=input_params,
-        z_array=z_array,
+    model = HaloModel(
+        cosmo_params=dict_cosmo,
+        z=z_array,
+        hod_type='standard',
         k_array=np.geomspace(k_min, k_max, n_k),  # Always in natural units (1/Mpc)
         M_min=M_min,
         M_max=M_max,
         units_per_h=units_per_h,
         verbose=True
     )
+    model.set_hod_params(input_params)
     t_init = time.time() - t0
     print(f"Init time: {t_init:.2f}s")
-    
+
     t0 = time.time()
-    Pk_gg_jax, Pk_gm_jax, ngal_jax = model.compute_both_all_z(verbose=True)
+    Pk_gg_jax = model.Pgg()
+    Pk_gm_jax = model.Pgm()
+    ngal_jax = model.ngal()
     t_compute = time.time() - t0
     print(f"Compute time: {t_compute*1000:.1f}ms")
-    
-    k_jax = model.get_k_array()
+
+    k_jax = model.get_k()
     
     # ====================================================================
     # Comparison
@@ -372,11 +371,11 @@ def run_null_test(units_per_h: bool):
 
 def test_csmf_hod():
     """Test the CSMF HOD implementation"""
-    
+
     print("\n" + "="*70)
     print("TESTING CSMF HOD")
     print("="*70)
-    
+
     # CSMF parameters (example values)
     csmf_params = {
         'M0': 10.5,        # log10(M0/Msun) - characteristic stellar mass
@@ -388,41 +387,43 @@ def test_csmf_hod():
         'b0': 0.5,         # normalization intercept
         'b1': 1.0          # normalization slope
     }
-    
+
     # Stellar mass bin (in Msun for natural units)
     Mstar_min = 10**10.0
     Mstar_max = 10**11.0
-    
+
     print(f"\nCSMF Parameters:")
     for key, val in csmf_params.items():
         print(f"  {key}: {val}")
     print(f"\nStellar mass bin: [{Mstar_min:.2e}, {Mstar_max:.2e}] Msun")
-    
+
     # Create model
-    model = MultiRedshiftHaloModel(
-        cosmo,
-        hod_type=HODType.CSMF,
-        hod_params=csmf_params,
-        z_array=z_array,
+    model = HaloModel(
+        cosmo_params=dict_cosmo,
+        z=z_array,
+        hod_type='csmf',
         k_array=np.geomspace(k_min, k_max, n_k),
         M_min=M_min,
         M_max=M_max,
+        Mstar_min=Mstar_min,
+        Mstar_max=Mstar_max,
         units_per_h=False,  # Natural units
         masses_are_log10=True,
         verbose=True
     )
-    
+    model.set_hod_params(csmf_params)
+
     # Compute power spectra
     t0 = time.time()
-    Pk_gg, Pk_gm, n_gal = model.compute_both_all_z(
-        Mstar_min=Mstar_min, Mstar_max=Mstar_max, verbose=True
-    )
+    Pk_gg = model.Pgg()
+    Pk_gm = model.Pgm()
+    n_gal = model.ngal()
     print(f"\nCompute time: {(time.time()-t0)*1000:.1f}ms")
-    
+
     print(f"\nCSMF Results:")
     for iz, z in enumerate(z_array):
         print(f"  z={z:.1f}: n_gal={n_gal[iz]:.4e} Mpc⁻³, P_gg(k=0.1)={Pk_gg[iz, 100]:.2e} Mpc³")
-    
+
     return model, Pk_gg, Pk_gm, n_gal
 
 
@@ -489,12 +490,12 @@ def generate_comparison_plot(results_h, save_path='null_test_comparison.png'):
 
 def mcmc_usage_example():
     """Demonstrate efficient MCMC usage pattern"""
-    
+
     print("\n" + "="*70)
     print("MCMC USAGE EXAMPLE")
     print("="*70)
-    
-    # Initial parameters
+
+    # Initial parameters (StandardHOD format)
     initial_params = {
         'log10Mmin': 12.0,
         'siglnM': 0.4,
@@ -502,24 +503,24 @@ def mcmc_usage_example():
         'log10M1': 13.3,
         'alpha': 1.0
     }
-    
+
     # Create model once (expensive: pre-computes CCL quantities)
     print("\nCreating model (one-time cost)...")
     t0 = time.time()
-    model = MultiRedshiftHaloModel(
-        cosmo,
+    model = HaloModel(
+        cosmo_params=dict_cosmo,
+        z=z_array,
         hod_type='standard',
-        hod_params=initial_params,
-        z_array=z_array,
         units_per_h=True,
         verbose=True
     )
+    model.set_hod_params(initial_params)
     print(f"Init time: {time.time()-t0:.2f}s")
-    
+
     # Simulate MCMC iterations
     n_iterations = 100
     print(f"\nSimulating {n_iterations} MCMC iterations...")
-    
+
     times = []
     for i in range(n_iterations):
         # Vary parameters (as would happen in MCMC)
@@ -530,12 +531,14 @@ def mcmc_usage_example():
             'log10M1': 13.3 + 0.1 * np.random.randn(),
             'alpha': 1.0 + 0.1 * np.random.randn()
         }
-        
+
         t0 = time.time()
-        model.update_hod_params(new_params)
-        Pk_gg, Pk_gm, n_gal = model.compute_both_all_z(verbose=False)
+        model.set_hod_params(new_params)
+        Pk_gg = model.Pgg()
+        Pk_gm = model.Pgm()
+        n_gal = model.ngal()
         times.append(time.time() - t0)
-    
+
     times = np.array(times)
     print(f"\nPer-iteration statistics:")
     print(f"  Mean time: {np.mean(times)*1000:.2f} ms")
@@ -579,13 +582,7 @@ if __name__ == "__main__":
     print("#"*70)
     
     mcmc_usage_example()
-    
-    # Print unit conversion summary
-    print("\n\n" + "#"*70)
-    print("# UNIT CONVERSION REFERENCE")
-    print("#"*70)
-    print(UNIT_CONVERSION_INFO)
-    
+
     # Final summary
     print("\n" + "="*70)
     print("SUMMARY")

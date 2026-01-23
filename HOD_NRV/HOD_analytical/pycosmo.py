@@ -60,7 +60,6 @@ class BetaNLInterpolator:
     def __init__(
         self,
         emu,
-        ccl_cosmo,
         h: float,
         z_values: Union[float, np.ndarray, List[float]],
         n_k: int = 100,
@@ -76,7 +75,6 @@ class BetaNLInterpolator:
             raise RuntimeError("JAX and interpax are required for BetaNLInterpolator")
         
         self.emu = emu
-        self.ccl_cosmo = ccl_cosmo
         self.h = h
         self.verbose = verbose
         self.method = method
@@ -108,10 +106,8 @@ class BetaNLInterpolator:
     
     def _get_linear_power(self, k_h: np.ndarray, z: float) -> np.ndarray:
         """Get linear power spectrum from CCL."""
-        a = 1.0 / (1.0 + z)
-        k_ccl = np.asarray(k_h) * self.h
-        Pk_ccl = ccl.linear_power(self.ccl_cosmo, k_ccl, a)
-        return Pk_ccl * self.h**3
+        Pk_lin = self.emu.get_pklin_from_z(k_h,z)
+        return Pk_lin
     
     def _get_halo_power_cleaned(self, k_h: np.ndarray, M1: float, M2: float, z: float) -> np.ndarray:
         """
@@ -262,6 +258,7 @@ class Cosmology:
     ):
         self.cosmo_params = cosmo_params.copy()
         self.units_per_h = units_per_h
+        print(units_per_h)
         self.verbose = verbose
         
         self._validate_cosmo_params(cosmo_params)
@@ -369,7 +366,7 @@ class Cosmology:
         return self._rho_m_internal / self.h**2 if self.units_per_h else self._rho_m_internal
     
     @property
-    def rho_m(self) -> float:
+    def rho_m_natural(self) -> float:
         return self._rho_m_internal
     
     def linear_power(self, k: Optional[np.ndarray] = None, z: float = 0.0) -> np.ndarray:
@@ -382,11 +379,6 @@ class Cosmology:
         Pk = ccl.nonlin_power(self.ccl_cosmo, k, 1.0 / (1.0 + z))
         return Pk * self.h**3 if self.units_per_h else Pk
     
-    def sigma8(self) -> float:
-        return ccl.sigma8(self.ccl_cosmo)
-    
-    def growth_factor(self, z: float) -> float:
-        return ccl.growth_factor(self.ccl_cosmo, 1.0 / (1.0 + z))
     
     def compute_beta_nl(self, z_values: Union[float, np.ndarray, List[float]], **kwargs) -> BetaNLInterpolator:
         """Compute β^NL at specific redshifts."""
@@ -402,7 +394,7 @@ class Cosmology:
         opts.update(kwargs)
         
         self.beta_nl_interp = BetaNLInterpolator(
-            emu=self.emu, ccl_cosmo=self.ccl_cosmo, h=self.h, z_values=z_values, **opts
+            emu=self.emu, h=self.h, z_values=z_values, **opts
         )
         return self.beta_nl_interp
     
