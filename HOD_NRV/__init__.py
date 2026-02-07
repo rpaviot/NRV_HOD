@@ -10,7 +10,7 @@ Main Classes
 - HaloOccupation: Main user interface for halo occupation modeling
 - Occupation: HOD model implementations
 - DeltaSigmaCalculator: Galaxy-galaxy lensing calculator
-- FastDeltaSigmaCalculator: Optimized lensing calculator with pre-computation
+- OptimizedDeltaSigmaCalculator: Fast lensing with precomputed halo-center profiles
 
 Main Functions
 --------------
@@ -20,7 +20,7 @@ Main Functions
 
 # Core HOD classes and population functions
 from .HOD_numerical.HOD.HOD_catalogue import HaloOccupation
-from .HOD_models import Occupation
+from .HOD_numerical.HOD_models import Occupation
 from .HOD_numerical.HOD.population_engine import (
     populate_centrals,
     populate_satellites,
@@ -43,13 +43,11 @@ from .HOD_numerical.twopoint_calculator.standard_two_point_calculator import (
     compute_galaxy_lensing
 )
 
-# Fast two-point calculator
-from .HOD_numerical.twopoint_calculator.fast_two_point import FastDeltaSigmaCalculator
-from .HOD_numerical.twopoint_calculator.precompute_deltasigma import (
-    build_particle_kdtree,
-    precompute_lensing_grid,
-    save_precomputed_lensing,
-    load_precomputed_lensing
+# Optimized halo-center lensing
+from .HOD_numerical.twopoint_calculator.halo_center_lensing import (
+    HaloCenterLensingCache,
+    precompute_halo_center_lensing,
+    OptimizedDeltaSigmaCalculator
 )
 
 __all__ = [
@@ -80,12 +78,10 @@ __all__ = [
     "compute_galaxy_clustering",
     "compute_galaxy_lensing",
 
-    # Fast two-point calculator
-    "FastDeltaSigmaCalculator",
-    "build_particle_kdtree",
-    "precompute_lensing_grid",
-    "save_precomputed_lensing",
-    "load_precomputed_lensing",
+    # Optimized halo-center lensing
+    "HaloCenterLensingCache",
+    "precompute_halo_center_lensing",
+    "OptimizedDeltaSigmaCalculator",
 ]
 
 __version__ = '0.1.0'

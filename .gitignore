@@ -202,3 +202,5 @@ HOD_NRV/HOD_numerical/test/output/
 
 # Jupyter notebooks
 *.ipynb
+*.h5 
+*.hdf5

@@ -54,27 +54,30 @@ HOD_NRV package. It uses pyccl for halo model calculations and JAX for optimizat
 making it suitable for MCMC sampling and parameter inference.
 """
 
-from .halo_model import (
-    # Main classes
-    HaloModel,
+from .hod_analytical import (
+    # HOD classes and factory
+    AnalyticalHOD,
     StandardHOD,
     CSMF_HOD,
-
-    # Factory and convenience functions
     create_hod,
-    HOD_PARAM_DEFINITIONS,
+
     # Parameter definitions
+    HOD_PARAM_DEFINITIONS,
     CSMF_HOD_PARAMS,
 
     # Validation
     validate_hod_params,
+)
 
-    # Documentation
+from .halo_model import (
+    # Main class
+    HaloModel,
 )
 
 __all__ = [
     # Main classes
     'HaloModel',
+    'AnalyticalHOD',
     'StandardHOD',
     'CSMF_HOD',
 
@@ -82,12 +85,11 @@ __all__ = [
     'create_hod',
 
     # Parameter definitions
+    'HOD_PARAM_DEFINITIONS',
     'CSMF_HOD_PARAMS',
-    'HOD_PARAM_DEFINITIONS'
+
     # Validation
     'validate_hod_params',
-
-    # Documentation
 ]
 
 __version__ = '0.1.0'

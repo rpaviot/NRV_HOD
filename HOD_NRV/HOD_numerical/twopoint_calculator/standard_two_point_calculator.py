@@ -2,10 +2,10 @@
 Two-Point Correlation Functions and Galaxy-Galaxy Lensing for NRVpy HOD Code
 
 For production use with HOD parameter sampling, consider using the optimized
-FastDeltaSigmaCalculator from the twopoint_calculator module, which provides
-~100-1000× speedup by pre-computing ΔΣ at particle positions.
+OptimizedDeltaSigmaCalculator from the twopoint_calculator module, which provides
+significant speedup by precomputing ΔΣ at halo centers.
 
-See: HOD_NRV.twopoint_calculator.FastDeltaSigmaCalculator
+See: HOD_NRV.twopoint_calculator.OptimizedDeltaSigmaCalculator
 
 This module provides functions for computing two-point correlation functions and
 galaxy-galaxy lensing signals from populated galaxy catalogs. It includes both
@@ -271,7 +271,7 @@ class DeltaSigmaCalculator:
     .. [2] Cacciato et al. (2009), MNRAS 394, 929
     .. [3] Singh et al. (2017), MNRAS 471, 3827
     """
-    def __init__(self, rr, xi_gm, RHO_M, chi_max=100):
+    def __init__(self, rr, xi_gm, RHO_M, chi_max=150):
         self.rr = rr
         self.RHO_M = RHO_M
         self.chi_max = chi_max

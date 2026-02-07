@@ -136,7 +136,8 @@ def populate_satellites(key_s: jrandom.PRNGKey,
                        ratios: Optional[jnp.ndarray] = None,
                        f_exp: float = 0.0,
                        tau: float = 6.0,
-                       lambda_NFW: float = 1.0) -> Tuple[jnp.ndarray, jnp.ndarray]:
+                       lambda_NFW: float = 1.0,
+                       use_fast: bool = True) -> Tuple[jnp.ndarray, jnp.ndarray]:
     """
     Populate satellite galaxies using NFW profiles and Poisson sampling.
     
@@ -174,7 +175,10 @@ def populate_satellites(key_s: jrandom.PRNGKey,
         Exponential decay scale in units of NFW scale radius Rs
     lambda_NFW : float, default=1.0
         NFW profile rescaling factor
-        
+    use_fast : bool, default=True
+        If True, use optimized satellite positioning (~10-100x faster).
+        If False, use original functions (for testing/comparison).
+
     Returns
     -------
     sat_positions : jnp.ndarray, shape (N_satellites, 3)
@@ -250,7 +254,8 @@ def populate_satellites(key_s: jrandom.PRNGKey,
         ratios=filtered['ratios'],
         f_exp=f_exp,
         tau=tau,
-        lambda_NFW=lambda_NFW
+        lambda_NFW=lambda_NFW,
+        use_fast=use_fast
     )
     
     # Sample satellite velocities from dispersion model
@@ -369,13 +374,14 @@ def populate_haloes_full(positions: jnp.ndarray,
                         shapes: Optional[jnp.ndarray] = None,
                         ratios: Optional[jnp.ndarray] = None,
                         f_exp: float = 0.0,
-                        tau: float = 6.0, 
+                        tau: float = 6.0,
                         lambda_NFW: float = 1.0,
                         apply_rsd: bool = True,
                         rsd_factor: float = 1.0,
                         rsd_axis_index: int = 2,
                         Lbox: float = 1000.0,
-                        random_seed: Optional[int] = None) -> Tuple[jnp.ndarray, jnp.ndarray, float]:
+                        random_seed: Optional[int] = None,
+                        use_fast: bool = True) -> Tuple[jnp.ndarray, jnp.ndarray, float, jnp.ndarray]:
     """
     Complete halo population pipeline: centrals + satellites + RSD.
     
@@ -426,12 +432,15 @@ def populate_haloes_full(positions: jnp.ndarray,
         
     Returns
     -------
-    positions_gal : jnp.ndarray, shape (N_galaxies, 3) 
+    positions_gal : jnp.ndarray, shape (N_galaxies, 3)
         Final galaxy positions (with RSD if requested) [Mpc/h]
     velocities_gal : jnp.ndarray, shape (N_galaxies, 3)
         Final galaxy velocities [km/s]
     satellite_fraction : float
         Fraction of galaxies that are satellites (N_satellites / N_total)
+    cent_halo_indices : jnp.ndarray, shape (N_centrals,)
+        Indices of halos that host central galaxies. Used for optimized
+        lensing calculations with precomputed halo-center profiles.
         
     Examples
     --------
@@ -464,6 +473,9 @@ def populate_haloes_full(positions: jnp.ndarray,
     cent_positions, cent_velocities, is_cent = populate_centrals(
         key_c, positions, velocities, probC
     )
+
+    # Track which halos have centrals (for optimized lensing)
+    cent_halo_indices = jnp.where(is_cent)[0]
     
     # Compute satellite occupation probability
     if hod_model.conformity:
@@ -480,7 +492,7 @@ def populate_haloes_full(positions: jnp.ndarray,
         key_s, key_s_pos, key_s_vel, positions, velocities, probS,
         radius, concentration, vrms, SpherePoints,
         triaxial_NFW=triaxial_NFW, shapes=shapes, ratios=ratios,
-        f_exp=f_exp, tau=tau, lambda_NFW=lambda_NFW
+        f_exp=f_exp, tau=tau, lambda_NFW=lambda_NFW, use_fast=use_fast
     )
     
     # Combine populations
@@ -499,8 +511,8 @@ def populate_haloes_full(positions: jnp.ndarray,
     
     # Calculate satellite fraction
     n_centrals = len(cent_positions)
-    n_satellites = len(sat_positions) 
+    n_satellites = len(sat_positions)
     n_total = n_centrals + n_satellites
     satellite_fraction = n_satellites / n_total if n_total > 0 else 0.0
-    
-    return positions_gal, velocities_gal, satellite_fraction
+
+    return positions_gal, velocities_gal, satellite_fraction, cent_halo_indices

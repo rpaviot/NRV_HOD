@@ -26,6 +26,7 @@ import time
 
 # Import our halo model
 from halo_model import HaloModel, StandardHOD, CSMF_HOD
+from HOD_NRV.utilsf.hankel_transforms import Pk_to_DeltaSigma_direct
 
 # Enable 64-bit precision in JAX
 jax.config.update("jax_enable_x64", True)
@@ -309,12 +310,19 @@ def run_null_test(units_per_h: bool):
     else:
         input_params = hod_params_natural
 
+    # When units_per_h=True, HaloModel expects k_array in h/Mpc
+    # Convert from natural units (1/Mpc) so both models evaluate at the same physical k
+    if units_per_h:
+        k_array_input = np.geomspace(k_min / h, k_max / h, n_k)  # h/Mpc
+    else:
+        k_array_input = np.geomspace(k_min, k_max, n_k)  # 1/Mpc
+
     t0 = time.time()
     model = HaloModel(
         cosmo_params=dict_cosmo,
         z=z_array,
         hod_type='standard',
-        k_array=np.geomspace(k_min, k_max, n_k),  # Always in natural units (1/Mpc)
+        k_array=k_array_input,
         M_min=M_min,
         M_max=M_max,
         units_per_h=units_per_h,
@@ -485,6 +493,129 @@ def generate_comparison_plot(results_h, save_path='null_test_comparison.png'):
 
 
 # ============================================================================
+# DeltaSigma Null Test (h-units only)
+# ============================================================================
+
+def test_delta_sigma():
+    """
+    Compare DeltaSigma between pyccl reference and JAX HaloModel.
+
+    Both use the same Pk_to_DeltaSigma_direct Hankel transform,
+    so this tests whether the Pgm -> DeltaSigma pipeline is consistent.
+    """
+    print("\n" + "="*70)
+    print("DELTA SIGMA NULL TEST (h-units)")
+    print("="*70)
+
+    rp_bins = np.logspace(-1, 1.7, 20)  # Mpc/h
+    rp = np.sqrt(rp_bins[:-1] * rp_bins[1:])  # geometric bin centres
+
+    # ------------------------------------------------------------------
+    # JAX HaloModel
+    # ------------------------------------------------------------------
+    print("\n" + "-"*50)
+    print("COMPUTING JAX DeltaSigma")
+    print("-"*50)
+
+    k_array_h = np.geomspace(k_min / h, k_max / h, n_k)  # h/Mpc
+
+    model = HaloModel(
+        cosmo_params=dict_cosmo,
+        z=z_array,
+        hod_type='standard',
+        k_array=k_array_h,
+        M_min=M_min,
+        M_max=M_max,
+        units_per_h=True,
+        verbose=True
+    )
+    model.set_hod_params(hod_params_h_units)
+
+    rp_jax, ds_jax = model.DeltaSigma(rp, rp_bins=rp_bins, include_stellar=False)
+    if ds_jax.ndim == 1:
+        ds_jax = ds_jax[np.newaxis, :]
+
+    print(f"  rp range: [{rp_jax[0]:.2f}, {rp_jax[-1]:.2f}] Mpc/h")
+    for iz, z in enumerate(z_array):
+        print(f"  z={z:.1f}: DS(rp=1) ~ {ds_jax[iz, np.argmin(np.abs(rp_jax - 1.0))]:.4e} h*Msun/pc^2")
+
+    # ------------------------------------------------------------------
+    # pyccl reference: compute Pk_gm then same Hankel transform
+    # ------------------------------------------------------------------
+    print("\n" + "-"*50)
+    print("COMPUTING PYCCL DeltaSigma")
+    print("-"*50)
+
+    k_pyccl_h, _, Pk_gm_pyccl, _ = compute_pyccl_power_spectra(
+        cosmo, hod_params_h_units, z_array,
+        k_min=k_min, k_max=k_max, n_k=n_k,
+        M_min=M_min, M_max=M_max, n_M=n_M,
+        units_per_h=True
+    )
+
+    # rho_m in h-units (same as model.RHO_M)
+    rho_m_h = ccl.rho_x(cosmo, 1.0, 'matter', is_comoving=True) / h**2
+
+    ds_pyccl = np.zeros((len(z_array), len(rp)))
+    for iz in range(len(z_array)):
+        rp_out, ds_iz = Pk_to_DeltaSigma_direct(
+            k_pyccl_h, Pk_gm_pyccl[iz], rho_m_h, rp, rp_bins=rp_bins
+        )
+        ds_pyccl[iz] = ds_iz
+
+    # ------------------------------------------------------------------
+    # Comparison
+    # ------------------------------------------------------------------
+    print("\n" + "-"*50)
+    print("COMPARISON")
+    print("-"*50)
+
+    rp_mask = (rp_jax > 0.3) & (rp_jax < 30.0)
+    print(f"\nMax |ΔDS/DS| (0.3 < rp < 30 Mpc/h):")
+    for iz, z in enumerate(z_array):
+        frac = np.abs((ds_jax[iz] - ds_pyccl[iz]) / ds_pyccl[iz])[rp_mask]
+        print(f"  z={z:.1f}: {np.max(frac)*100:.4f}%")
+
+    # ------------------------------------------------------------------
+    # Plot
+    # ------------------------------------------------------------------
+    fig, axes = plt.subplots(2, len(z_array), figsize=(5*len(z_array), 8))
+    colors = ['C0', 'C1', 'C2', 'C3']
+
+    for iz, z in enumerate(z_array):
+        # DeltaSigma
+        axes[0, iz].semilogx(rp_jax, rp*ds_jax[iz], '--', color=colors[iz], lw=2, label='JAX')
+        axes[0, iz].semilogx(rp_jax, rp*ds_pyccl[iz], 'k-', lw=2, label='pyccl')
+        axes[0, iz].set_xlabel(r'$r_p$ [Mpc/$h$]')
+        axes[0, iz].set_ylabel(r'$\Delta\Sigma$ [$h\,M_\odot/\mathrm{pc}^2$]')
+        axes[0, iz].set_title(f'z = {z:.1f}')
+        axes[0, iz].legend()
+        axes[0, iz].grid(True, alpha=0.3)
+
+        # Fractional difference
+        frac_diff = (ds_jax[iz] - ds_pyccl[iz]) / ds_pyccl[iz] * 100
+        axes[1, iz].semilogx(rp_jax, frac_diff, '-', color=colors[iz], lw=1.5)
+        axes[1, iz].axhline(0, color='k', ls=':', alpha=0.5)
+        axes[1, iz].fill_between(rp_jax, -1, 1, color='gray', alpha=0.2)
+        axes[1, iz].set_xlabel(r'$r_p$ [Mpc/$h$]')
+        axes[1, iz].set_ylabel('Diff [%]')
+        axes[1, iz].set_ylim([-5, 5])
+        axes[1, iz].grid(True, alpha=0.3)
+
+    plt.suptitle(r'NULL TEST: $\Delta\Sigma$ — pyccl vs JAX (h-units)', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    save_path = 'null_test_DeltaSigma.png'
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"\nPlot saved to: {save_path}")
+
+    return {
+        'rp': rp_jax,
+        'ds_jax': ds_jax,
+        'ds_pyccl': ds_pyccl,
+    }
+
+
+# ============================================================================
 # MCMC Usage Example
 # ============================================================================
 
@@ -575,7 +706,14 @@ if __name__ == "__main__":
     print("#"*70)
     
     fig = generate_comparison_plot(results_h)
-    
+
+    # DeltaSigma null test (h-units)
+    print("\n\n" + "#"*70)
+    print("# DELTA SIGMA NULL TEST")
+    print("#"*70)
+
+    ds_results = test_delta_sigma()
+
     # MCMC usage example
     print("\n\n" + "#"*70)
     print("# MCMC USAGE DEMONSTRATION")
