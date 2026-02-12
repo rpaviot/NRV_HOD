@@ -25,7 +25,7 @@ import pyccl as ccl
 import time
 
 # Import our halo model
-from halo_model import HaloModel, StandardHOD, CSMF_HOD
+from HOD_NRV.HOD_analytical.halo_model import HaloModel, StandardHOD, CSMF_HOD
 from HOD_NRV.utilsf.hankel_transforms import Pk_to_DeltaSigma_direct
 
 # Enable 64-bit precision in JAX

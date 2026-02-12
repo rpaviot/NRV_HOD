@@ -62,10 +62,11 @@ cosmo_params = {'H0': dict_cosmo['h']*100, 'Om0': dict_cosmo['Omc']+dict_cosmo['
 # Base HOD parameters for ELG_GHOD (Ac and As will be rescaled)
 base_hod_params = {
     "As": 0.3,
-    "Mmin": 13.0,
+    "Mmin": 12.7,
     "sig_M": 0.3,
     "M1": 13.0,
-    "alpha": 0.80,
+    "gamma":5.0,
+    "alpha": 1.10,
     "kappa": 0.80,
 }
 
@@ -113,8 +114,8 @@ halo = HaloOccupation(
 # Set HOD model and rescale Ac/As
 # ============================================================================
 
-print("\nSetting HOD model: ELG_GHOD")
-halo.set_halo_model("ELG_GHOD")
+print("\nSetting HOD model: ELG_mHMQ")
+halo.set_halo_model("ELG_mHMQ")
 
 print(f"Rescaling Ac/As to target n_gal = {target_ngal:.2e} (Mpc/h)^-3 ...")
 Ac_rescaled, As_rescaled = rescale_Ac_to_target_ngal(

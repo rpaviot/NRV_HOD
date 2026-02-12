@@ -31,15 +31,15 @@ from HOD_NRV.utilsf.emulator_utils import rescale_Ac_to_target_ngal
 HALO_PATH = "/Users/ler13nrv/Documents/flamingo_data/parquet_halo_catalogue_L1000N1800.parquet"
 PARTICLE_PATH = "/Users/ler13nrv/Documents/flamingo_data/particle_catalogue_L1000N1800_downsampled.parquet"
 
-N_REAL = 5
+N_REAL = 10
 BASE_SEED = 1000
 PARTICLE_FRACTION = 0.05
 PARTICLE_SUBSAMPLE_SEED = 99
 
 # Load galaxy fraction from benchmark results
 with open("benchmark_results.json") as _f:
-    #GALAXY_FRACTION = json.load(_f)["optimal"]["galaxy_fraction"]
-    GALAXY_FRACTION = 0.2
+    GALAXY_FRACTION = json.load(_f)["optimal"]["galaxy_fraction"]
+    #GALAXY_FRACTION = 0.2
 
 
 CACHE_INPUT = "halo_center_lensing_cache.h5"
@@ -75,13 +75,13 @@ cosmo_params = {
 
 base_hod_params = {
     "As": 0.3,
-    "Mmin": 13.0,
+    "Mmin": 12.7,
     "sig_M": 0.3,
     "M1": 13.0,
-    "alpha": 0.80,
+    "gamma":5.0,
+    "alpha": 1.10,
     "kappa": 0.80,
 }
-
 target_ngal = 2e-4  # (Mpc/h)^-3
 
 # Lensing bins (same as example)
@@ -157,8 +157,8 @@ def main():
     )
 
     # --- Set HOD model and rescale Ac/As ---
-    print("\nSetting HOD model: ELG_GHOD")
-    halo.set_halo_model("ELG_GHOD")
+    print("\nSetting HOD model: ELG_mHMQ")
+    halo.set_halo_model("ELG_mHMQ")
 
     print(f"Rescaling Ac/As to target n_gal = {target_ngal:.2e} (Mpc/h)^-3 ...")
     Ac_rescaled, As_rescaled = rescale_Ac_to_target_ngal(
@@ -275,12 +275,12 @@ def main():
                                      sharex=True, gridspec_kw={"hspace": 0.05})
 
     # Top panel: DeltaSigma comparison
-    ax1.loglog(rp_centers, ds_baseline_mean, "k-", lw=2, label=f"Baseline (mean of {n_compare})")
-    ax1.loglog(rp_centers, ds_opt_mean, "ro--", lw=1.5, ms=5, label=f"Optimized (mean of {N_REAL})")
+    ax1.semilogx(rp_centers, rp_centers*ds_baseline_mean, "k-", lw=2, label=f"Baseline (mean of {n_compare})")
+    ax1.semilogx(rp_centers, rp_centers*ds_opt_mean, "ro--", lw=1.5, ms=5, label=f"Optimized (mean of {N_REAL})")
 
     # Show individual realizations as faint lines
     for i in range(N_REAL):
-        ax1.loglog(rp_centers, ds_opt_all[i], color="red", alpha=0.15, lw=0.5)
+        ax1.loglog(rp_centers, rp_centers*ds_opt_all[i], color="red", alpha=0.15, lw=0.5)
 
     ax1.set_ylabel(r"$\Delta\Sigma$ [$h\,M_\odot/\mathrm{pc}^2$]")
     ax1.legend(loc="upper right")

@@ -259,7 +259,7 @@ def _get_required_parameters(
     halo : HaloOccupation
         HaloOccupation instance to inspect for enabled extensions
     hod_type : str
-        HOD model type ('LRG', 'ELG_GHOD', 'ELG_SFR')
+        HOD model type ('LRG', 'ELG_GHOD', 'ELG_SFR', 'ELG_mHMQ')
     conformity : bool
         Whether conformity is enabled
     include_nfw_extensions : bool, default=False
@@ -273,8 +273,8 @@ def _get_required_parameters(
     # Base parameters for all models
     required = {'Mmin', 'sig_M', 'As', 'M1', 'alpha', 'kappa'}
 
-    # Add gamma for ELG_SFR
-    if hod_type == 'ELG_SFR':
+    # Add gamma for ELG_SFR and ELG_mHMQ
+    if hod_type in ('ELG_SFR', 'ELG_mHMQ'):
         required.add('gamma')
 
     # Add conformity parameter

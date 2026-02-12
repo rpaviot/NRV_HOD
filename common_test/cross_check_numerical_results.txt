@@ -1,5 +1,5 @@
 # Numerical DeltaSigma Regression Test Results
-# Date: 2026-02-06 19:15:45
+# Date: 2026-02-09 18:12:31
 # Settings: 5% particles, 10% galaxies, 5 realizations
 # Baseline: 10 realizations (100% particles/galaxies)
 # Base seed: 2000

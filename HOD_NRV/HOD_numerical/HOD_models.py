@@ -13,13 +13,19 @@ def func_erf(x):
 
 @jit
 def LRG_Zheng07(logM, Ac, Mmin, sig_M):
-    Ncen = Ac / 2. * (1 + func_erf((logM - Mmin)/sig_M))
+    Ncen = Ac / 2. * (1 + func_erf((logM - Mmin)/(jnp.sqrt(2)*sig_M)))
     return Ncen
 
 @jit
 def ELG_GHOD(logM, Ac, Mmin ,sig_M):
     Ncen = Ac / (sqrtpi*sig_M) * jnp.exp(-((logM - Mmin) ** 2) / (2 * sig_M ** 2))
     return Ncen
+
+@jit 
+def ELG_mHMQ(logM, Ac,Mmin,sig_M,gamma):
+    exp_part =ELG_GHOD(logM, Ac, Mmin ,sig_M)
+    quench_fraction = 1 + func_erf((gamma*(logM - Mmin))/(jnp.sqrt(2)*sig_M))
+    return exp_part*quench_fraction
 
 @jit
 def ELG_SFR(logM, Ac, Mmin, sig_M, gamma):
@@ -94,6 +100,7 @@ class Occupation:
         "LRG": (LRG_Zheng07, ["Ac", "Mmin", "sig_M"]),
         "ELG_GHOD": (ELG_GHOD, ["Ac", "Mmin", "sig_M"]),
         "ELG_SFR": (ELG_SFR, ["Ac", "Mmin", "sig_M", "gamma"]),
+        "ELG_mHMQ": (ELG_mHMQ, ["Ac", "Mmin", "sig_M", "gamma"]),
     }
 
     satellite_params=["As", "Mmin", "M1", "alpha", "kappa"]

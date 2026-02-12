@@ -204,3 +204,4 @@ HOD_NRV/HOD_numerical/test/output/
 *.ipynb
 *.h5 
 *.hdf5
+*.txt

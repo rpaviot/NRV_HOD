@@ -109,22 +109,39 @@ class HaloOccupation:
     .. [3] Wechsler & Tinker (2018), ARA&A 56, 435
     """
 
-    def __init__(self, cosmology: Dict[str, float], 
-                 zeff: float, 
-                 Lbox: float, 
-                 column_mapping: Dict[str, str], 
+    @staticmethod
+    def _subsample_array(arr, fraction, seed=42):
+        """Subsample an array by keeping a random fraction of rows.
+
+        Uses sorted random indices for cache-friendly memory access.
+        Returns the array unchanged if fraction >= 1.0.
+        """
+        if fraction >= 1.0:
+            return arr
+        n = len(arr)
+        n_keep = int(n * fraction)
+        rng = np.random.RandomState(seed)
+        idx = np.sort(rng.choice(n, n_keep, replace=False))
+        return arr[idx]
+
+    def __init__(self, cosmology: Dict[str, float],
+                 zeff: float,
+                 Lbox: float,
+                 column_mapping: Dict[str, str],
                  mass_definition: str,
-                 DataFrame: Optional[Any] = None, 
-                 halo_path: Optional[str] = None, 
-                 DataFrame_part: Optional[Any] = None, 
+                 DataFrame: Optional[Any] = None,
+                 halo_path: Optional[str] = None,
+                 DataFrame_part: Optional[Any] = None,
                  assembly_bias: bool = False,
-                 NFW_scaled: bool = True, 
- 
+                 NFW_scaled: bool = True,
+
                  outerprofile: bool = True,
                  apply_rsd: bool = True,
                  triaxial_NFW: Union[bool, str] = False,
                  rsd_axis: str = 'z',
-                 do_test: bool = True):
+                 do_test: bool = True,
+                 particle_fraction: float = 1.0,
+                 particle_subsample_seed: int = 42):
         
         # Store configuration parameters
         self.dict_cosmology = cosmology
@@ -176,6 +193,12 @@ class HaloOccupation:
                 )
             else:
                 self.positions_part = (self.positions_part + self.Lbox) % self.Lbox
+
+            # Subsample particles if requested
+            if particle_fraction < 1.0:
+                self.positions_part = self._subsample_array(
+                    self.positions_part, particle_fraction, particle_subsample_seed
+                )
 
         # === TRIAXIAL SHAPES ===
         if self.triaxial_NFW:
@@ -609,7 +632,149 @@ class HaloOccupation:
 
         return rp_centers, ds_total
 
+    def compute_avg_clustering(self, dict_params: Dict[str, float],
+                               n_realizations: int, mode: str,
+                               bins1: Union[int, Any],
+                               bins2: Optional[Any] = None,
+                               output: str = 'auto',
+                               catalog2: Optional[Any] = None,
+                               base_seed: int = 1000,
+                               use_fast: bool = True) -> tuple:
+        """
+        Compute averaged galaxy clustering over multiple HOD realizations.
 
+        Parameters
+        ----------
+        dict_params : dict
+            HOD parameter dictionary (see populate_haloes)
+        n_realizations : int
+            Number of independent HOD realizations to average over
+        mode : str
+            Correlation function mode ('s', 'smu', 'rppi')
+        bins1 : int or array-like
+            Primary binning edges
+        bins2 : array-like, optional
+            Secondary binning edges
+        output : str, default='auto'
+            Output format ('auto', 'multipoles', 'wp')
+        catalog2 : array-like, optional
+            Second catalog for cross-correlation
+        base_seed : int, default=1000
+            Base random seed; realization i uses base_seed + i
+        use_fast : bool, default=True
+            Use optimized satellite positioning
+
+        Returns
+        -------
+        r : array-like
+            Bin centers or separation values
+        xi_mean : array-like
+            Mean correlation function across realizations
+        xi_std : array-like
+            Sample standard deviation (ddof=1) across realizations
+        """
+        results = []
+        for i in range(n_realizations):
+            self.populate_haloes(dict_params, random_seed=base_seed + i,
+                                 use_fast=use_fast)
+            r, xi = self.compute_galaxy_clustering(
+                mode, bins1, catalog2=catalog2, bins2=bins2, output=output
+            )
+            results.append(xi)
+        all_results = np.array(results)
+        return r, all_results.mean(axis=0), all_results.std(axis=0, ddof=1)
+
+    def compute_avg_lensing(self, dict_params: Dict[str, float],
+                            n_realizations: int,
+                            bins1: Union[int, Any],
+                            method: str = 'standard',
+                            precomputed_cache: Optional[Any] = None,
+                            bins_comp: Optional[Any] = None,
+                            output: str = 'xi',
+                            bins2: Optional[Any] = None,
+                            galaxy_fraction: float = 1.0,
+                            base_seed: int = 1000,
+                            use_fast: bool = True) -> tuple:
+        """
+        Compute averaged galaxy-galaxy lensing over multiple HOD realizations.
+
+        Parameters
+        ----------
+        dict_params : dict
+            HOD parameter dictionary (see populate_haloes)
+        n_realizations : int
+            Number of independent HOD realizations to average over
+        bins1 : int or array-like
+            Primary binning edges for projected separation [Mpc/h]
+        method : str, default='standard'
+            Lensing method: 'standard' (pycorr pair counting) or 'optimized'
+            (precomputed halo-center profiles)
+        precomputed_cache : HaloCenterLensingCache, optional
+            Required when method='optimized'
+        bins_comp : array-like, optional
+            Binning for completeness calculation. Default: geomspace(5e-3, 120, 151)
+        output : str, default='xi'
+            Output format
+        bins2 : array-like, optional
+            Secondary binning edges
+        galaxy_fraction : float, default=1.0
+            Fraction of galaxies to keep per realization (0 < f <= 1)
+        base_seed : int, default=1000
+            Base random seed; realization i uses base_seed + i
+        use_fast : bool, default=True
+            Use optimized satellite positioning
+
+        Returns
+        -------
+        rp : array-like
+            Projected separation bin centers [Mpc/h]
+        ds_mean : array-like
+            Mean DeltaSigma across realizations [Msun h/pc^2]
+        ds_std : array-like
+            Sample standard deviation (ddof=1) across realizations
+        """
+        if method not in ('standard', 'optimized'):
+            raise ValueError(f"method must be 'standard' or 'optimized', got '{method}'")
+        if method == 'optimized' and precomputed_cache is None:
+            raise ValueError("precomputed_cache required when method='optimized'")
+        if method == 'standard' and not hasattr(self, 'positions_part'):
+            raise RuntimeError("Particle data not loaded. Provide DataFrame_part during initialization.")
+
+        if bins_comp is None:
+            bins_comp = np.geomspace(5e-3, 120, 151)
+
+        results = []
+
+        if method == 'standard':
+            for i in range(n_realizations):
+                self.populate_haloes(dict_params, random_seed=base_seed + i,
+                                     use_fast=use_fast)
+                gal_pos = np.array(self.positions_gal)
+                gal_pos_sub = self._subsample_array(
+                    gal_pos, galaxy_fraction,
+                    seed=base_seed + n_realizations + i
+                )
+                rp, ds = compute_galaxy_lensing(
+                    gal_pos_sub, self.positions_part, self.Lbox,
+                    self.rsd_axis, self.RHO_M, bins1,
+                    output=output, bins2=bins2, bins_comp=bins_comp
+                )
+                results.append(ds)
+
+        elif method == 'optimized':
+            for i in range(n_realizations):
+                self.populate_haloes(dict_params, random_seed=base_seed + i,
+                                     use_fast=use_fast)
+                rp, ds = self.compute_galaxy_lensing_optimized(
+                    bins1, precomputed_cache,
+                    output=output, bins2=bins2, bins_comp=bins_comp,
+                    galaxy_subsample_fraction=galaxy_fraction,
+                    galaxy_subsample_seed=base_seed + n_realizations + i
+                )
+                results.append(ds)
+
+        all_results = np.array(results)
+        return rp, all_results.mean(axis=0), all_results.std(axis=0, ddof=1)
 
 
 
