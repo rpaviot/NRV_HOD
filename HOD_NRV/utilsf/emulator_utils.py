@@ -75,8 +75,8 @@ def compute_ngal_with_fiducial_Ac(
 
     Examples
     --------
-    >>> from HOD_NRV.HOD_catalogue import HaloOccupation
-    >>> from HOD_NRV.emulator_utils import compute_ngal_with_fiducial_Ac
+    >>> from HOD_NRV.HOD_numerical.HOD import HaloOccupation
+    >>> from HOD_NRV.utilsf.emulator_utils import compute_ngal_with_fiducial_Ac
     >>>
     >>> halo = HaloOccupation(cosmology=cosmo, zeff=1.0, Lbox=1000, ...)
     >>> halo.set_halo_model("ELG_GHOD")
@@ -411,8 +411,8 @@ def generate_hod_parameter_grid(
 
     Examples
     --------
-    >>> from HOD_NRV.HOD_catalogue import HaloOccupation
-    >>> from HOD_NRV.emulator_utils import generate_hod_parameter_grid
+    >>> from HOD_NRV.HOD_numerical.HOD import HaloOccupation
+    >>> from HOD_NRV.utilsf.emulator_utils import generate_hod_parameter_grid
     >>>
     >>> # Setup halo catalog
     >>> halo = HaloOccupation(

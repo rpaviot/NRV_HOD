@@ -27,35 +27,19 @@ then feeds into the standard DeltaSigmaCalculator pipeline.
 References
 ----------
 .. [1] Yuan et al. (2021), MNRAS, arXiv:2110.11412 (AbacusHOD paper)
-.. [2] Mandelbaum et al. (2006), MNRAS 368, 715
 """
 
 import os
 import time
+import multiprocessing as mp
 import numpy as np
 import h5py
 from typing import Dict, Optional, Tuple
-from concurrent.futures import ThreadPoolExecutor
 from scipy.spatial import cKDTree
-from scipy.special import roots_legendre
-
-import jax
-import jax.numpy as jnp
-from jax import jit
-from interpax import interp1d as interpax_interp1d
-
-jax.config.update("jax_enable_x64", True)
 
 from .standard_two_point_calculator import (
     compute_corr, DeltaSigmaCalculator
 )
-
-# Gauss-Legendre quadrature nodes/weights (module-level, computed once)
-N_GL = 200
-_x_gl, _w_gl = roots_legendre(N_GL)
-GL_X = jnp.array(_x_gl)
-GL_W = jnp.array(_w_gl)
-
 
 def periodic_distance(pos1: np.ndarray, pos2: np.ndarray, boxsize: float) -> np.ndarray:
     """
@@ -122,46 +106,94 @@ def compute_xigm_at_position(
     return xi_gm
 
 
-def _compute_xigm_single(halo_pos, idx, particle_positions, bins, boxsize,
-                          shell_volumes, n_mean, n_comp_bins):
-    """Thread-safe xi_gm computation for a single halo."""
-    if len(idx) == 0:
-        return -np.ones(n_comp_bins)
-    delta = particle_positions[idx] - halo_pos
-    delta -= boxsize * np.round(delta / boxsize)
-    r = np.sqrt(np.einsum('ij,ij->i', delta, delta))
-    counts, _ = np.histogram(r, bins=bins)
-    return (counts / shell_volumes / n_mean) - 1.0
-
-
 # ---------------------------------------------------------------------------
-# JAX-accelerated DeltaSigma (called per-halo inside precompute loop)
+# Multiprocessing shared state + worker functions
 # ---------------------------------------------------------------------------
 
+_shared = {}
 
-@jit
-def _deltasigma_from_xigm(xi_gm, r_centers, rp_bins, RHO_M, chi_max):
-    """xi_gm (n_comp,) -> bin-averaged DeltaSigma (n_rp,). Pure JAX + GL."""
-    rp_lo, rp_hi = rp_bins[:-1], rp_bins[1:]
 
-    # SIGMA(r) = 2 * int_0^chi_max xi_gm(sqrt(r^2 + chi^2)) dchi
-    chi_nodes = 0.5 * (chi_max * GL_X + chi_max)
-    r_3d = jnp.sqrt(r_centers[:, None]**2 + chi_nodes[None, :]**2)
-    xi_interp = interpax_interp1d(r_3d.ravel(), r_centers, xi_gm, method='cubic', extrap=[xi_gm[0], 0.0]).reshape(r_3d.shape)
-    SIGMA = chi_max * jnp.dot(xi_interp, GL_W)
+def _process_batch_prequeried(halo_indices):
+    """Worker: compute xi_gm + DeltaSigma for halos with pre-queried indices."""
+    s = _shared
+    particle_positions = s['particle_positions']
+    halo_positions = s['halo_positions']
+    bins_comp = s['bins_comp']
+    shell_volumes = s['shell_volumes']
+    n_mean = s['n_mean']
+    Lbox = s['Lbox']
+    r_centers = s['r_centers']
+    rp_bins = s['rp_bins']
+    RHO_M = s['RHO_M']
+    chi_max = s['chi_max']
+    n_rp_bins = s['n_rp_bins']
+    idx_lists = s['idx_lists']
+    n_comp_bins = len(bins_comp) - 1
 
-    # SIGMA_MEAN(<r) = (2/r^2) * int_0^r Sigma(r') r' dr'
-    rp_nodes = 0.5 * r_centers[:, None] * (GL_X[None, :] + 1)
-    S_interp = interpax_interp1d(rp_nodes.ravel(), r_centers, SIGMA, method='cubic', extrap=[SIGMA[0], 0.0]).reshape(rp_nodes.shape)
-    SIGMA_MEAN = r_centers * jnp.dot(S_interp * rp_nodes, GL_W) / r_centers**2
+    results = np.empty((len(halo_indices), n_rp_bins))
 
-    DS = (SIGMA_MEAN - SIGMA) * RHO_M / 1e12
+    for k, i in enumerate(halo_indices):
+        idx = idx_lists[i]
+        if len(idx) == 0:
+            xi_gm = -np.ones(n_comp_bins)
+        else:
+            delta = particle_positions[idx] - halo_positions[i]
+            delta -= Lbox * np.round(delta / Lbox)
+            r = np.sqrt(np.einsum('ij,ij->i', delta, delta))
+            counts, _ = np.histogram(r, bins=bins_comp)
+            xi_gm = (counts / shell_volumes / n_mean) - 1.0
 
-    # Bin-average DeltaSigma over rp bins
-    bn = 0.5 * ((rp_hi - rp_lo)[:, None] * GL_X[None, :] + (rp_hi + rp_lo)[:, None])
-    DS_bn = interpax_interp1d(bn.ravel(), r_centers, DS, method='cubic', extrap=[DS[0], 0.0]).reshape(bn.shape)
-    integrals = 0.5 * (rp_hi - rp_lo) * jnp.dot(DS_bn * bn, GL_W)
-    return 2.0 * integrals / (rp_hi**2 - rp_lo**2)
+        calc = DeltaSigmaCalculator(r_centers, xi_gm, RHO_M, chi_max=chi_max)
+        results[k] = calc.compute_deltasigma_averaged(rp_bins)
+
+    return results
+
+
+def _process_batch_with_query(halo_indices):
+    """Worker: query KD-tree + compute xi_gm + DeltaSigma for halos."""
+    s = _shared
+    particle_positions = s['particle_positions']
+    halo_positions = s['halo_positions']
+    bins_comp = s['bins_comp']
+    shell_volumes = s['shell_volumes']
+    n_mean = s['n_mean']
+    Lbox = s['Lbox']
+    r_centers = s['r_centers']
+    rp_bins = s['rp_bins']
+    RHO_M = s['RHO_M']
+    chi_max = s['chi_max']
+    n_rp_bins = s['n_rp_bins']
+    search_radius = s['search_radius']
+    kdtree = s['kdtree']
+    n_comp_bins = len(bins_comp) - 1
+
+    results = np.empty((len(halo_indices), n_rp_bins))
+    sub_chunk_size = 100
+    ptr = 0
+
+    for start in range(0, len(halo_indices), sub_chunk_size):
+        sub_indices = halo_indices[start:start + sub_chunk_size]
+        sub_positions = halo_positions[sub_indices]
+        sub_idx_lists = kdtree.query_ball_point(
+            sub_positions, r=search_radius, workers=1, return_sorted=False
+        )
+
+        for j, i in enumerate(sub_indices):
+            idx = sub_idx_lists[j]
+            if len(idx) == 0:
+                xi_gm = -np.ones(n_comp_bins)
+            else:
+                delta = particle_positions[idx] - halo_positions[i]
+                delta -= Lbox * np.round(delta / Lbox)
+                r = np.sqrt(np.einsum('ij,ij->i', delta, delta))
+                counts, _ = np.histogram(r, bins=bins_comp)
+                xi_gm = (counts / shell_volumes / n_mean) - 1.0
+
+            calc = DeltaSigmaCalculator(r_centers, xi_gm, RHO_M, chi_max=chi_max)
+            results[ptr] = calc.compute_deltasigma_averaged(rp_bins)
+            ptr += 1
+
+    return results
 
 
 class HaloCenterLensingCache:
@@ -295,13 +327,14 @@ def precompute_halo_center_lensing(
     bins_comp: Optional[np.ndarray] = None,
     verbose: bool = True,
     n_workers: int = -1,
-    chunk_size: int = 500
+    prequery_all: bool = False
 ) -> HaloCenterLensingCache:
     """
-    Precompute DeltaSigma profiles at all halo centers using KD-tree + JAX.
+    Precompute DeltaSigma profiles at all halo centers using KD-tree + multiprocessing.
 
     Phase 1: Build KD-tree from particle positions.
-    Phase 2: Chunked KD-tree query + xi_gm + DeltaSigma per halo (minimal memory).
+    Phase 2: Set shared state for fork-based COW sharing.
+    Phase 3: Parallel xi_gm + DeltaSigma via multiprocessing.Pool.
 
     Parameters
     ----------
@@ -322,10 +355,13 @@ def precompute_halo_center_lensing(
     verbose : bool, default=True
         Print progress information
     n_workers : int, default=-1
-        Number of threads for parallel xi_gm computation (-1 for min(cpu_count, 8)).
-        numpy/scipy release the GIL so threads achieve real parallelism.
-    chunk_size : int, default=500
-        Number of halos per batch KD-tree query in Phase 2
+        Number of worker processes (-1 for cpu_count).
+    prequery_all : bool, default=True
+        If True (Mode 1), query ALL halos at once with workers=-1 (maximally
+        efficient KD-tree query), then distribute pre-queried indices to workers
+        via fork COW. Uses more RAM (~18 GB for downsampled case).
+        If False (Mode 2), each worker queries the shared KD-tree independently
+        for its halos. Lower RAM, slightly less efficient KD-tree queries.
 
     Returns
     -------
@@ -351,12 +387,14 @@ def precompute_halo_center_lensing(
     n_rp_bins = len(rp_bins) - 1
     search_radius = bins_comp[-1]
     r_centers = np.sqrt(bins_comp[:-1] * bins_comp[1:])
+    chi_max = 120.0
     t_total = time.time()
 
     if verbose:
         print(f"Precomputing DeltaSigma at {n_halos} halo centers...")
         print(f"  rp_bins: {n_rp_bins} bins from {rp_bins[0]:.3f} to {rp_bins[-1]:.1f} Mpc/h")
         print(f"  Particles: {len(particle_positions)}")
+        print(f"  Mode: {'prequery_all' if prequery_all else 'per-worker query'}")
 
     # ── Phase 1: KD-tree build ──
     if verbose:
@@ -367,67 +405,65 @@ def precompute_halo_center_lensing(
     if verbose:
         print(f"  Building KD-tree... done ({t_tree:.1f}s)")
 
-    # ── Phase 2: Chunked KD-tree query + xi_gm + DeltaSigma per halo ──
+    # ── Phase 2: Set shared state ──
     volume_total = Lbox**3
     n_particles_total = len(particle_positions)
-    n_comp_bins = len(bins_comp) - 1
-    all_deltasigma = np.empty((n_halos, n_rp_bins))
-
-    # Precompute constants (previously recomputed per halo)
     shell_volumes = (4.0/3.0) * np.pi * (bins_comp[1:]**3 - bins_comp[:-1]**3)
     n_mean = n_particles_total / volume_total
 
-    # Pre-convert JAX constants once (avoids repeated conversion per halo)
-    jnp_r_centers = jnp.array(r_centers)
-    jnp_rp_bins = jnp.array(rp_bins)
-    jnp_RHO_M = float(RHO_M)
-    jnp_chi_max = 100.0
+    _shared.update({
+        'particle_positions': particle_positions,
+        'halo_positions': halo_positions,
+        'bins_comp': bins_comp,
+        'shell_volumes': shell_volumes,
+        'n_mean': n_mean,
+        'Lbox': Lbox,
+        'r_centers': r_centers,
+        'rp_bins': rp_bins,
+        'RHO_M': RHO_M,
+        'chi_max': chi_max,
+        'n_rp_bins': n_rp_bins,
+        'search_radius': search_radius,
+    })
 
-    # Resolve n_workers
+    if prequery_all:
+        if verbose:
+            print(f"  Querying KD-tree for all {n_halos} halos (workers=-1)...")
+        t0 = time.time()
+        _shared['idx_lists'] = kdtree.query_ball_point(
+            halo_positions, r=search_radius, workers=-1, return_sorted=False
+        )
+        t_query = time.time() - t0
+        if verbose:
+            print(f"  KD-tree query done ({t_query:.1f}s)")
+        worker_fn = _process_batch_prequeried
+    else:
+        _shared['kdtree'] = kdtree
+        worker_fn = _process_batch_with_query
+
+    # ── Phase 3: Parallel computation ──
     if n_workers == -1:
-        n_workers = min(os.cpu_count() or 1, 8)
+        n_workers = os.cpu_count() or 1
 
     if verbose:
-        print(f"  Computing xi_gm + DeltaSigma ({n_halos} halos, chunk_size={chunk_size}, "
-              f"n_workers={n_workers})...")
+        print(f"  Computing xi_gm + DeltaSigma ({n_halos} halos, n_workers={n_workers})...")
     t0 = time.time()
 
-    n_chunks = (n_halos + chunk_size - 1) // chunk_size
-    for c in range(n_chunks):
-        i0 = c * chunk_size
-        i1 = min(i0 + chunk_size, n_halos)
-        chunk_positions = halo_positions[i0:i1]
+    all_indices = np.arange(n_halos)
+    batches = [arr.tolist() for arr in np.array_split(all_indices, n_workers)]
 
-        # Batch KD-tree query for the whole chunk
-        idx_lists = kdtree.query_ball_point(
-            chunk_positions, r=search_radius,
-            workers=-1, return_sorted=False
-        )
+    ctx = mp.get_context('fork')
+    with ctx.Pool(n_workers) as pool:
+        results = pool.map(worker_fn, batches)
 
-        # Parallel xi_gm computation via threads (numpy/scipy release the GIL)
-        with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = [
-                pool.submit(
-                    _compute_xigm_single,
-                    chunk_positions[j], idx_lists[j], particle_positions,
-                    bins_comp, Lbox, shell_volumes, n_mean, n_comp_bins
-                )
-                for j in range(i1 - i0)
-            ]
-            for j, fut in enumerate(futures):
-                xi_gm_j = fut.result()
-                all_deltasigma[i0 + j] = np.array(_deltasigma_from_xigm(
-                    jnp.array(xi_gm_j), jnp_r_centers, jnp_rp_bins,
-                    jnp_RHO_M, jnp_chi_max
-                ))
+    all_deltasigma = np.vstack(results)
 
-        if verbose and (c % 10 == 0 or c == n_chunks - 1):
-            elapsed = time.time() - t0
-            print(f"    chunk {c+1}/{n_chunks} ({i1}/{n_halos} halos, {elapsed:.1f}s)")
-
-    t_phase2 = time.time() - t0
+    t_phase3 = time.time() - t0
     if verbose:
-        print(f"  xi_gm + DeltaSigma complete ({t_phase2:.1f}s)")
+        print(f"  xi_gm + DeltaSigma complete ({t_phase3:.1f}s)")
+
+    # ── Phase 4: Cleanup + return ──
+    _shared.clear()
 
     t_elapsed = time.time() - t_total
     if verbose:

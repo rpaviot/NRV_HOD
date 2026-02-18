@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
-from HOD_NRV.HOD_numerical.twopoint_calculator import precompute_halo_center_lensing
+from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import precompute_halo_center_lensing
 
 # ============================================================================
 # Configuration (matches numerical_dsigma_example.py)
@@ -136,6 +136,7 @@ def main():
         RHO_M=halo.RHO_M,
         rp_bins=rp_bins,
         verbose=True,
+        prequery_all=False,
     )
 
     elapsed = time.perf_counter() - t0

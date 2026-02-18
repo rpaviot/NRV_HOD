@@ -17,7 +17,7 @@ import jax.numpy as jnp
 from jax import jit, vmap
 from jax.scipy.special import sici
 
-from HOD_NRV.HOD_analytical.hod_analytical import gl_integrate, GL_W, N_GL
+from .hod_analytical import gl_integrate, GL_W, N_GL
 
 jax.config.update("jax_enable_x64", True)
 

@@ -31,7 +31,7 @@ import warnings
 import os
 
 
-from HOD_NRV.HOD_analytical.halo_model import (
+from .halo_model import (
     MultiRedshiftHaloModel, HODType, CSMF_HOD,
     create_hod, CSMF_HOD_PARAMS
 )

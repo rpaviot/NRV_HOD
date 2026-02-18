@@ -3,13 +3,13 @@ import jax.random as jrandom
 from typing import Dict, Optional, Union, Any
 
 from HOD_NRV.HOD_numerical.HOD_models import Occupation
-from HOD_NRV.HOD_numerical.satellites import NFW_jax as NFWj
+from HOD_NRV.HOD_numerical.satellites.NFW_jax import create_point_on_unit_sphere
 from HOD_NRV.utilsf.data_reader import (
     read_halo_catalog, setup_cosmology, setup_data_arrays,
     setup_particle_data_arrays, setup_triaxial_shapes,
     setup_assembly_bias_data, apply_rsd_preprocessing, validate_rsd_axis
 )
-from HOD_NRV.HOD_numerical.HOD.population_engine import populate_haloes_full
+from .population_engine import populate_haloes_full
 from HOD_NRV.HOD_numerical.twopoint_calculator.standard_two_point_calculator import (
     compute_galaxy_clustering, compute_galaxy_lensing
 )
@@ -224,7 +224,7 @@ class HaloOccupation:
 
         # Pre-generate sphere points for NFW sampling
         key = jrandom.key(0)
-        self.SpherePoints = NFWj.create_point_on_unit_sphere(key)
+        self.SpherePoints = create_point_on_unit_sphere(key)
         
         # Run validation tests if requested
         if do_test:
@@ -529,7 +529,7 @@ class HaloOccupation:
         Examples
         --------
         >>> # First, create precomputed cache (one-time cost)
-        >>> from HOD_NRV.HOD_numerical.twopoint_calculator import (
+        >>> from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import (
         ...     HaloCenterLensingCache, precompute_halo_center_lensing
         ... )
         >>> cache = precompute_halo_center_lensing(

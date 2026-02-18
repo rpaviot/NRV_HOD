@@ -28,7 +28,7 @@ from typing import Dict, Optional, Any, Union, List
 
 import pyccl as ccl
 
-from HOD_NRV.HOD_analytical.emu import (
+from .emu import (
     BetaNLInterpolator, HAS_DARK_EMULATOR, HAS_INTERPAX, HAS_JAX, darkemu
 )
 

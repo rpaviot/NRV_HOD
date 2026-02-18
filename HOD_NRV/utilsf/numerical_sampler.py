@@ -14,7 +14,7 @@ import numpy as np
 from enum import IntEnum
 from typing import Dict, Optional, Tuple, Any
 
-from HOD_NRV.utilsf.emulator_utils import rescale_Ac_to_target_ngal
+from .emulator_utils import rescale_Ac_to_target_ngal
 
 
 class FitCase(IntEnum):

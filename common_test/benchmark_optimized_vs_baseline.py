@@ -21,7 +21,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
-from HOD_NRV.HOD_numerical.twopoint_calculator import HaloCenterLensingCache
+from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import HaloCenterLensingCache
 from HOD_NRV.utilsf.emulator_utils import rescale_Ac_to_target_ngal
 
 # ============================================================================
@@ -38,8 +38,8 @@ PARTICLE_SUBSAMPLE_SEED = 99
 
 # Load galaxy fraction from benchmark results
 with open("benchmark_results.json") as _f:
-    GALAXY_FRACTION = json.load(_f)["optimal"]["galaxy_fraction"]
-    #GALAXY_FRACTION = 0.2
+    #GALAXY_FRACTION = json.load(_f)["optimal"]["galaxy_fraction"]
+    GALAXY_FRACTION = 0.2
 
 
 CACHE_INPUT = "halo_center_lensing_cache.h5"

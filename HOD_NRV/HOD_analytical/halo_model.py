@@ -14,17 +14,17 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 from typing import Dict, Optional, Union, List
-from HOD_NRV.HOD_analytical.pycosmo import Cosmology
-from HOD_NRV.HOD_analytical.emu import HAS_INTERPAX
+from .pycosmo import Cosmology
+from .emu import HAS_INTERPAX
 
-from HOD_NRV.HOD_analytical.hod_analytical import (
+from .hod_analytical import (
     N_GL, GL_X, GL_W, gl_nodes_scaled, gl_integrate,
     HOD_PARAM_DEFINITIONS, CSMF_HOD_PARAMS,
     get_required_params, validate_hod_params,
     AnalyticalHOD, StandardHOD, CSMF_HOD, create_hod,
 )
 
-from HOD_NRV.HOD_analytical.power_spectrum import (
+from .power_spectrum import (
     nfw_fourier_u, nfw_fourier_u_single,
     _compute_ngal, _compute_Pgg, _compute_Pgm,
     _compute_Pgg_with_beta_nl, _compute_Pgm_with_beta_nl,

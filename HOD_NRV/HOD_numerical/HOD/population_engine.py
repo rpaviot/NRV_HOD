@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from typing import Tuple, Optional
 
-from HOD_NRV.HOD_numerical.satellites import NFW_jax as NFWj
+from HOD_NRV.HOD_numerical.satellites.NFW_jax import position_satellites, dispersion_velocities_satellites
 from HOD_NRV.utilsf.utils_functions import random_uniform_jax, random_poisson_jax
 
 
@@ -241,7 +241,7 @@ def populate_satellites(key_s: jrandom.PRNGKey,
     )
     
     # Sample satellite positions using unified NFW interface
-    sat_positions = NFWj.position_satellites(
+    sat_positions = position_satellites(
         key=key_s_pos,
         SpherePoints=SpherePoints,
         halo_centers=filtered['positions'],
@@ -259,7 +259,7 @@ def populate_satellites(key_s: jrandom.PRNGKey,
     )
     
     # Sample satellite velocities from dispersion model
-    sat_velocities = NFWj.dispersion_velocities_satellites(
+    sat_velocities = dispersion_velocities_satellites(
         key_s_vel, filtered['velocities'], filtered['vrms'], N_s_filtered, N_s_tot
     )
     
