@@ -65,10 +65,11 @@ cosmo_params = {
 
 base_hod_params = {
     "As": 0.3,
-    "Mmin": 13.0,
+    "Mmin": 12.7,
     "sig_M": 0.3,
     "M1": 13.0,
-    "alpha": 0.80,
+    "gamma":5.0,
+    "alpha": 1.10,
     "kappa": 0.80,
 }
 

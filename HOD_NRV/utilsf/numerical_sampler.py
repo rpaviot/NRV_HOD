@@ -15,6 +15,7 @@ from enum import IntEnum
 from typing import Dict, Optional, Tuple, Any
 
 from .emulator_utils import rescale_Ac_to_target_ngal
+from HOD_NRV.HOD_numerical.HOD import HaloOccupation
 
 
 class FitCase(IntEnum):
@@ -61,8 +62,40 @@ class NumericalDeltaSigmaFitter:
 
     Parameters
     ----------
-    halo : HaloOccupation
-        Initialized HaloOccupation instance with particle data and precomputed cache.
+    cosmology : dict
+        Cosmological parameters passed to HaloOccupation.
+    zeff : float
+        Effective redshift.
+    Lbox : float
+        Box side length [Mpc/h].
+    column_mapping : dict
+        Maps internal column names to catalog column names.
+    mass_definition : str
+        Halo mass definition (e.g. "200c").
+    DataFrame : pd.DataFrame, optional
+        Halo catalog DataFrame.
+    halo_path : str, optional
+        Path to halo catalog parquet file (used if DataFrame is None).
+    DataFrame_part : pd.DataFrame, optional
+        Particle catalog DataFrame.
+    assembly_bias : bool
+        Enable assembly bias weighting.
+    NFW_scaled : bool
+        Use mass-concentration scaled NFW profile.
+    outerprofile : bool
+        Include outer halo profile term.
+    apply_rsd : bool
+        Apply redshift-space distortions.
+    triaxial_NFW : bool or object
+        Triaxial NFW profile option.
+    rsd_axis : str
+        Axis along which RSD is applied ('x', 'y', or 'z').
+    do_test : bool
+        Run internal consistency checks at init.
+    particle_fraction : float
+        Fraction of particles to subsample (1.0 = all particles).
+    particle_subsample_seed : int
+        Random seed for particle subsampling.
     precomputed_cache : HaloCenterLensingCache
         Loaded from HDF5 via HaloCenterLensingCache.load().
     fit_case : FitCase
@@ -81,22 +114,56 @@ class NumericalDeltaSigmaFitter:
         Projected separation bin edges [Mpc/h]. If None, loaded from data file.
     base_seed : int
         Base random seed for HOD realizations.
+    rp_min : float, optional
+        Minimum projected separation scale cut [Mpc/h]. Bins below this are excluded.
+    rp_max : float, optional
+        Maximum projected separation scale cut [Mpc/h]. Bins above this are excluded.
     """
 
     def __init__(
         self,
-        halo,
-        precomputed_cache,
-        fit_case: FitCase,
-        data_path: str,
+        # --- HaloOccupation constructor args ---
+        cosmology: Dict[str, float],
+        zeff: float,
+        Lbox: float,
+        column_mapping: Dict[str, str],
+        mass_definition: str,
+        DataFrame=None,
+        halo_path: Optional[str] = None,
+        DataFrame_part=None,
+        assembly_bias: bool = False,
+        NFW_scaled: bool = True,
+        outerprofile: bool = True,
+        apply_rsd: bool = True,
+        triaxial_NFW=False,
+        rsd_axis: str = 'z',
+        do_test: bool = True,
+        particle_fraction: float = 1.0,
+        particle_subsample_seed: int = 42,
+        # --- Precomputed cache (still passed externally) ---
+        precomputed_cache=None,
+        # --- Fitter-specific args ---
+        fit_case: FitCase = FitCase.STANDARD_NFW,
+        data_path: str = "",
         target_ngal: float = 2.3e-4,
         n_realizations: int = 5,
         galaxy_fraction: float = 0.1,
         M1_fixed: float = 13.0,
         rp_bins=None,
         base_seed: int = 1000,
+        # --- Scale cuts ---
+        rp_min: Optional[float] = None,
+        rp_max: Optional[float] = None,
     ):
-        self.halo = halo
+        self.halo = HaloOccupation(
+            cosmology=cosmology, zeff=zeff, Lbox=Lbox,
+            column_mapping=column_mapping, mass_definition=mass_definition,
+            DataFrame=DataFrame, halo_path=halo_path, DataFrame_part=DataFrame_part,
+            assembly_bias=assembly_bias, NFW_scaled=NFW_scaled, outerprofile=outerprofile,
+            apply_rsd=apply_rsd, triaxial_NFW=triaxial_NFW, rsd_axis=rsd_axis,
+            do_test=do_test, particle_fraction=particle_fraction,
+            particle_subsample_seed=particle_subsample_seed,
+        )
         self.precomputed_cache = precomputed_cache
         self.fit_case = FitCase(fit_case)
         self.target_ngal = target_ngal
@@ -104,6 +171,8 @@ class NumericalDeltaSigmaFitter:
         self.galaxy_fraction = galaxy_fraction
         self.M1_fixed = M1_fixed
         self.base_seed = base_seed
+        self.rp_min = rp_min
+        self.rp_max = rp_max
 
         # Configure HOD model
         use_conformity = (self.fit_case == FitCase.CONFORMITY)
@@ -114,7 +183,7 @@ class NumericalDeltaSigmaFitter:
         self.param_names = [p[0] for p in self.free_params]
         self.n_params = len(self.free_params)
 
-        # Load observed data
+        # Load observed data (scale cuts applied inside)
         self._load_data(data_path)
 
         # Override rp_bins if provided
@@ -165,12 +234,26 @@ class NumericalDeltaSigmaFitter:
             raise KeyError("Data file must contain 'delta_sigma' or 'dsigma'")
 
         # Covariance
-        for key in ("covariance", "cov"):
+        for key in ("cov_delta_sigma", "cov_dsigma"):
             if key in data:
                 self.cov = data[key]
                 break
         else:
-            raise KeyError("Data file must contain 'covariance' or 'cov'")
+            raise KeyError("Data file must contain 'cov_delta_sigma' or 'cov_dsigma'")
+
+        # Apply scale cuts
+        mask = np.ones(len(self.rp), dtype=bool)
+        if self.rp_min is not None:
+            mask &= (self.rp >= self.rp_min)
+        if self.rp_max is not None:
+            mask &= (self.rp <= self.rp_max)
+
+        if not mask.all():
+            self.rp     = self.rp[mask]
+            self.ds_obs = self.ds_obs[mask]
+            self.cov    = self.cov[np.ix_(mask, mask)]
+            idx = np.where(mask)[0]
+            self.rp_bins = self.rp_bins[idx[0] : idx[-1] + 2]
 
         self.cov_inv = np.linalg.inv(self.cov)
         self.n_bins = len(self.ds_obs)
