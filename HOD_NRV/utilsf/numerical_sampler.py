@@ -26,7 +26,7 @@ class FitCase(IntEnum):
 
 # Parameter definitions per case: (name, low, high)
 _BASE_PARAMS = [
-    ("ratio_As_Ac", 0.1, 3.0),
+    ("As",          0.002, 0.05),
     ("Mmin",        11.5, 13.5),
     ("sig_M",       0.1, 2.0),
     ("gamma",       0.0, 10.0),
@@ -258,21 +258,18 @@ class NumericalDeltaSigmaFitter:
         self.cov_inv = np.linalg.inv(self.cov)
         self.n_bins = len(self.ds_obs)
 
-    def _derive_Ac_As(self, ratio_As_Ac: float, params_no_AcAs: dict) -> Tuple[float, float]:
-        """Derive Ac and As from the ratio and target ngal.
+    def _derive_Ac_As(self, As_sampled: float, params_no_AcAs: dict) -> Tuple[float, float]:
+        """Derive Ac and As by rescaling to target_ngal.
 
-        Steps:
-        1. Set As_fid = ratio_As_Ac * Ac_fid (with Ac_fid = 1.0)
-        2. Call rescale_Ac_to_target_ngal → Ac_new, As_new
-        3. The ratio As/Ac is preserved by the rescaling.
+        Ac_fid = 0.01; As_sampled is passed directly. Both are rescaled
+        proportionally by rescale_Ac_to_target_ngal to hit target_ngal.
 
         Returns (Ac_new, As_new).
         """
-        Ac_fid = 1.0
-        As_fid = ratio_As_Ac * Ac_fid
+        Ac_fid = 0.01
 
         params_for_rescale = params_no_AcAs.copy()
-        params_for_rescale["As"] = As_fid
+        params_for_rescale["As"] = As_sampled
 
         Ac_new, As_new = rescale_Ac_to_target_ngal(
             self.halo.HOD, params_for_rescale, self.target_ngal, Ac_fiducial=Ac_fid
@@ -286,7 +283,7 @@ class NumericalDeltaSigmaFitter:
         """
         free_dict = dict(zip(self.param_names, theta))
 
-        ratio_As_Ac = free_dict.pop("ratio_As_Ac")
+        As_sampled = free_dict.pop("As")
 
         # Build the non-Ac/As params needed for ngal rescaling
         params_no_AcAs = {
@@ -299,7 +296,7 @@ class NumericalDeltaSigmaFitter:
         }
 
         try:
-            Ac, As = self._derive_Ac_As(ratio_As_Ac, params_no_AcAs)
+            Ac, As = self._derive_Ac_As(As_sampled, params_no_AcAs)
         except Exception:
             return None
 
