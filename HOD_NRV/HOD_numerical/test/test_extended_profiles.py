@@ -10,7 +10,6 @@ import numpy as np
 import jax.numpy as jnp
 import jax.random as jrandom
 from HOD_NRV.HOD_numerical.satellites.NFW_jax import (
-    create_point_on_unit_sphere,
     extended_elliptical_NFW_satellites_positions
 )
 
@@ -43,13 +42,10 @@ def test_extended_elliptical_profile():
     lambda_NFW = 1.0
 
     # Generate satellites
-    key = jrandom.PRNGKey(42)
-    SpherePoints = create_point_on_unit_sphere(key)
     key_pos = jrandom.PRNGKey(123)
 
     sat_positions = 1000 * extended_elliptical_NFW_satellites_positions(
         key_pos,
-        SpherePoints,
         jnp.array([center]),
         jnp.array([Rvir]),
         jnp.array([c_true]),

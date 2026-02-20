@@ -8,7 +8,7 @@ import jax.numpy as jnp
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from HOD_NRV.HOD_numerical.satellites.NFW_jax import create_point_on_unit_sphere, spherical_NFW_satellites_positions, elliptical_NFW_satellites_positions
+from HOD_NRV.HOD_numerical.satellites.NFW_jax import spherical_NFW_satellites_positions, elliptical_NFW_satellites_positions
 
 def random_orthonormal_basis(seed=None):
     if seed is not None:
@@ -33,9 +33,6 @@ def spherical_nfw_null_test():
     N_s = 100_000
 
     # Sample satellites
-    key = jrandom.PRNGKey(0)
-    SpherePoints = create_point_on_unit_sphere(key)
-    
     key_pos = jrandom.PRNGKey(1)
     cent = jnp.array([center])
     rvir = jnp.array([Rvir])
@@ -43,7 +40,7 @@ def spherical_nfw_null_test():
     N_s_arr = jnp.array([N_s])
     N_s_tot = int(jnp.sum(N_s_arr))
 
-    sat_pos = 1000*spherical_NFW_satellites_positions(key_pos, SpherePoints, cent, rvir, c_arr, N_s_arr, N_s_tot)
+    sat_pos = 1000*spherical_NFW_satellites_positions(key_pos, cent, rvir, c_arr, N_s_arr, N_s_tot)
     sat_pos_np = np.array(sat_pos)
 
     # Radial distances
@@ -96,8 +93,6 @@ def triaxial_nfw_null_test(Q):
     shape_matrices = jnp.stack([raw_basis])  # shape (1,3,3)
 
     # --- JAX setup ---
-    key = jrandom.PRNGKey(0)
-    SpherePoints = create_point_on_unit_sphere(key)
     key_s_pos = jrandom.PRNGKey(1)
     halo_centers = jnp.array([center])
     Rvir_arr = jnp.array([Rvir])
@@ -108,7 +103,6 @@ def triaxial_nfw_null_test(Q):
     # --- Generate satellites using the ellipsoidal sampler ---
     sat_positions = 1000*elliptical_NFW_satellites_positions(
         key_s_pos,
-        SpherePoints,
         halo_centers,
         Rvir_arr,
         c_arr,

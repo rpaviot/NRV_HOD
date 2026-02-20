@@ -4,8 +4,8 @@ Numerical DeltaSigma Regression Test
 
 Fast regression test for the numerical HOD pipeline (population engine,
 NFW profiles, two-point calculator).  Uses the optimal downsampling settings
-from benchmark_results.json (5% particles, 10% galaxies, 5 realizations,
-use_fast=True) to run in ~3 s per realization instead of ~120 s.
+from benchmark_results.json (5% particles, 10% galaxies, 5 realizations)
+to run in ~3 s per realization instead of ~120 s.
 
 The mean DeltaSigma is compared against the full-resolution baseline stored
 in baseline_dsigma_cache.npz (10 realizations, 100% particles/galaxies).
@@ -75,13 +75,13 @@ cosmo_params = {
 
 base_hod_params = {
     "As": 0.3,
-    "Mmin": 13.0,
+    "Mmin": 12.7,
     "sig_M": 0.3,
     "M1": 13.0,
-    "alpha": 0.80,
+    "gamma":5.0,
+    "alpha": 1.10,
     "kappa": 0.80,
 }
-
 target_ngal = 2e-4  # (Mpc/h)^-3
 
 # Lensing bins (same as baseline)
@@ -204,8 +204,8 @@ def main():
     )
 
     # --- Set HOD model and rescale Ac/As ---
-    print("\nSetting HOD model: ELG_GHOD")
-    halo.set_halo_model("ELG_GHOD")
+    print("\nSetting HOD model: ELG_mHMQ")
+    halo.set_halo_model("ELG_mHMQ")
 
     print(f"Rescaling Ac/As to target n_gal = {target_ngal:.2e} (Mpc/h)^-3 ...")
     Ac_rescaled, As_rescaled = rescale_Ac_to_target_ngal(
@@ -230,7 +230,7 @@ def main():
     # --- JIT warmup ---
     print("\nWarming up JAX JIT (throw-away population)...")
     t0 = time.perf_counter()
-    halo.populate_haloes(hod_params, random_seed=0, use_fast=True)
+    halo.populate_haloes(hod_params, random_seed=0)
     warmup_time = time.perf_counter() - t0
     print(f"  Warmup time: {fmt_time(warmup_time)}")
 
@@ -245,9 +245,8 @@ def main():
         seed = BASE_SEED + i
         print(f"  Realization {i+1}/{n_real} (seed={seed})...", end=" ", flush=True)
 
-        # Populate with use_fast=True
         t_pop = time.perf_counter()
-        halo.populate_haloes(hod_params, random_seed=seed, use_fast=True)
+        halo.populate_haloes(hod_params, random_seed=seed)
         t_pop = time.perf_counter() - t_pop
 
         n_gal = len(halo.positions_gal)

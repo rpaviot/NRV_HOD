@@ -1,9 +1,6 @@
-
-import jax.random as jrandom
 from typing import Dict, Optional, Union, Any
 
 from HOD_NRV.HOD_numerical.HOD_models import Occupation
-from HOD_NRV.HOD_numerical.satellites.NFW_jax import create_point_on_unit_sphere
 from HOD_NRV.utilsf.data_reader import (
     read_halo_catalog, setup_cosmology, setup_data_arrays,
     setup_particle_data_arrays, setup_triaxial_shapes,
@@ -18,12 +15,12 @@ import numpy as np
 class HaloOccupation:
     """
     Main class for populating dark matter halos with galaxies using HOD models.
-    
+
     This class provides a complete interface for Halo Occupation Distribution (HOD)
     modeling of galaxy populations in cosmological simulations. It handles data
     loading, cosmological setup, galaxy population, and two-point function
     calculations.
-    
+
     Parameters
     ----------
     cosmology : dict
@@ -58,12 +55,12 @@ class HaloOccupation:
         Axis along which to apply RSD ('x', 'y', or 'z')
     do_test : bool, default=True
         Whether to run validation tests on initialization
-        
+
     Attributes
     ----------
     positions : jnp.ndarray, shape (N_halos, 3)
         Halo positions [Mpc/h]
-    velocities : jnp.ndarray, shape (N_halos, 3) 
+    velocities : jnp.ndarray, shape (N_halos, 3)
         Halo velocities [km/s]
     mass : jnp.ndarray, shape (N_halos,)
         Halo masses [Msun/h]
@@ -79,7 +76,7 @@ class HaloOccupation:
         Fraction of galaxies that are satellites (N_satellites / N_total)
     cent_halo_indices : jnp.ndarray, shape (N_centrals,)
         Indices of halos hosting central galaxies (for optimized lensing)
-        
+
     Examples
     --------
     >>> # Basic usage
@@ -88,20 +85,20 @@ class HaloOccupation:
     ...     zeff=1.0, Lbox=1000, column_mapping=cm,
     ...     mass_definition="Mvir", DataFrame=df
     ... )
-    >>> 
+    >>>
     >>> # Set HOD model and populate
     >>> halo.set_halo_model("LRG")
     >>> halo.populate_haloes({"Ac": 1.0, "Mmin": 13.0, "sig_M": 0.5, ...})
-    >>> 
+    >>>
     >>> # Compute clustering
     >>> r, xi = halo.compute_galaxy_clustering('s', bins)
-    
+
     Notes
     -----
     This class integrates data reading, cosmological calculations, galaxy
     population algorithms, and statistical measurements into a unified
     interface for HOD modeling workflows.
-    
+
     References
     ----------
     .. [1] Berlind & Weinberg (2002), ApJ 575, 587
@@ -134,7 +131,6 @@ class HaloOccupation:
                  DataFrame_part: Optional[Any] = None,
                  assembly_bias: bool = False,
                  NFW_scaled: bool = True,
-
                  outerprofile: bool = True,
                  apply_rsd: bool = True,
                  triaxial_NFW: Union[bool, str] = False,
@@ -142,7 +138,7 @@ class HaloOccupation:
                  do_test: bool = True,
                  particle_fraction: float = 1.0,
                  particle_subsample_seed: int = 42):
-        
+
         # Store configuration parameters
         self.dict_cosmology = cosmology
         self.zeff = zeff
@@ -153,7 +149,6 @@ class HaloOccupation:
         self.triaxial_NFW = bool(triaxial_NFW) if isinstance(triaxial_NFW, str) else triaxial_NFW
         self.NFW_scaled = NFW_scaled
         self.outerprofile = outerprofile
-        
 
         # Validate and store RSD axis
         self.rsd_axis = rsd_axis
@@ -162,13 +157,13 @@ class HaloOccupation:
         # === DATA LOADING ===
         # Read halo catalog
         self.DataFrame = read_halo_catalog(halo_path=halo_path, DataFrame=DataFrame)
-        
+
         # Store particle data if provided
         if DataFrame_part is not None:
             self.DataFrame_part = DataFrame_part
 
         # === COSMOLOGICAL SETUP ===
-        (self.cosmology, self.RHO_M, self.rsd_factor, 
+        (self.cosmology, self.RHO_M, self.rsd_factor,
          self.logM_bins, self.mass_function) = setup_cosmology(
             self.dict_cosmology, self.zeff, self.mass_definition
         )
@@ -178,13 +173,13 @@ class HaloOccupation:
          self.concentration, self.vrms, self.logM) = setup_data_arrays(
             self.DataFrame, column_mapping
         )
-        
+
         # === PARTICLE DATA ARRAYS ===
         if DataFrame_part is not None:
             self.positions_part, self.velocities_part = setup_particle_data_arrays(
                 self.DataFrame_part, column_mapping
             )
-            
+
             # Apply RSD preprocessing to particles if requested
             if self.apply_rsd:
                 self.positions_part = apply_rsd_preprocessing(
@@ -217,48 +212,41 @@ class HaloOccupation:
         else:
             self.fI = None
             self.fE = None
-    
 
         # Store number of halos
         self.n_halos = len(self.DataFrame)
 
-        # Pre-generate sphere points for NFW sampling
-        key = jrandom.key(0)
-        self.SpherePoints = create_point_on_unit_sphere(key)
-        
         # Run validation tests if requested
         if do_test:
             from ..test import test_satellites
             test_satellites.run_all_tests()
 
-
-
     def set_halo_model(self, hod_type: str, conformity: bool = False):
         """
         Configure the Halo Occupation Distribution model.
-        
+
         Parameters
         ----------
         hod_type : str
             HOD model type. Options:
             - "LRG": Error function (erf) model for Luminous Red Galaxies
-            - "ELG_GHOD": Gaussian HOD model for Emission Line Galaxies  
+            - "ELG_GHOD": Gaussian HOD model for Emission Line Galaxies
             - "ELG_SFR": Star Formation Rate based ELG model
         conformity : bool, default=False
             Whether to use AbacusHOD-style conformity for satellites.
             When True, satellite occupation depends on actual central
             galaxy realization rather than just central probability.
-            
+
         Examples
         --------
         >>> halo.set_halo_model("LRG")  # Standard LRG model
         >>> halo.set_halo_model("ELG_GHOD", conformity=True)  # ELG with conformity
-        
+
         Notes
         -----
         This method must be called before `populate_haloes()` to define
         the HOD model parameters and occupation functions.
-        
+
         The conformity parameter enables satellite occupation to depend
         on whether a central galaxy is actually realized (not just the
         probability of central occupation). This follows the AbacusHOD
@@ -270,56 +258,47 @@ class HaloOccupation:
             fI=self.fI, fE=self.fE
         )
 
-
-
-
-
-
     def populate_haloes(self, dict_params: Dict[str, float],
-                       random_seed: Optional[int] = None,
-                       use_fast: bool = True) -> None:
+                       random_seed: Optional[int] = None) -> None:
         """
         Populate halos with galaxies using the configured HOD model.
-        
+
         This method orchestrates the complete galaxy population workflow:
         1. Compute central and satellite occupation probabilities
         2. Populate central galaxies at halo centers
-        3. Populate satellite galaxies using NFW density profiles  
+        3. Populate satellite galaxies using NFW density profiles
         4. Apply redshift space distortions if requested
         5. Store results in self.positions_gal and self.velocities_gal
-        
+
         Parameters
         ----------
         dict_params : dict
             HOD parameter dictionary. Required keys depend on the HOD model:
-            
+
             For LRG models:
             - "Ac": Central amplitude
             - "Mmin": Minimum mass threshold [log10(Msun/h)]
             - "sig_M": Mass scatter parameter
-            - "As": Satellite amplitude  
+            - "As": Satellite amplitude
             - "M1": Satellite mass scale [log10(Msun/h)]
             - "alpha": Satellite power law index
             - "kappa": Satellite cutoff parameter
-            
+
             Additional parameters for conformity models:
             - "M1_EE": Satellite mass scale when central present
-            
+
             Additional parameters for assembly bias:
             - "A_cent", "B_cent": Central assembly bias coefficients
             - "A_sat", "B_sat": Satellite assembly bias coefficients
-            
+
             Additional parameters for extended NFW profiles:
             - "f_exp": Exponential component fraction [0, 1] (default: 0.0)
             - "tau": Exponential decay scale in units of Rs (default: 6.0)
             - "lambda_NFW": NFW profile rescaling factor (default: 1.0)
-        
+
         random_seed : int, optional
             Random seed for reproducible galaxy populations.
             If None, uses a random seed.
-        use_fast : bool, default=True
-            If True, use optimized satellite positioning (~10-100x faster).
-            If False, use original functions (for testing/comparison).
 
         Examples
         --------
@@ -329,33 +308,33 @@ class HaloOccupation:
         ...     "As": 1.0, "M1": 14.0, "alpha": 1.0, "kappa": 1.0
         ... }
         >>> halo.populate_haloes(params)
-        >>> 
+        >>>
         >>> # Access populated galaxies
         >>> galaxy_positions = halo.positions_gal
         >>> galaxy_velocities = halo.velocities_gal
         >>> sat_fraction = halo.satellite_fraction
-        
+
         Notes
         -----
         After calling this method, galaxy positions and velocities are
         available in `self.positions_gal` and `self.velocities_gal`.
         The satellite fraction is available in `self.satellite_fraction`.
-        
+
         For conformity models, satellite occupation depends on actual
         central galaxy realization rather than just central probability.
-        
+
         Extended NFW profiles are used automatically when f_exp > 0
         or lambda_NFW ≠ 1 in the parameter dictionary, providing more
         flexible satellite positioning.
         """
         if not hasattr(self, 'HOD'):
             raise RuntimeError("HOD model not set. Call set_halo_model() first.")
-            
+
         # Extract extended NFW parameters from dict_params (with defaults)
         f_exp = dict_params.get('f_exp', 0.0)
-        tau = dict_params.get('tau', 6.0) 
+        tau = dict_params.get('tau', 6.0)
         lambda_NFW = dict_params.get('lambda_NFW', 1.0)
-        
+
         # Use the population engine for the complete workflow
         (self.positions_gal, self.velocities_gal,
          self.satellite_fraction, self.cent_halo_indices) = populate_haloes_full(
@@ -368,7 +347,6 @@ class HaloOccupation:
             logM=self.logM,
             hod_model=self.HOD,
             dict_params=dict_params,
-            SpherePoints=self.SpherePoints,
             triaxial_NFW=self.triaxial_NFW,
             shapes=self.shapes,
             ratios=self.ratios,
@@ -379,18 +357,16 @@ class HaloOccupation:
             rsd_factor=self.rsd_factor,
             rsd_axis_index=self.rsd_axis_index,
             Lbox=self.Lbox,
-            random_seed=random_seed,
-            use_fast=use_fast
+            random_seed=random_seed
         )
 
-
-    def compute_galaxy_clustering(self, mode: str, bins1: Union[int, Any], 
+    def compute_galaxy_clustering(self, mode: str, bins1: Union[int, Any],
                                  catalog2: Optional[Any] = None,
                                  bins2: Optional[Any] = None,
                                  output: str = 'auto') -> tuple:
         """
         Compute galaxy clustering correlation function.
-        
+
         Parameters
         ----------
         mode : str
@@ -403,14 +379,14 @@ class HaloOccupation:
             Secondary binning edges
         output : str, default='auto'
             Output format ('auto', 'multipoles', 'wp')
-            
+
         Returns
         -------
         r : array-like
             Bin centers or separation values
         xi : array-like
             Correlation function values
-            
+
         Raises
         ------
         RuntimeError
@@ -418,22 +394,21 @@ class HaloOccupation:
         """
         if not hasattr(self, 'positions_gal'):
             raise RuntimeError("Galaxies not populated. Call populate_haloes() first.")
-            
+
         return compute_galaxy_clustering(
             self.positions_gal, self.Lbox, self.rsd_axis, mode, bins1,
             catalog2=catalog2, bins2=bins2, output=output
         )
-    
-    
+
     def compute_galaxy_lensing(self, bins1: Union[int, Any],
                               output: str = 'xi',
                               bins2: Optional[Any] = None,
                               bins_comp: Any = None) -> tuple:
         """
         Compute galaxy-galaxy lensing signal.
-        
+
         Parameters
-        ----------  
+        ----------
         bins1 : int or array-like
             Primary binning edges for projected separation
         output : str, default='xi'
@@ -442,14 +417,14 @@ class HaloOccupation:
             Secondary binning edges
         bins_comp : array-like, optional
             Binning for completeness calculation. If None, uses default.
-            
+
         Returns
         -------
         rp : array-like
             Projected separation bins
         delta_sigma : array-like
             Surface mass density contrast
-            
+
         Raises
         ------
         RuntimeError
@@ -459,12 +434,11 @@ class HaloOccupation:
             raise RuntimeError("Galaxies not populated. Call populate_haloes() first.")
         if not hasattr(self, 'positions_part'):
             raise RuntimeError("Particle data not loaded. Provide DataFrame_part during initialization.")
-            
+
         # Set default for bins_comp if not provided
         if bins_comp is None:
-            import numpy as np
             bins_comp = np.geomspace(5e-3, 120, 151)
-            
+
         return compute_galaxy_lensing(
             self.positions_gal, self.positions_part, self.Lbox,
             self.rsd_axis, self.RHO_M, bins1,
@@ -638,8 +612,7 @@ class HaloOccupation:
                                bins2: Optional[Any] = None,
                                output: str = 'auto',
                                catalog2: Optional[Any] = None,
-                               base_seed: int = 1000,
-                               use_fast: bool = True) -> tuple:
+                               base_seed: int = 1000) -> tuple:
         """
         Compute averaged galaxy clustering over multiple HOD realizations.
 
@@ -661,8 +634,6 @@ class HaloOccupation:
             Second catalog for cross-correlation
         base_seed : int, default=1000
             Base random seed; realization i uses base_seed + i
-        use_fast : bool, default=True
-            Use optimized satellite positioning
 
         Returns
         -------
@@ -675,8 +646,7 @@ class HaloOccupation:
         """
         results = []
         for i in range(n_realizations):
-            self.populate_haloes(dict_params, random_seed=base_seed + i,
-                                 use_fast=use_fast)
+            self.populate_haloes(dict_params, random_seed=base_seed + i)
             r, xi = self.compute_galaxy_clustering(
                 mode, bins1, catalog2=catalog2, bins2=bins2, output=output
             )
@@ -693,8 +663,7 @@ class HaloOccupation:
                             output: str = 'xi',
                             bins2: Optional[Any] = None,
                             galaxy_fraction: float = 1.0,
-                            base_seed: int = 1000,
-                            use_fast: bool = True) -> tuple:
+                            base_seed: int = 1000) -> tuple:
         """
         Compute averaged galaxy-galaxy lensing over multiple HOD realizations.
 
@@ -721,8 +690,6 @@ class HaloOccupation:
             Fraction of galaxies to keep per realization (0 < f <= 1)
         base_seed : int, default=1000
             Base random seed; realization i uses base_seed + i
-        use_fast : bool, default=True
-            Use optimized satellite positioning
 
         Returns
         -------
@@ -747,8 +714,7 @@ class HaloOccupation:
 
         if method == 'standard':
             for i in range(n_realizations):
-                self.populate_haloes(dict_params, random_seed=base_seed + i,
-                                     use_fast=use_fast)
+                self.populate_haloes(dict_params, random_seed=base_seed + i)
                 gal_pos = np.array(self.positions_gal)
                 gal_pos_sub = self._subsample_array(
                     gal_pos, galaxy_fraction,
@@ -763,8 +729,7 @@ class HaloOccupation:
 
         elif method == 'optimized':
             for i in range(n_realizations):
-                self.populate_haloes(dict_params, random_seed=base_seed + i,
-                                     use_fast=use_fast)
+                self.populate_haloes(dict_params, random_seed=base_seed + i)
                 rp, ds = self.compute_galaxy_lensing_optimized(
                     bins1, precomputed_cache,
                     output=output, bins2=bins2, bins_comp=bins_comp,
@@ -775,22 +740,3 @@ class HaloOccupation:
 
         all_results = np.array(results)
         return rp, all_results.mean(axis=0), all_results.std(axis=0, ddof=1)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        
-
-
