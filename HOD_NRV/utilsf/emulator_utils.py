@@ -21,6 +21,7 @@ References
 .. [1] Rocher et al. (2023) - HOD emulation with fixed number density
 """
 
+import os
 import numpy as np
 import pandas as pd
 from typing import Dict, Optional, Tuple, List, Set
@@ -589,6 +590,222 @@ def generate_hod_parameter_grid(
             print(f"\nSaved parameter grid to: {save_path}")
 
     return param_grid
+
+
+def run_hod_grid(
+    param_grid: pd.DataFrame,
+    halo,
+    rp_bins: np.ndarray,
+    n_realizations: int = 5,
+    galaxy_fraction: float = 0.10,
+    save_path: Optional[str] = None,
+    checkpoint_every: int = 200,
+    base_seed: int = 42,
+    mpi_rank: int = 0,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Evaluate DeltaSigma on a pre-generated HOD parameter grid.
+
+    Iterates over rows of param_grid, calls halo.compute_avg_lensing() for each,
+    and returns arrays suitable for emulator training. Supports fault-tolerant
+    checkpointing and resuming from an existing checkpoint.
+
+    Parameters
+    ----------
+    param_grid : pd.DataFrame
+        Parameter grid, e.g. from generate_hod_parameter_grid(). Each row must
+        contain a complete set of HOD parameters (including Ac).
+    halo : HaloOccupation
+        HaloOccupation instance with halo and particle catalogs loaded and
+        set_halo_model() already called.
+    rp_bins : np.ndarray
+        Projected separation bin edges [Mpc/h]. Shape: (n_bins+1,).
+    n_realizations : int, default=5
+        Number of HOD realizations averaged per grid point.
+    galaxy_fraction : float, default=0.10
+        Galaxy downsampling fraction per realization.
+    save_path : str, optional
+        If provided, save incremental .npz checkpoints to this path.
+        Must end in .npz. Also used for resume detection.
+    checkpoint_every : int, default=200
+        Save a checkpoint every this many completed grid points.
+    base_seed : int, default=42
+        Base random seed; grid point i uses base_seed + i * n_realizations.
+    mpi_rank : int, default=0
+        MPI rank number, used only for log messages.
+
+    Returns
+    -------
+    params_array : np.ndarray
+        Shape (n_points, n_params). Parameter values in column order of param_grid.
+    rp_centers : np.ndarray
+        Shape (n_rp_bins,). Bin centers in Mpc/h.
+    dsigma_array : np.ndarray
+        Shape (n_points, n_rp_bins). Mean DeltaSigma per grid point.
+
+    Notes
+    -----
+    MPI slicing (splitting param_grid across ranks) must be done by the caller
+    before passing param_grid to this function. This function is single-process.
+
+    **Particle subsampling** is controlled at `HaloOccupation` construction time
+    via ``particle_fraction`` and ``particle_subsample_seed``, not here.
+    The benchmark-optimal setting is ``particle_fraction=0.05``. Pass it when
+    constructing the ``halo`` object before calling this function.
+
+    If save_path already exists, the function resumes from the last checkpoint
+    and skips already-completed rows.
+    """
+    n_points = len(param_grid)
+    param_names = list(param_grid.columns)
+    n_params = len(param_names)
+
+    # Compute rp_centers from bin edges
+    rp_centers = np.sqrt(rp_bins[:-1] * rp_bins[1:])
+    n_rp = len(rp_centers)
+
+    # Allocate output arrays
+    params_array = param_grid.values.copy()
+    dsigma_array = np.full((n_points, n_rp), np.nan)
+
+    # Resume from existing checkpoint if available
+    start_idx = 0
+    if save_path is not None and os.path.exists(save_path):
+        try:
+            ckpt = np.load(save_path)
+            n_done = int(ckpt.get("n_completed", 0))
+            if n_done > 0 and n_done <= n_points:
+                dsigma_array[:n_done] = ckpt["dsigma_array"][:n_done]
+                start_idx = n_done
+                print(f"[rank {mpi_rank}] Resuming from checkpoint: {n_done}/{n_points} done")
+        except Exception as e:
+            warnings.warn(f"[rank {mpi_rank}] Could not load checkpoint ({e}); starting fresh")
+
+    print(f"[rank {mpi_rank}] Evaluating {n_points - start_idx} grid points "
+          f"({start_idx} already done)")
+
+    for i in range(start_idx, n_points):
+        row_params = param_grid.iloc[i].to_dict()
+        point_seed = base_seed + i * n_realizations
+
+        try:
+            _, ds_mean, _ = halo.compute_avg_lensing(
+                row_params,
+                n_realizations=n_realizations,
+                bins1=rp_bins,
+                method="standard",
+                galaxy_fraction=galaxy_fraction,
+                base_seed=point_seed,
+            )
+            dsigma_array[i] = ds_mean
+        except Exception as e:
+            warnings.warn(f"[rank {mpi_rank}] Grid point {i} failed: {e}")
+            dsigma_array[i] = np.nan
+
+        # Checkpoint
+        if save_path is not None and ((i + 1) % checkpoint_every == 0 or i == n_points - 1):
+            _save_grid_checkpoint(
+                save_path, params_array, rp_centers, dsigma_array,
+                param_names, n_completed=i + 1
+            )
+            print(f"[rank {mpi_rank}] Checkpoint saved: {i + 1}/{n_points}")
+
+    print(f"[rank {mpi_rank}] Grid evaluation complete.")
+    return params_array, rp_centers, dsigma_array
+
+
+def _save_grid_checkpoint(
+    path: str,
+    params_array: np.ndarray,
+    rp_centers: np.ndarray,
+    dsigma_array: np.ndarray,
+    param_names: List[str],
+    n_completed: int,
+):
+    """Save grid evaluation checkpoint to .npz file."""
+    import os
+    np.savez_compressed(
+        path,
+        params_array=params_array,
+        rp_centers=rp_centers,
+        dsigma_array=dsigma_array,
+        param_names=np.array(param_names, dtype=object),
+        n_completed=n_completed,
+    )
+
+
+def merge_grid_chunks(
+    directory: str,
+    n_ranks: int,
+    output: str,
+    rank_prefix: str = "grid_rank",
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Merge per-rank .npz grid files produced by run_hod_grid() into a single file.
+
+    Parameters
+    ----------
+    directory : str
+        Directory containing per-rank checkpoint files.
+    n_ranks : int
+        Number of MPI ranks (expects files rank0..rank{n_ranks-1}).
+    output : str
+        Path for the merged output .npz file.
+    rank_prefix : str, default="grid_rank"
+        Filename prefix; files are expected as {directory}/{rank_prefix}{i}.npz.
+
+    Returns
+    -------
+    params_array : np.ndarray
+        Merged parameter array, shape (N_total, n_params).
+    rp_centers : np.ndarray
+        Bin centers (same across all ranks).
+    dsigma_array : np.ndarray
+        Merged DeltaSigma array, shape (N_total, n_rp).
+    """
+    import os
+
+    all_params = []
+    all_dsigma = []
+    rp_centers = None
+    param_names = None
+
+    for rank in range(n_ranks):
+        fpath = os.path.join(directory, f"{rank_prefix}{rank}.npz")
+        if not os.path.exists(fpath):
+            raise FileNotFoundError(f"Expected chunk file not found: {fpath}")
+
+        data = np.load(fpath, allow_pickle=True)
+        n_done = int(data.get("n_completed", len(data["params_array"])))
+
+        all_params.append(data["params_array"][:n_done])
+        all_dsigma.append(data["dsigma_array"][:n_done])
+
+        if rp_centers is None:
+            rp_centers = data["rp_centers"]
+        if param_names is None and "param_names" in data:
+            param_names = list(data["param_names"])
+
+    params_array = np.concatenate(all_params, axis=0)
+    dsigma_array = np.concatenate(all_dsigma, axis=0)
+
+    # Drop rows where DeltaSigma is all-NaN (failed evaluations)
+    valid = ~np.all(np.isnan(dsigma_array), axis=1)
+    params_array = params_array[valid]
+    dsigma_array = dsigma_array[valid]
+
+    print(f"Merged {params_array.shape[0]} valid grid points from {n_ranks} ranks")
+
+    np.savez_compressed(
+        output,
+        params_array=params_array,
+        rp_centers=rp_centers,
+        dsigma_array=dsigma_array,
+        param_names=np.array(param_names if param_names else [], dtype=object),
+    )
+    print(f"Merged grid saved to: {output}")
+
+    return params_array, rp_centers, dsigma_array
 
 
 def load_parameter_grid(file_path: str) -> pd.DataFrame:

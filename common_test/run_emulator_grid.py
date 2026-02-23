@@ -1,0 +1,340 @@
+"""
+MPI-parallel grid evaluation for DeltaSigma emulator training.
+
+Generates a Latin Hypercube parameter grid, distributes it across MPI ranks,
+evaluates DeltaSigma for each grid point using the full numerical HOD pipeline,
+and saves per-rank checkpoints. After all ranks finish, rank 0 merges the chunks.
+
+Usage
+-----
+MPI (cluster)::
+
+    mpirun -n 5 --bind-to core --map-by node:PE=20 \\
+        python run_emulator_grid.py \\
+        --fit_case STANDARD_NFW \\
+        --n_samples 100000 \\
+        --output_dir emulator_grid/
+
+SLURM::
+
+    srun --ntasks=5 --cpus-per-task=20 \\
+        python run_emulator_grid.py \\
+        --fit_case STANDARD_NFW \\
+        --n_samples 100000
+
+Single-process smoke test (no MPI)::
+
+    python run_emulator_grid.py --n_samples 50 --no_mpi
+
+Notes
+-----
+* Each MPI rank imports JAX independently — no deadlock risk.
+* Each rank writes its own checkpoint file; if interrupted, resume by
+  re-running the same command (run_hod_grid detects existing checkpoints).
+* After all ranks finish and merge, train the emulator with::
+
+      python -c "
+      import numpy as np
+      from HOD_NRV.utilsf.emulator_nn import train_emulator
+      d = np.load('emulator_grid/grid_merged.npz', allow_pickle=True)
+      train_emulator(d['params_array'], d['dsigma_array'], d['rp_centers'],
+                     save_path='emulator_STANDARD_NFW.pt')
+      "
+"""
+
+import argparse
+import os
+import sys
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="MPI-parallel DeltaSigma grid evaluation for emulator training"
+    )
+    parser.add_argument(
+        "--fit_case",
+        choices=["STANDARD_NFW", "EXTENDED_PROFILE", "CONFORMITY"],
+        default="STANDARD_NFW",
+        help="HOD model complexity (determines free parameters)",
+    )
+    parser.add_argument(
+        "--n_samples",
+        type=int,
+        default=100_000,
+        help="Total number of LHS grid points (split across all ranks)",
+    )
+    parser.add_argument(
+        "--n_realizations",
+        type=int,
+        default=5,
+        help="HOD realizations per grid point",
+    )
+    parser.add_argument(
+        "--galaxy_fraction",
+        type=float,
+        default=0.10,
+        help="Galaxy downsampling fraction per realization",
+    )
+    parser.add_argument(
+        "--particle_fraction",
+        type=float,
+        default=0.05,
+        help="Particle downsampling fraction (applied once at HaloOccupation init). "
+             "Default 0.05 matches the optimal setting from benchmark_dsigma_convergence.py",
+    )
+    parser.add_argument(
+        "--particle_seed",
+        type=int,
+        default=42,
+        help="Random seed for particle subsampling",
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="emulator_grid",
+        help="Directory for per-rank checkpoint files and merged output",
+    )
+    parser.add_argument(
+        "--checkpoint_every",
+        type=int,
+        default=200,
+        help="Save checkpoint every N completed grid points",
+    )
+    parser.add_argument(
+        "--base_seed",
+        type=int,
+        default=42,
+        help="Base random seed for LHS + HOD realizations",
+    )
+    parser.add_argument(
+        "--no_mpi",
+        action="store_true",
+        help="Run without MPI (single process, for local testing)",
+    )
+    return parser.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Flamingo data paths and cosmology (edit for your cluster)
+# ---------------------------------------------------------------------------
+
+HALO_PATH = "/Users/ler13nrv/Documents/flamingo_data/parquet_halo_catalogue_L1000N1800.parquet"
+PARTICLE_PATH = "/Users/ler13nrv/Documents/flamingo_data/particle_catalogue_L1000N1800_downsampled.parquet"
+
+LBOX = 681.0          # Mpc/h
+ZEFF = 1.0
+MASS_DEFINITION = "200m"
+TARGET_NGAL = 2e-4    # (Mpc/h)^-3
+M1_FIXED = 13.0       # log10 M_sun/h
+
+COLUMN_MAPPING = {
+    "x": "x", "y": "y", "z": "z",
+    "vx": "vx", "vy": "vy", "vz": "vz",
+    "mass": "mass", "radius": "rvir", "c": "c", "vrms": "vrms",
+}
+
+COSMO_PARAMS = {
+    "H0": 68.1,
+    "Om0": 0.306,
+    "Ob0": 0.0486,
+    "sigma8": 0.807,
+    "ns": 0.967,
+}
+
+RP_BINS = np.geomspace(0.1, 50.0, 16)  # 15 bins
+
+# ---------------------------------------------------------------------------
+# Parameter ranges per fit case
+# ---------------------------------------------------------------------------
+
+_BASE_RANGES = {
+    "As":         (0.002, 0.05),
+    "Mmin":       (11.5, 13.5),
+    "sig_M":      (0.1, 2.0),
+    "gamma":      (0.0, 10.0),
+    "alpha":      (0.1, 2.0),
+    "kappa":      (0.1, 2.0),
+    "lambda_NFW": (0.1, 2.0),
+}
+
+_EXTENDED_RANGES = {
+    "f_exp": (0.1, 0.9),
+    "tau":   (1.0, 10.0),
+}
+
+_CONFORMITY_RANGES = {
+    "kappa_EE": (0.5, 2.0),
+}
+
+FIXED_PARAMS = {"M1": M1_FIXED}
+
+
+def get_param_ranges(fit_case_str: str) -> dict:
+    ranges = dict(_BASE_RANGES)
+    if fit_case_str in ("EXTENDED_PROFILE", "CONFORMITY"):
+        ranges.update(_EXTENDED_RANGES)
+    if fit_case_str == "CONFORMITY":
+        ranges.update(_CONFORMITY_RANGES)
+    return ranges
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    args = parse_args()
+
+    # --- MPI setup ---
+    if args.no_mpi:
+        rank, size = 0, 1
+    else:
+        try:
+            from mpi4py import MPI
+            comm = MPI.COMM_WORLD
+            rank = comm.Get_rank()
+            size = comm.Get_size()
+        except ImportError:
+            print("mpi4py not available; running single-process (use --no_mpi to suppress this warning)")
+            rank, size = 0, 1
+            comm = None
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # --- Imports (deferred so each MPI rank imports JAX independently) ---
+    from HOD_NRV.HOD_numerical.HOD import HaloOccupation
+    from HOD_NRV.utilsf.emulator_utils import (
+        generate_hod_parameter_grid,
+        run_hod_grid,
+        merge_grid_chunks,
+    )
+
+    # --- Generate full parameter grid on rank 0, then broadcast ---
+    if rank == 0:
+        print(f"[rank 0] Loading halo catalog from {HALO_PATH}")
+        halo_rank0 = HaloOccupation(
+            cosmology=COSMO_PARAMS,
+            zeff=ZEFF,
+            Lbox=LBOX,
+            column_mapping=COLUMN_MAPPING,
+            mass_definition=MASS_DEFINITION,
+            halo_path=HALO_PATH,
+            DataFrame_part=None,   # particles not needed for grid generation
+            apply_rsd=False,
+            do_test=False,
+        )
+        hod_type = "ELG_mHMQ"
+        use_conformity = (args.fit_case == "CONFORMITY")
+        halo_rank0.set_halo_model(hod_type, conformity=use_conformity)
+
+        param_ranges = get_param_ranges(args.fit_case)
+
+        print(f"[rank 0] Generating {args.n_samples} LHS grid points "
+              f"for fit_case={args.fit_case}")
+        param_grid = generate_hod_parameter_grid(
+            halo=halo_rank0,
+            hod_type=hod_type,
+            param_ranges=param_ranges,
+            n_samples=args.n_samples,
+            target_ngal=TARGET_NGAL,
+            Ac_fiducial=1.0,
+            fixed_params=FIXED_PARAMS,
+            random_seed=args.base_seed,
+            conformity=use_conformity,
+            verbose=True,
+        )
+
+        # Save full grid for reference
+        grid_meta_path = os.path.join(args.output_dir, "param_grid_full.parquet")
+        param_grid.to_parquet(grid_meta_path, index=False)
+        print(f"[rank 0] Full parameter grid saved to {grid_meta_path}")
+    else:
+        param_grid = None
+
+    # Broadcast grid to all ranks
+    if not args.no_mpi and size > 1:
+        import pandas as pd
+        param_grid = comm.bcast(param_grid, root=0)
+
+    # --- Slice grid for this rank ---
+    n_total = len(param_grid)
+    chunk = n_total // size
+    start = rank * chunk
+    end = start + chunk if rank < size - 1 else n_total
+    my_grid = param_grid.iloc[start:end].reset_index(drop=True)
+
+    print(f"[rank {rank}] Processing rows {start}:{end} ({len(my_grid)} points)")
+
+    # --- Load halo + particle catalogs for this rank ---
+    import pandas as pd
+
+    print(f"[rank {rank}] Loading halo catalog...")
+    halo = HaloOccupation(
+        cosmology=COSMO_PARAMS,
+        zeff=ZEFF,
+        Lbox=LBOX,
+        column_mapping=COLUMN_MAPPING,
+        mass_definition=MASS_DEFINITION,
+        halo_path=HALO_PATH,
+        DataFrame_part=pd.read_parquet(PARTICLE_PATH),
+        apply_rsd=True,
+        do_test=False,
+        particle_fraction=args.particle_fraction,
+        particle_subsample_seed=args.particle_seed,
+    )
+    print(f"[rank {rank}] Particle fraction: {args.particle_fraction} "
+          f"(seed={args.particle_seed})")
+    hod_type = "ELG_mHMQ"
+    use_conformity = (args.fit_case == "CONFORMITY")
+    halo.set_halo_model(hod_type, conformity=use_conformity)
+    print(f"[rank {rank}] Catalog loaded.")
+
+    # --- Evaluate grid ---
+    save_path = os.path.join(
+        args.output_dir, f"grid_rank{rank}.npz"
+    )
+    _, rp_centers, _ = run_hod_grid(
+        my_grid,
+        halo,
+        RP_BINS,
+        n_realizations=args.n_realizations,
+        galaxy_fraction=args.galaxy_fraction,
+        save_path=save_path,
+        checkpoint_every=args.checkpoint_every,
+        base_seed=args.base_seed + start,   # offset seed by rank's start index
+        mpi_rank=rank,
+    )
+
+    print(f"[rank {rank}] Done. Results saved to {save_path}")
+
+    # --- Rank 0 merges after all ranks finish ---
+    if not args.no_mpi and size > 1:
+        comm.Barrier()
+
+    if rank == 0:
+        print("[rank 0] Merging per-rank chunks...")
+        merged_path = os.path.join(args.output_dir, "grid_merged.npz")
+        params_merged, rp_centers, dsigma_merged = merge_grid_chunks(
+            directory=args.output_dir,
+            n_ranks=size,
+            output=merged_path,
+        )
+        print(f"[rank 0] Merged grid: {params_merged.shape[0]} points, "
+              f"{dsigma_merged.shape[1]} rp bins")
+        print(f"[rank 0] Merged file: {merged_path}")
+        print()
+        print("Next step — train the emulator:")
+        print(f"  python -c \"")
+        print(f"  import numpy as np")
+        print(f"  from HOD_NRV.utilsf.emulator_nn import train_emulator")
+        print(f"  d = np.load('{merged_path}', allow_pickle=True)")
+        print(f"  train_emulator(d['params_array'], d['dsigma_array'], d['rp_centers'],")
+        print(f"                 save_path='emulator_{args.fit_case}.pt')\"")
+
+
+if __name__ == "__main__":
+    main()

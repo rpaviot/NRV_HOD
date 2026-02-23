@@ -14,7 +14,10 @@ import numpy as np
 from enum import IntEnum
 from typing import Dict, Optional, Tuple, Any
 
+import torch
+
 from .emulator_utils import rescale_Ac_to_target_ngal
+from .emulator_nn import load_emulator, predict_dsigma
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
 
 
@@ -573,3 +576,314 @@ class NumericalDeltaSigmaFitter:
             ds_obs=self.ds_obs,
             cov=self.cov,
         )
+
+
+# ---------------------------------------------------------------------------
+# EmulatorFitter — Nautilus sampler backed by a pre-trained DeltaSigmaEmulator
+# ---------------------------------------------------------------------------
+
+# Module-level state for fork-safe pool parallelism (mirrors _fitter_instance).
+_emulator_fitter_instance = None
+
+
+def _emulator_likelihood(theta):
+    """Module-level wrapper for EmulatorFitter, picklable by name."""
+    return _emulator_fitter_instance.log_likelihood(theta)
+
+
+class EmulatorFitter:
+    """
+    Nautilus nested sampler backed by a pre-trained DeltaSigmaEmulator.
+
+    Identical interface to NumericalDeltaSigmaFitter but replaces the slow
+    compute_avg_lensing() forward model (~3.2 s/call) with an emulator forward
+    pass (~μs/call), making full Nautilus runs feasible in minutes.
+
+    Parameters
+    ----------
+    emulator_path : str
+        Path to the saved .pt model file written by train_emulator().
+        The companion <emulator_path>.norm.npz must also exist.
+    ds_obs : np.ndarray, shape (n_bins,)
+        Observed DeltaSigma signal.
+    cov_inv : np.ndarray, shape (n_bins, n_bins)
+        Inverse covariance matrix.
+    rp_obs : np.ndarray, shape (n_bins,)
+        Projected separation bin centers corresponding to ds_obs [Mpc/h].
+    fit_case : FitCase
+        Which model complexity to use (determines free parameters).
+    target_ngal : float
+        Fixed galaxy number density [(Mpc/h)^-3] used for Ac/As rescaling.
+    param_names_ordered : list of str, optional
+        Ordered list of HOD parameter names as stored in the emulator grid.
+        Must match the column order of the param_grid used during training.
+        Defaults to the order implied by fit_case via _get_free_params + M1.
+    M1_fixed : float, default=13.0
+        Fixed log10(M1) value.
+    rp_min : float, optional
+        Minimum rp scale cut [Mpc/h].
+    rp_max : float, optional
+        Maximum rp scale cut [Mpc/h].
+    hod_model : HaloOccupation or object with .HOD, optional
+        Needed only for the Ac/As rescaling step. If None, Ac rescaling
+        is skipped and parameters are passed directly to the emulator — only
+        valid if the emulator was trained with Ac already rescaled (as produced
+        by generate_hod_parameter_grid).
+
+    Examples
+    --------
+    >>> fitter = EmulatorFitter(
+    ...     emulator_path="emulator_STANDARD_NFW.pt",
+    ...     ds_obs=ds_obs, cov_inv=cov_inv, rp_obs=rp_centers,
+    ...     fit_case=FitCase.STANDARD_NFW,
+    ...     target_ngal=2e-4,
+    ...     hod_model=halo,
+    ... )
+    >>> points, weights, log_l, log_z = fitter.run(n_live=500, n_eff=5000)
+    """
+
+    def __init__(
+        self,
+        emulator_path: str,
+        ds_obs: np.ndarray,
+        cov_inv: np.ndarray,
+        rp_obs: np.ndarray,
+        fit_case: FitCase = FitCase.STANDARD_NFW,
+        target_ngal: float = 2.3e-4,
+        param_names_ordered: Optional[list] = None,
+        M1_fixed: float = 13.0,
+        rp_min: Optional[float] = None,
+        rp_max: Optional[float] = None,
+        hod_model=None,
+    ):
+        self.fit_case = FitCase(fit_case)
+        self.target_ngal = target_ngal
+        self.M1_fixed = M1_fixed
+        self.hod_model = hod_model
+        self.rp_min = rp_min
+        self.rp_max = rp_max
+
+        # Load emulator
+        self.model, self.norm_stats = load_emulator(emulator_path)
+        self.emulator_rp = self.norm_stats["rp_centers"]  # shape (n_rp_emulator,)
+
+        # Free parameters for this case
+        self.free_params = _get_free_params(self.fit_case)
+        self.param_names = [p[0] for p in self.free_params]
+        self.n_params = len(self.free_params)
+
+        # Parameter order expected by the emulator (column order of training grid)
+        # Default: full parameter dict order as built by _build_params_full()
+        if param_names_ordered is not None:
+            self.emulator_param_order = param_names_ordered
+        else:
+            # Use the same order as NumericalDeltaSigmaFitter._build_params produces
+            # Full params include Ac, As, Mmin, sig_M, gamma, M1, alpha, kappa,
+            # lambda_NFW, [f_exp, tau], [kappa_EE]
+            self.emulator_param_order = self._default_emulator_param_order()
+
+        # Apply scale cuts to obs data
+        self.rp_obs = np.asarray(rp_obs)
+        self.ds_obs = np.asarray(ds_obs)
+        self.cov_inv = np.asarray(cov_inv)
+
+        mask = np.ones(len(self.rp_obs), dtype=bool)
+        if rp_min is not None:
+            mask &= (self.rp_obs >= rp_min)
+        if rp_max is not None:
+            mask &= (self.rp_obs <= rp_max)
+        if not mask.all():
+            self.rp_obs   = self.rp_obs[mask]
+            self.ds_obs   = self.ds_obs[mask]
+            self.cov_inv  = self.cov_inv[np.ix_(mask, mask)]
+
+        self.n_bins = len(self.ds_obs)
+
+        # Pre-compute emulator → obs interpolation indices
+        # We interpolate emulator predictions onto rp_obs using log-linear interp
+        self._setup_interp()
+
+    def _default_emulator_param_order(self):
+        """Default parameter order expected by the emulator."""
+        order = ["Ac", "As", "Mmin", "sig_M", "gamma", "M1", "alpha", "kappa", "lambda_NFW"]
+        if self.fit_case >= FitCase.EXTENDED_PROFILE:
+            order += ["f_exp", "tau"]
+        if self.fit_case >= FitCase.CONFORMITY:
+            order += ["kappa_EE"]
+        return order
+
+    def _setup_interp(self):
+        """Pre-compute interpolation from emulator rp grid to obs rp grid."""
+        # We will interpolate log(DS_emulator)(log rp_emulator) onto log rp_obs
+        self._log_rp_emu = np.log(self.emulator_rp)
+        self._log_rp_obs = np.log(self.rp_obs)
+
+    def _build_params_full(self, theta) -> Optional[Dict[str, float]]:
+        """Convert sampler parameter vector to full HOD parameter dict.
+
+        Mirrors NumericalDeltaSigmaFitter._build_params but is used only
+        to drive the Ac/As rescaling step. Returns None on failure.
+        """
+        if isinstance(theta, dict):
+            free_dict = dict(theta)
+        else:
+            free_dict = dict(zip(self.param_names, theta))
+
+        As_sampled = free_dict.pop("As")
+
+        params_no_AcAs = {
+            "Mmin": free_dict["Mmin"],
+            "sig_M": free_dict["sig_M"],
+            "gamma": free_dict["gamma"],
+            "M1": self.M1_fixed,
+            "alpha": free_dict["alpha"],
+            "kappa": free_dict["kappa"],
+        }
+
+        if self.hod_model is not None:
+            try:
+                Ac_fid = 0.01
+                params_for_rescale = params_no_AcAs.copy()
+                params_for_rescale["As"] = As_sampled
+                Ac, As = rescale_Ac_to_target_ngal(
+                    self.hod_model.HOD, params_for_rescale,
+                    self.target_ngal, Ac_fiducial=Ac_fid
+                )
+            except Exception:
+                return None
+            if Ac <= 0 or As <= 0 or not np.isfinite(Ac) or not np.isfinite(As):
+                return None
+        else:
+            # No HOD model provided: pass As directly, Ac = 1 (placeholder)
+            Ac = 1.0
+            As = As_sampled
+
+        full_params = {
+            "Ac": Ac,
+            "As": As,
+            "Mmin": free_dict["Mmin"],
+            "sig_M": free_dict["sig_M"],
+            "gamma": free_dict["gamma"],
+            "M1": self.M1_fixed,
+            "alpha": free_dict["alpha"],
+            "kappa": free_dict["kappa"],
+            "lambda_NFW": free_dict["lambda_NFW"],
+        }
+
+        if self.fit_case >= FitCase.EXTENDED_PROFILE:
+            full_params["f_exp"] = free_dict["f_exp"]
+            full_params["tau"] = free_dict["tau"]
+
+        if self.fit_case >= FitCase.CONFORMITY:
+            full_params["kappa_EE"] = free_dict["kappa_EE"]
+
+        return full_params
+
+    def _params_to_emulator_vector(self, full_params: dict) -> np.ndarray:
+        """Extract ordered parameter vector for emulator input."""
+        return np.array(
+            [full_params[k] for k in self.emulator_param_order],
+            dtype=np.float32,
+        )
+
+    def log_likelihood(self, theta) -> float:
+        """Compute log-likelihood using the emulator forward pass.
+
+        Parameters
+        ----------
+        theta : dict or array
+            Free parameter values from Nautilus.
+
+        Returns
+        -------
+        float
+            Log-likelihood, or -1e100 on failure.
+        """
+        full_params = self._build_params_full(theta)
+        if full_params is None:
+            return -1e100
+
+        try:
+            theta_vec = self._params_to_emulator_vector(full_params)
+            ds_pred = predict_dsigma(self.model, self.norm_stats, theta_vec)
+        except Exception:
+            return -1e100
+
+        if not np.all(np.isfinite(ds_pred)):
+            return -1e100
+
+        # Interpolate emulator prediction onto obs rp grid (log-linear)
+        log_ds_emu = np.log(ds_pred)
+        log_ds_at_obs = np.interp(
+            self._log_rp_obs, self._log_rp_emu, log_ds_emu
+        )
+        ds_at_obs = np.exp(log_ds_at_obs)
+
+        residual = ds_at_obs - self.ds_obs
+        chi2 = residual @ self.cov_inv @ residual
+        return -0.5 * chi2
+
+    def run(
+        self,
+        n_live: int = 500,
+        n_eff: int = 5000,
+        filepath: Optional[str] = None,
+        verbose: bool = True,
+        n_workers: int = 1,
+        **nautilus_kwargs,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        """Run the Nautilus nested sampler with the emulator likelihood.
+
+        Parameters
+        ----------
+        n_live : int
+            Number of live points.
+        n_eff : int
+            Target effective sample size.
+        filepath : str, optional
+            Checkpoint file path for resume capability.
+        verbose : bool
+            Whether to print progress.
+        n_workers : int
+            Number of parallel likelihood workers. Emulator calls are
+            cheap (~μs), so n_workers=1 is usually sufficient.
+        **nautilus_kwargs
+            Extra kwargs forwarded to nautilus.Sampler.run().
+
+        Returns
+        -------
+        points : np.ndarray, shape (n_eff, n_params)
+        weights : np.ndarray, shape (n_eff,)
+        log_l : np.ndarray, shape (n_eff,)
+        log_z : float
+        """
+        import nautilus
+        import HOD_NRV.utilsf.numerical_sampler as _self_mod
+
+        prior = nautilus.Prior()
+        for name, low, high in self.free_params:
+            prior.add_parameter(name, dist=(low, high))
+
+        _self_mod._emulator_fitter_instance = self
+
+        pool_arg = n_workers if n_workers > 1 else None
+
+        try:
+            sampler = nautilus.Sampler(
+                prior,
+                _emulator_likelihood,
+                n_live=n_live,
+                filepath=filepath,
+                pool=pool_arg,
+                pass_dict=False,
+            )
+            sampler.run(n_eff=n_eff, verbose=verbose, **nautilus_kwargs)
+        finally:
+            _self_mod._emulator_fitter_instance = None
+
+        points, log_w, log_l = sampler.posterior()
+        weights = np.exp(log_w - log_w.max())
+        weights /= weights.sum()
+        log_z = sampler.evidence()
+
+        return points, weights, log_l, log_z
