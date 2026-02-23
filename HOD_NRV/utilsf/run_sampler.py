@@ -68,6 +68,7 @@ FIT_CASE   = FitCase.STANDARD_NFW   # or EXTENDED_PROFILE / CONFORMITY
 N_LIVE     = 500
 N_EFF      = 5000
 CHECKPOINT = "sampler_checkpoint.hdf5"
+N_WORKERS  = 1     # set to number of available CPU cores for parallel sampling
 
 
 # ============================================================================
@@ -132,6 +133,7 @@ def main():
     print(f"Galaxy frac   : {GALAXY_FRACTION}")
     print(f"Particle frac : {PARTICLE_FRACTION}")
     print(f"Checkpoint    : {CHECKPOINT}")
+    print(f"N workers     : {N_WORKERS}")
     print()
 
     # --- Run sampler ---
@@ -140,6 +142,7 @@ def main():
         n_eff=N_EFF,
         filepath=CHECKPOINT,
         verbose=True,
+        n_workers=N_WORKERS,
     )
 
     # --- Save results ---

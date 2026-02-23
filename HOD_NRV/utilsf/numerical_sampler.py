@@ -11,11 +11,27 @@ fix M1 = 13.0 by default.
 """
 
 import numpy as np
+import multiprocessing as mp
 from enum import IntEnum
 from typing import Dict, Optional, Tuple, Any
 
 from .emulator_utils import rescale_Ac_to_target_ngal
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
+
+
+def _worker_thread_init():
+    """Limit each worker process to 1 thread (OMP, OpenBLAS, XLA).
+
+    Called as Pool initializer so every worker process inherits single-threaded
+    behaviour before importing any numerical library.
+    """
+    import os
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["XLA_FLAGS"] = (
+        "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
+    )
 
 
 class FitCase(IntEnum):
@@ -276,12 +292,16 @@ class NumericalDeltaSigmaFitter:
         )
         return Ac_new, As_new
 
-    def _build_params(self, theta: np.ndarray) -> Optional[Dict[str, float]]:
+    def _build_params(self, theta) -> Optional[Dict[str, float]]:
         """Convert flat parameter vector to full HOD parameter dict.
 
         Returns None if the derived parameters are unphysical (e.g. Ac <= 0).
         """
-        free_dict = dict(zip(self.param_names, theta))
+        # Nautilus passes theta as a dict {name: value}; fallback for array input.
+        if isinstance(theta, dict):
+            free_dict = dict(theta)
+        else:
+            free_dict = dict(zip(self.param_names, theta))
 
         As_sampled = free_dict.pop("As")
 
@@ -368,6 +388,7 @@ class NumericalDeltaSigmaFitter:
         n_eff: int = 5000,
         filepath: Optional[str] = None,
         verbose: bool = True,
+        n_workers: int = 1,
         **nautilus_kwargs,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
         """Run the Nautilus nested sampler.
@@ -382,6 +403,13 @@ class NumericalDeltaSigmaFitter:
             Checkpoint file path for resume capability.
         verbose : bool
             Whether to print progress.
+        n_workers : int
+            Number of parallel likelihood-evaluation workers. If > 1, a
+            forkserver multiprocessing pool is created and passed to Nautilus.
+            Each worker is initialised with a single-thread environment
+            (OMP/XLA/OpenBLAS = 1) so N workers use N cores in total rather
+            than N*ncpu. Set to the number of available CPUs for maximum
+            throughput.
         **nautilus_kwargs
             Extra kwargs passed to nautilus.Sampler.run().
 
@@ -402,14 +430,30 @@ class NumericalDeltaSigmaFitter:
         for name, low, high in self.free_params:
             prior.add_parameter(name, dist=(low, high))
 
-        sampler = nautilus.Sampler(
-            prior,
-            self.log_likelihood,
-            n_live=n_live,
-            filepath=filepath,
-        )
+        if n_workers > 1:
+            ctx = mp.get_context("forkserver")
+            pool = ctx.Pool(
+                processes=n_workers,
+                initializer=_worker_thread_init,
+            )
+        else:
+            pool = None
 
-        sampler.run(n_eff=n_eff, verbose=verbose, **nautilus_kwargs)
+        try:
+            sampler = nautilus.Sampler(
+                prior,
+                self.log_likelihood,
+                n_live=n_live,
+                filepath=filepath,
+                pool=pool,
+                pass_dict=False,
+            )
+
+            sampler.run(n_eff=n_eff, verbose=verbose, **nautilus_kwargs)
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
 
         points, log_w, log_l = sampler.posterior()
         weights = np.exp(log_w - log_w.max())
