@@ -11,7 +11,6 @@ fix M1 = 13.0 by default.
 """
 
 import numpy as np
-import multiprocessing as mp
 from enum import IntEnum
 from typing import Dict, Optional, Tuple, Any
 
@@ -19,19 +18,19 @@ from .emulator_utils import rescale_Ac_to_target_ngal
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
 
 
-def _worker_thread_init():
-    """Limit each worker process to 1 thread (OMP, OpenBLAS, XLA).
+# Module-level state for fork-safe pool parallelism.
+# Set by NumericalDeltaSigmaFitter.run() before the pool is created;
+# inherited by worker processes via fork COW.
+_fitter_instance = None
 
-    Called as Pool initializer so every worker process inherits single-threaded
-    behaviour before importing any numerical library.
+
+def _fitter_likelihood(theta):
+    """Lightweight module-level wrapper used by Nautilus pool workers.
+
+    Nautilus pickles this as a name reference (cheap), not as a closure.
+    Workers inherit _fitter_instance via fork copy-on-write.
     """
-    import os
-    os.environ["OMP_NUM_THREADS"] = "1"
-    os.environ["OPENBLAS_NUM_THREADS"] = "1"
-    os.environ["MKL_NUM_THREADS"] = "1"
-    os.environ["XLA_FLAGS"] = (
-        "--xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1"
-    )
+    return _fitter_instance.log_likelihood(theta)
 
 
 class FitCase(IntEnum):
@@ -425,35 +424,43 @@ class NumericalDeltaSigmaFitter:
             Log-evidence estimate.
         """
         import nautilus
+        import os
+        import HOD_NRV.utilsf.numerical_sampler as _self_mod
 
         prior = nautilus.Prior()
         for name, low, high in self.free_params:
             prior.add_parameter(name, dist=(low, high))
 
+        # Expose self to forked workers via module-level global (COW, no pickling).
+        _self_mod._fitter_instance = self
+
+        # Limit each worker to 1 thread so N workers use N cores total.
+        # Save and restore so caller's environment is not permanently changed.
+        _saved_env = {}
         if n_workers > 1:
-            ctx = mp.get_context("forkserver")
-            pool = ctx.Pool(
-                processes=n_workers,
-                initializer=_worker_thread_init,
-            )
-        else:
-            pool = None
+            for var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+                _saved_env[var] = os.environ.get(var)
+                os.environ[var] = "1"
+
+        pool_arg = n_workers if n_workers > 1 else None
 
         try:
             sampler = nautilus.Sampler(
                 prior,
-                self.log_likelihood,
+                _fitter_likelihood,   # module-level function → cheap to pickle
                 n_live=n_live,
                 filepath=filepath,
-                pool=pool,
+                pool=pool_arg,        # integer → NautilusPool embeds likelihood in workers
                 pass_dict=False,
             )
-
             sampler.run(n_eff=n_eff, verbose=verbose, **nautilus_kwargs)
         finally:
-            if pool is not None:
-                pool.close()
-                pool.join()
+            _self_mod._fitter_instance = None
+            for var, val in _saved_env.items():
+                if val is None:
+                    os.environ.pop(var, None)
+                else:
+                    os.environ[var] = val
 
         points, log_w, log_l = sampler.posterior()
         weights = np.exp(log_w - log_w.max())
