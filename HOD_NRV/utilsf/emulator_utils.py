@@ -598,6 +598,7 @@ def run_hod_grid(
     rp_bins: np.ndarray,
     n_realizations: int = 5,
     galaxy_fraction: float = 0.10,
+    precomputed_cache=None,
     save_path: Optional[str] = None,
     checkpoint_every: int = 200,
     base_seed: int = 42,
@@ -624,6 +625,15 @@ def run_hod_grid(
         Number of HOD realizations averaged per grid point.
     galaxy_fraction : float, default=0.10
         Galaxy downsampling fraction per realization.
+    precomputed_cache : HaloCenterLensingCache, optional
+        If provided, use ``method="optimized"`` (precomputed halo-center profiles
+        for centrals, pycorr only for satellites). This is **strongly recommended**
+        for large grids: it gives a 3–9× speedup over the standard method depending
+        on satellite fraction. Generate it once with
+        ``common_test/precompute_halo_center_cache.py``, then load with
+        ``HaloCenterLensingCache.load(path)``.
+        If None (default), falls back to ``method="standard"`` (full pycorr pair
+        counting per realization).
     save_path : str, optional
         If provided, save incremental .npz checkpoints to this path.
         Must end in .npz. Also used for resume detection.
@@ -681,8 +691,9 @@ def run_hod_grid(
         except Exception as e:
             warnings.warn(f"[rank {mpi_rank}] Could not load checkpoint ({e}); starting fresh")
 
+    method = "optimized" if precomputed_cache is not None else "standard"
     print(f"[rank {mpi_rank}] Evaluating {n_points - start_idx} grid points "
-          f"({start_idx} already done)")
+          f"({start_idx} already done) — method={method}")
 
     for i in range(start_idx, n_points):
         row_params = param_grid.iloc[i].to_dict()
@@ -693,7 +704,8 @@ def run_hod_grid(
                 row_params,
                 n_realizations=n_realizations,
                 bins1=rp_bins,
-                method="standard",
+                method=method,
+                precomputed_cache=precomputed_cache,
                 galaxy_fraction=galaxy_fraction,
                 base_seed=point_seed,
             )
