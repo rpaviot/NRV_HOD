@@ -257,7 +257,7 @@ def main():
             param_ranges=param_ranges,
             n_samples=args.n_samples,
             target_ngal=TARGET_NGAL,
-            Ac_fiducial=1.0,
+            Ac_fiducial=0.01,
             fixed_params=FIXED_PARAMS,
             random_seed=args.base_seed,
             conformity=use_conformity,
@@ -339,6 +339,7 @@ def main():
         checkpoint_every=args.checkpoint_every,
         base_seed=args.base_seed + start,   # offset seed by rank's start index
         mpi_rank=rank,
+        target_ngal=TARGET_NGAL,
     )
 
     print(f"[rank {rank}] Done. Results saved to {save_path}")
