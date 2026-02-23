@@ -257,7 +257,6 @@ def main():
             param_ranges=param_ranges,
             n_samples=args.n_samples,
             target_ngal=TARGET_NGAL,
-            Ac_fiducial=0.01,
             fixed_params=FIXED_PARAMS,
             random_seed=args.base_seed,
             conformity=use_conformity,

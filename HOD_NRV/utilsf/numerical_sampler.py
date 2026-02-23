@@ -704,8 +704,13 @@ class EmulatorFitter:
         self._setup_interp()
 
     def _default_emulator_param_order(self):
-        """Default parameter order expected by the emulator."""
-        order = ["Ac", "As", "Mmin", "sig_M", "gamma", "M1", "alpha", "kappa", "lambda_NFW"]
+        """Default parameter order expected by the emulator.
+
+        Matches the column order of the param_grid produced by
+        generate_hod_parameter_grid(): free LHS-sampled params + fixed M1.
+        Ac is NOT included — it is a derived parameter never stored in the grid.
+        """
+        order = ["As", "Mmin", "sig_M", "gamma", "M1", "alpha", "kappa", "lambda_NFW"]
         if self.fit_case >= FitCase.EXTENDED_PROFILE:
             order += ["f_exp", "tau"]
         if self.fit_case >= FitCase.CONFORMITY:
@@ -792,19 +797,25 @@ class EmulatorFitter:
         Parameters
         ----------
         theta : dict or array
-            Free parameter values from Nautilus.
+            Free parameter values from Nautilus (same params that appear in
+            the training grid: As, Mmin, sig_M, gamma, M1, alpha, kappa,
+            lambda_NFW, ...). No Ac — it is a derived parameter.
 
         Returns
         -------
         float
             Log-likelihood, or -1e100 on failure.
         """
-        full_params = self._build_params_full(theta)
-        if full_params is None:
-            return -1e100
+        if isinstance(theta, dict):
+            free_dict = dict(theta)
+        else:
+            free_dict = dict(zip(self.param_names, theta))
 
         try:
-            theta_vec = self._params_to_emulator_vector(full_params)
+            theta_vec = np.array([
+                self.M1_fixed if p == 'M1' else free_dict[p]
+                for p in self.emulator_param_order
+            ], dtype=np.float32)
             ds_pred = predict_dsigma(self.model, self.norm_stats, theta_vec)
         except Exception:
             return -1e100

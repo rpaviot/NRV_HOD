@@ -349,7 +349,7 @@ def generate_hod_parameter_grid(
     param_ranges: Dict[str, Tuple[float, float]],
     n_samples: int,
     target_ngal: float,
-    Ac_fiducial: float = 1.0,
+    Ac_fiducial=None,
     fixed_params: Optional[Dict[str, float]] = None,
     random_seed: Optional[int] = None,
     conformity: bool = False,
@@ -382,8 +382,9 @@ def generate_hod_parameter_grid(
         Number of parameter combinations to generate
     target_ngal : float
         Target galaxy number density [(Mpc/h)^-3]
-    Ac_fiducial : float, default=1.0
-        Fiducial value for Ac used in rescaling
+    Ac_fiducial : deprecated, ignored
+        No longer used. Ac is a derived parameter and does not appear in the
+        output grid. Passing this argument raises a DeprecationWarning.
     fixed_params : dict, optional
         Dictionary of parameters to hold fixed (not sampled in LHS).
         Example: {'M1': 13.5, 'kappa': 1.0} to fix M1 and kappa.
@@ -407,8 +408,10 @@ def generate_hod_parameter_grid(
     Returns
     -------
     param_grid : pd.DataFrame
-        DataFrame with columns for all HOD parameters including rescaled Ac.
-        Shape: (n_samples, n_params+1) where 'Ac' is the rescaled central amplitude.
+        DataFrame with columns for all free LHS-sampled HOD parameters (no Ac).
+        Shape: (n_samples, n_params). Ac is a derived parameter: it is computed
+        by run_hod_grid() just before each forward-model call to hit target_ngal,
+        but is never stored in the grid or checkpoint files.
 
     Examples
     --------
@@ -462,24 +465,31 @@ def generate_hod_parameter_grid(
     -----
     This function performs the following steps:
 
-    1. Generate LHS samples for free parameters (excluding Ac)
-    2. Insert Ac as a constant fiducial column (placeholder)
-    3. Return DataFrame with all parameters including Ac
+    1. Generate LHS samples for free parameters (Ac excluded — it is derived)
+    2. Add fixed_params as constant columns
+    3. Return DataFrame with free params only (no Ac column)
 
-    The ``Ac`` column is stored as the fiducial constant ``Ac_fiducial`` for every
-    row (preserving the LHS structure). The actual rescaling of ``(Ac, As)`` to
-    hit ``target_ngal`` happens inside ``run_hod_grid`` just before each
-    ``compute_avg_lensing`` call, and the rescaled values are written back into
-    ``params_array`` (the array used for emulator training). This ensures that
-    the emulator always sees the true ``(Ac_rescaled, As_rescaled)`` pair, which
-    is also what ``EmulatorFitter._build_params_full`` reproduces at inference
-    time via the same ``rescale_Ac_to_target_ngal`` call.
+    ``Ac`` is a fully derived parameter: given the sampled free params and
+    ``target_ngal``, there is a unique ``Ac`` (and rescaled ``As``) that hits
+    the number density constraint.  The derivation happens inside
+    ``run_hod_grid`` just before each ``compute_avg_lensing`` call, but those
+    derived values are NOT stored in ``params_array``.  The emulator is trained
+    on the original free params (including ``As`` as sampled by LHS), and at
+    inference time Nautilus samples those same free params directly.
 
     See Also
     --------
     create_latin_hypercube : Generate LHS samples
     rescale_Ac_to_target_ngal : Rescale Ac for target ngal
     """
+    if Ac_fiducial is not None:
+        warnings.warn(
+            "Ac_fiducial is deprecated and ignored. Ac is now a fully derived "
+            "parameter that never appears in the output grid.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+
     if verbose:
         print(f"Generating {n_samples} HOD parameter combinations for {hod_type}")
         print(f"Target number density: {target_ngal:.2e} (Mpc/h)^-3")
@@ -547,15 +557,14 @@ def generate_hod_parameter_grid(
         for param_name, param_value in fixed_params_copy.items():
             lhs_samples[param_name] = param_value
 
-    # Combine into final DataFrame with Ac as a constant fiducial placeholder.
-    # Actual rescaling (Ac, As) → target_ngal happens in run_hod_grid just before
-    # each compute_avg_lensing call, and the rescaled values are stored in params_array.
+    # Ac is fully derived — it is NOT stored in the grid.
+    # run_hod_grid() computes (Ac, As) on-the-fly to hit target_ngal, but does
+    # not write those values back into params_array.
     param_grid = lhs_samples.copy()
-    param_grid.insert(0, 'Ac', Ac_fiducial)  # constant for all rows
 
     if verbose:
-        print(f"\nDone! Parameter grid: {n_samples} points, "
-              f"Ac set to fiducial {Ac_fiducial} (constant placeholder).")
+        print(f"\nDone! Parameter grid: {n_samples} points, {len(param_grid.columns)} "
+              f"free params (Ac excluded — derived at evaluation time).")
 
     # Save if path provided
     if save_path is not None:
@@ -597,7 +606,8 @@ def run_hod_grid(
     ----------
     param_grid : pd.DataFrame
         Parameter grid, e.g. from generate_hod_parameter_grid(). Each row must
-        contain a complete set of HOD parameters (including Ac).
+        contain the free HOD parameters (no Ac; Ac is derived when target_ngal
+        is provided).
     halo : HaloOccupation
         HaloOccupation instance with halo and particle catalogs loaded and
         set_halo_model() already called.
@@ -627,20 +637,18 @@ def run_hod_grid(
         MPI rank number, used only for log messages.
     target_ngal : float, optional
         If provided, call ``rescale_Ac_to_target_ngal`` just before each
-        ``compute_avg_lensing`` call to obtain ``(Ac_rescaled, As_rescaled)``
-        that achieve ``target_ngal``.  The rescaled values replace the grid
-        row's placeholder ``Ac``/``As`` **inside ``params_array``** (the array
-        written to checkpoints and returned for emulator training), so the
-        emulator always sees the true rescaled pair.  The ``param_grid``
-        DataFrame is **not** modified.  Should be the same value passed to
-        ``generate_hod_parameter_grid``.
+        ``compute_avg_lensing`` call to derive ``(Ac, As_rescaled)`` that
+        achieve ``target_ngal``. These derived values are used **only** for
+        the HOD forward model call; they are NOT written back into
+        ``params_array``. The emulator trains on the original free params
+        (including ``As`` as LHS-sampled). ``param_grid`` is never modified.
 
     Returns
     -------
     params_array : np.ndarray
-        Shape (n_points, n_params). For rows where rescaling was applied,
-        ``Ac`` and ``As`` columns contain the rescaled values (not the
-        fiducial placeholder stored in ``param_grid``).
+        Shape (n_points, n_params). Contains the original free-param values
+        from param_grid unchanged (no Ac column; rescaled Ac/As are never
+        stored here).
     rp_centers : np.ndarray
         Shape (n_rp_bins,). Bin centers in Mpc/h.
     dsigma_array : np.ndarray
@@ -661,7 +669,6 @@ def run_hod_grid(
     """
     n_points = len(param_grid)
     param_names = list(param_grid.columns)
-    n_params = len(param_names)
 
     # Compute rp_centers from bin edges
     rp_centers = np.sqrt(rp_bins[:-1] * rp_bins[1:])
@@ -670,10 +677,6 @@ def run_hod_grid(
     # Allocate output arrays
     params_array = param_grid.values.copy()
     dsigma_array = np.full((n_points, n_rp), np.nan)
-
-    # Pre-compute column indices for Ac/As rescaling (if needed)
-    Ac_col = param_names.index('Ac') if (target_ngal is not None and 'Ac' in param_names) else None
-    As_col = param_names.index('As') if (target_ngal is not None and 'As' in param_names) else None
 
     # Resume from existing checkpoint if available
     start_idx = 0
@@ -697,23 +700,20 @@ def run_hod_grid(
         row_params = param_grid.iloc[i].to_dict()
         point_seed = base_seed + i * n_realizations
 
-        # Rescale Ac and As to achieve target_ngal before calling the forward model.
-        # The rescaled values are stored back into params_array so the emulator
-        # trains on the same (Ac, As) that EmulatorFitter produces at inference time.
+        # Derive (Ac, As_rescaled) to hit target_ngal.
+        # These values are used ONLY for the forward model call — not stored in
+        # params_array. The emulator trains on the original free params (row_params).
         if target_ngal is not None:
             Ac_r, As_r = rescale_Ac_to_target_ngal(
-                halo.HOD, row_params, target_ngal, Ac_fiducial=row_params['Ac']
+                halo.HOD, row_params, target_ngal, Ac_fiducial=0.01
             )
-            row_params['Ac'] = Ac_r
-            row_params['As'] = As_r
-            if Ac_col is not None:
-                params_array[i, Ac_col] = Ac_r
-            if As_col is not None:
-                params_array[i, As_col] = As_r
+            row_params_for_hod = {**row_params, 'Ac': Ac_r, 'As': As_r}
+        else:
+            row_params_for_hod = row_params  # caller must include 'Ac'
 
         try:
             _, ds_mean, _ = halo.compute_avg_lensing(
-                row_params,
+                row_params_for_hod,
                 n_realizations=n_realizations,
                 bins1=rp_bins,
                 method=method,
