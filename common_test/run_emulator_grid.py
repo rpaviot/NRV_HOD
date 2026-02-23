@@ -1,44 +1,52 @@
 """
-MPI-parallel grid evaluation for DeltaSigma emulator training.
+SLURM job-array grid evaluation for DeltaSigma emulator training.
 
-Generates a Latin Hypercube parameter grid, distributes it across MPI ranks,
-evaluates DeltaSigma for each grid point using the full numerical HOD pipeline,
-and saves per-rank checkpoints. After all ranks finish, rank 0 merges the chunks.
+Three-phase workflow (no MPI required):
 
-Usage
------
-Step 0 — generate the halo-center lensing cache (once per simulation snapshot)::
+Phase 1 — generate the parameter grid (once)::
 
-    python precompute_halo_center_cache.py
-    # writes: halo_center_lensing_cache.h5
-
-MPI (cluster)::
-
-    mpirun -n 5 --bind-to core --map-by node:PE=20 \\
-        python run_emulator_grid.py \\
+    python run_emulator_grid.py \\
+        --generate_grid_only \\
         --fit_case STANDARD_NFW \\
         --n_samples 100000 \\
+        --output_dir emulator_grid/
+
+Phase 2 — evaluate grid slices in parallel (SLURM job array)::
+
+    # Each array job reads its slice from disk and writes grid_rank{i}.npz
+    SLURM_ARRAY_TASK_ID=0 SLURM_ARRAY_TASK_COUNT=5 \\
+        python run_emulator_grid.py \\
+        --job_array --n_jobs 5 \\
+        --grid_path emulator_grid/param_grid_full.parquet \\
+        --fit_case STANDARD_NFW \\
         --cache_path halo_center_lensing_cache.h5 \\
         --output_dir emulator_grid/
 
-SLURM::
+Phase 3 — merge per-job chunks::
 
-    srun --ntasks=5 --cpus-per-task=20 \\
-        python run_emulator_grid.py \\
-        --fit_case STANDARD_NFW \\
-        --n_samples 100000 \\
-        --cache_path halo_center_lensing_cache.h5
+    python run_emulator_grid.py \\
+        --merge_only --n_jobs 5 \\
+        --output_dir emulator_grid/
 
-Single-process smoke test (no MPI)::
+Single-process smoke test (no SLURM)::
 
     python run_emulator_grid.py --n_samples 50 --no_mpi
 
+Job-array dry-run (two jobs locally)::
+
+    SLURM_ARRAY_TASK_ID=0 SLURM_ARRAY_TASK_COUNT=2 \\
+        python run_emulator_grid.py --job_array --n_jobs 2 \\
+        --grid_path emulator_grid/param_grid_full.parquet --n_samples 50
+
+See run_emulator_grid.slurm for the complete SLURM submission script that
+handles job dependencies between the three phases automatically.
+
 Notes
 -----
-* Each MPI rank imports JAX independently — no deadlock risk.
-* Each rank writes its own checkpoint file; if interrupted, resume by
+* Each job imports JAX independently — no deadlock risk.
+* Each job writes its own checkpoint file; if interrupted, resume by
   re-running the same command (run_hod_grid detects existing checkpoints).
-* After all ranks finish and merge, train the emulator with::
+* After all jobs finish and merge, train the emulator with::
 
       python -c "
       import numpy as np
@@ -59,7 +67,7 @@ import numpy as np
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="MPI-parallel DeltaSigma grid evaluation for emulator training"
+        description="SLURM job-array DeltaSigma grid evaluation for emulator training"
     )
     parser.add_argument(
         "--fit_case",
@@ -71,7 +79,7 @@ def parse_args():
         "--n_samples",
         type=int,
         default=100_000,
-        help="Total number of LHS grid points (split across all ranks)",
+        help="Total number of LHS grid points (split across all jobs)",
     )
     parser.add_argument(
         "--n_realizations",
@@ -111,7 +119,7 @@ def parse_args():
         "--output_dir",
         type=str,
         default="emulator_grid",
-        help="Directory for per-rank checkpoint files and merged output",
+        help="Directory for per-job checkpoint files and merged output",
     )
     parser.add_argument(
         "--checkpoint_every",
@@ -129,6 +137,35 @@ def parse_args():
         "--no_mpi",
         action="store_true",
         help="Run without MPI (single process, for local testing)",
+    )
+    # --- Job array arguments ---
+    parser.add_argument(
+        "--job_array",
+        action="store_true",
+        help="Activate job array mode: reads rank/size from SLURM_ARRAY_TASK_ID / "
+             "SLURM_ARRAY_TASK_COUNT and loads the parameter grid from --grid_path",
+    )
+    parser.add_argument(
+        "--n_jobs",
+        type=int,
+        default=1,
+        help="Number of array jobs (fallback if SLURM_ARRAY_TASK_COUNT is not set)",
+    )
+    parser.add_argument(
+        "--grid_path",
+        type=str,
+        default=None,
+        help="Path to pre-saved param_grid_full.parquet (required with --job_array)",
+    )
+    parser.add_argument(
+        "--generate_grid_only",
+        action="store_true",
+        help="Phase 1: generate and save the LHS parameter grid, then exit",
+    )
+    parser.add_argument(
+        "--merge_only",
+        action="store_true",
+        help="Phase 3: merge per-job grid_rank{i}.npz chunks, then exit",
     )
     return parser.parse_args()
 
@@ -204,23 +241,7 @@ def get_param_ranges(fit_case_str: str) -> dict:
 def main():
     args = parse_args()
 
-    # --- MPI setup ---
-    if args.no_mpi:
-        rank, size = 0, 1
-    else:
-        try:
-            from mpi4py import MPI
-            comm = MPI.COMM_WORLD
-            rank = comm.Get_rank()
-            size = comm.Get_size()
-        except ImportError:
-            print("mpi4py not available; running single-process (use --no_mpi to suppress this warning)")
-            rank, size = 0, 1
-            comm = None
-
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # --- Imports (deferred so each MPI rank imports JAX independently) ---
+    import pandas as pd
     from HOD_NRV.HOD_numerical.HOD import HaloOccupation
     from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import HaloCenterLensingCache
     from HOD_NRV.utilsf.emulator_utils import (
@@ -229,10 +250,14 @@ def main():
         merge_grid_chunks,
     )
 
-    # --- Generate full parameter grid on rank 0, then broadcast ---
-    if rank == 0:
-        print(f"[rank 0] Loading halo catalog from {HALO_PATH}")
-        halo_rank0 = HaloOccupation(
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # -----------------------------------------------------------------------
+    # Phase 1: generate grid and exit
+    # -----------------------------------------------------------------------
+    if args.generate_grid_only:
+        print(f"[Phase 1] Loading halo catalog from {HALO_PATH}")
+        halo_gen = HaloOccupation(
             cosmology=COSMO_PARAMS,
             zeff=ZEFF,
             Lbox=LBOX,
@@ -245,14 +270,13 @@ def main():
         )
         hod_type = "ELG_mHMQ"
         use_conformity = (args.fit_case == "CONFORMITY")
-        halo_rank0.set_halo_model(hod_type, conformity=use_conformity)
+        halo_gen.set_halo_model(hod_type, conformity=use_conformity)
 
         param_ranges = get_param_ranges(args.fit_case)
-
-        print(f"[rank 0] Generating {args.n_samples} LHS grid points "
+        print(f"[Phase 1] Generating {args.n_samples} LHS grid points "
               f"for fit_case={args.fit_case}")
         param_grid = generate_hod_parameter_grid(
-            halo=halo_rank0,
+            halo=halo_gen,
             hod_type=hod_type,
             param_ranges=param_ranges,
             n_samples=args.n_samples,
@@ -262,32 +286,104 @@ def main():
             conformity=use_conformity,
             verbose=True,
         )
-
-        # Save full grid for reference
         grid_meta_path = os.path.join(args.output_dir, "param_grid_full.parquet")
         param_grid.to_parquet(grid_meta_path, index=False)
-        print(f"[rank 0] Full parameter grid saved to {grid_meta_path}")
+        print(f"[Phase 1] Full parameter grid saved to {grid_meta_path} "
+              f"({len(param_grid)} rows)")
+        print(f"[Phase 1] Done. Submit Phase 2 (job array) next.")
+        return
+
+    # -----------------------------------------------------------------------
+    # Phase 3: merge chunks and exit
+    # -----------------------------------------------------------------------
+    if args.merge_only:
+        merged_path = os.path.join(args.output_dir, "grid_merged.npz")
+        print(f"[Phase 3] Merging {args.n_jobs} per-job chunks in {args.output_dir}...")
+        params_merged, rp_centers, dsigma_merged = merge_grid_chunks(
+            directory=args.output_dir,
+            n_ranks=args.n_jobs,
+            output=merged_path,
+        )
+        print(f"[Phase 3] Merged grid: {params_merged.shape[0]} points, "
+              f"{dsigma_merged.shape[1]} rp bins")
+        print(f"[Phase 3] Merged file: {merged_path}")
+        print()
+        print("Next step — train the emulator:")
+        fit_case = args.fit_case
+        print(f"  python -c \"")
+        print(f"  import numpy as np")
+        print(f"  from HOD_NRV.utilsf.emulator_nn import train_emulator")
+        print(f"  d = np.load('{merged_path}', allow_pickle=True)")
+        print(f"  train_emulator(d['params_array'], d['dsigma_array'], d['rp_centers'],")
+        print(f"                 save_path='emulator_{fit_case}.pt')\"")
+        return
+
+    # -----------------------------------------------------------------------
+    # Phase 2: evaluate grid slice
+    # -----------------------------------------------------------------------
+
+    # Determine rank / size
+    if args.no_mpi:
+        rank, size = 0, 1
+    elif args.job_array:
+        rank = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
+        size = int(os.environ.get("SLURM_ARRAY_TASK_COUNT", args.n_jobs))
     else:
-        param_grid = None
+        rank, size = 0, 1   # bare invocation = single process
 
-    # Broadcast grid to all ranks
-    if not args.no_mpi and size > 1:
-        import pandas as pd
-        param_grid = comm.bcast(param_grid, root=0)
+    # Load or generate parameter grid
+    if args.job_array:
+        if args.grid_path is None:
+            raise ValueError("--grid_path is required when using --job_array")
+        print(f"[job {rank}/{size}] Loading parameter grid from {args.grid_path}")
+        param_grid = pd.read_parquet(args.grid_path)
+    else:
+        # Single-process path: generate in-process and save for reference
+        print(f"[rank {rank}] Loading halo catalog from {HALO_PATH}")
+        halo_grid = HaloOccupation(
+            cosmology=COSMO_PARAMS,
+            zeff=ZEFF,
+            Lbox=LBOX,
+            column_mapping=COLUMN_MAPPING,
+            mass_definition=MASS_DEFINITION,
+            halo_path=HALO_PATH,
+            DataFrame_part=None,
+            apply_rsd=False,
+            do_test=False,
+        )
+        hod_type_tmp = "ELG_mHMQ"
+        use_conformity_tmp = (args.fit_case == "CONFORMITY")
+        halo_grid.set_halo_model(hod_type_tmp, conformity=use_conformity_tmp)
 
-    # --- Slice grid for this rank ---
+        param_ranges = get_param_ranges(args.fit_case)
+        print(f"[rank {rank}] Generating {args.n_samples} LHS grid points "
+              f"for fit_case={args.fit_case}")
+        param_grid = generate_hod_parameter_grid(
+            halo=halo_grid,
+            hod_type=hod_type_tmp,
+            param_ranges=param_ranges,
+            n_samples=args.n_samples,
+            target_ngal=TARGET_NGAL,
+            fixed_params=FIXED_PARAMS,
+            random_seed=args.base_seed,
+            conformity=use_conformity_tmp,
+            verbose=True,
+        )
+        grid_meta_path = os.path.join(args.output_dir, "param_grid_full.parquet")
+        param_grid.to_parquet(grid_meta_path, index=False)
+        print(f"[rank {rank}] Full parameter grid saved to {grid_meta_path}")
+
+    # Slice grid for this job
     n_total = len(param_grid)
     chunk = n_total // size
     start = rank * chunk
     end = start + chunk if rank < size - 1 else n_total
     my_grid = param_grid.iloc[start:end].reset_index(drop=True)
 
-    print(f"[rank {rank}] Processing rows {start}:{end} ({len(my_grid)} points)")
+    print(f"[job {rank}/{size}] Processing rows {start}:{end} ({len(my_grid)} points)")
 
-    # --- Load halo + particle catalogs for this rank ---
-    import pandas as pd
-
-    print(f"[rank {rank}] Loading halo catalog...")
+    # Load halo + particle catalogs
+    print(f"[job {rank}/{size}] Loading halo catalog...")
     halo = HaloOccupation(
         cosmology=COSMO_PARAMS,
         zeff=ZEFF,
@@ -301,32 +397,30 @@ def main():
         particle_fraction=args.particle_fraction,
         particle_subsample_seed=args.particle_seed,
     )
-    print(f"[rank {rank}] Particle fraction: {args.particle_fraction} "
+    print(f"[job {rank}/{size}] Particle fraction: {args.particle_fraction} "
           f"(seed={args.particle_seed})")
     hod_type = "ELG_mHMQ"
     use_conformity = (args.fit_case == "CONFORMITY")
     halo.set_halo_model(hod_type, conformity=use_conformity)
-    print(f"[rank {rank}] Catalog loaded.")
+    print(f"[job {rank}/{size}] Catalog loaded.")
 
-    # --- Load precomputed halo-center lensing cache (each rank loads independently) ---
+    # Load precomputed halo-center lensing cache
     precomputed_cache = None
     if args.cache_path is not None:
         if not os.path.exists(args.cache_path):
             raise FileNotFoundError(
-                f"[rank {rank}] Cache file not found: {args.cache_path}\n"
+                f"[job {rank}/{size}] Cache file not found: {args.cache_path}\n"
                 f"Run common_test/precompute_halo_center_cache.py first."
             )
-        print(f"[rank {rank}] Loading halo-center lensing cache from {args.cache_path}...")
+        print(f"[job {rank}/{size}] Loading halo-center lensing cache from {args.cache_path}...")
         precomputed_cache = HaloCenterLensingCache.load(args.cache_path)
-        print(f"[rank {rank}] Cache loaded ({len(precomputed_cache.deltasigma)} halos).")
+        print(f"[job {rank}/{size}] Cache loaded ({len(precomputed_cache.deltasigma)} halos).")
     else:
-        print(f"[rank {rank}] No cache provided — using method='standard' (slower). "
+        print(f"[job {rank}/{size}] No cache provided — using method='standard' (slower). "
               f"Consider running precompute_halo_center_cache.py and passing --cache_path.")
 
-    # --- Evaluate grid ---
-    save_path = os.path.join(
-        args.output_dir, f"grid_rank{rank}.npz"
-    )
+    # Evaluate grid
+    save_path = os.path.join(args.output_dir, f"grid_rank{rank}.npz")
     _, rp_centers, _ = run_hod_grid(
         my_grid,
         halo,
@@ -336,20 +430,16 @@ def main():
         precomputed_cache=precomputed_cache,
         save_path=save_path,
         checkpoint_every=args.checkpoint_every,
-        base_seed=args.base_seed + start,   # offset seed by rank's start index
+        base_seed=args.base_seed + start,   # offset seed by job's start index
         mpi_rank=rank,
         target_ngal=TARGET_NGAL,
     )
 
-    print(f"[rank {rank}] Done. Results saved to {save_path}")
-
-    # --- Rank 0 merges after all ranks finish ---
-    if not args.no_mpi and size > 1:
-        comm.Barrier()
-
-    if rank == 0:
-        print("[rank 0] Merging per-rank chunks...")
+    print(f"[job {rank}/{size}] Done. Results saved to {save_path}")
+    if not args.job_array:
+        # Single-process: merge immediately
         merged_path = os.path.join(args.output_dir, "grid_merged.npz")
+        print("[rank 0] Merging per-rank chunks...")
         params_merged, rp_centers, dsigma_merged = merge_grid_chunks(
             directory=args.output_dir,
             n_ranks=size,
@@ -366,6 +456,8 @@ def main():
         print(f"  d = np.load('{merged_path}', allow_pickle=True)")
         print(f"  train_emulator(d['params_array'], d['dsigma_array'], d['rp_centers'],")
         print(f"                 save_path='emulator_{args.fit_case}.pt')\"")
+    else:
+        print(f"[job {rank}/{size}] Run Phase 3 (--merge_only) after all jobs complete.")
 
 
 if __name__ == "__main__":
