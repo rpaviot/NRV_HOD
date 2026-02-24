@@ -167,6 +167,12 @@ def parse_args():
         action="store_true",
         help="Phase 3: merge per-job grid_rank{i}.npz chunks, then exit",
     )
+    parser.add_argument(
+        "--population_backend",
+        choices=["jax", "numba"],
+        default="numba",
+        help="Galaxy population backend: 'numba' (default, faster, float64) or 'jax'",
+    )
     return parser.parse_args()
 
 
@@ -267,6 +273,7 @@ def main():
             DataFrame_part=None,   # particles not needed for grid generation
             apply_rsd=False,
             do_test=False,
+            population_backend=args.population_backend,
         )
         hod_type = "ELG_mHMQ"
         use_conformity = (args.fit_case == "CONFORMITY")
@@ -350,6 +357,7 @@ def main():
             DataFrame_part=None,
             apply_rsd=False,
             do_test=False,
+            population_backend=args.population_backend,
         )
         hod_type_tmp = "ELG_mHMQ"
         use_conformity_tmp = (args.fit_case == "CONFORMITY")
@@ -396,7 +404,9 @@ def main():
         do_test=False,
         particle_fraction=args.particle_fraction,
         particle_subsample_seed=args.particle_seed,
+        population_backend=args.population_backend,
     )
+    print(f"[job {rank}/{size}] Population backend: {args.population_backend}")
     print(f"[job {rank}/{size}] Particle fraction: {args.particle_fraction} "
           f"(seed={args.particle_seed})")
     hod_type = "ELG_mHMQ"

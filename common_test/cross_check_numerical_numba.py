@@ -1,22 +1,30 @@
 """
-Numerical DeltaSigma Regression Test
-=====================================
+Numba Backend DeltaSigma Regression Test
+=========================================
 
-Fast regression test for the numerical HOD pipeline (population engine,
-NFW profiles, two-point calculator).  Uses the optimal downsampling settings
-from benchmark_results.json (5% particles, 10% galaxies, 5 realizations)
-to run in ~3 s per realization instead of ~120 s.
+Mirrors cross_check_numerical.py but drives the NumPy/Numba population backend
+instead of the JAX backend.
 
-The mean DeltaSigma is compared against the full-resolution baseline stored
-in baseline_dsigma_cache.npz (10 realizations, 100% particles/galaxies).
+Architecture
+------------
+    HaloOccupation (JAX)            # data loading, cosmology, HOD model
+      ↓ np.array(halo.positions)    # extract numpy arrays
+    populate_haloes_full_numba()    # Numba NFW placement
+      ↓ positions_gal (numpy)
+    compute_galaxy_lensing()        # pycorr — unchanged
+      ↓ ds
+    compare vs baseline_dsigma_cache.npz
 
-Prerequisites:
+Note: hod_model.compute_central_occupation / compute_satellite_occupation are
+JAX-JIT and still used for occupation probabilities.  The Numba backend only
+replaces the heavy NFW sampling step.
+
+Prerequisites
+-------------
   1. baseline_dsigma_cache.npz  (from numerical_dsigma_example.py)
-  2. benchmark_results.json     (optimal settings source)
+  2. benchmark_results.json     (optimal downsampling settings)
 
 Data: Flamingo L1000N1800
-  - Halos:     parquet_halo_catalogue_L1000N1800.parquet
-  - Particles: particle_catalogue_L1000N1800_downsampled.parquet
 """
 
 import json
@@ -28,13 +36,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
+from HOD_NRV.HOD_numerical.HOD.population_engine_numba import populate_haloes_full_numba
 from HOD_NRV.HOD_numerical.twopoint_calculator.standard_two_point_calculator import (
     compute_galaxy_lensing,
 )
 from HOD_NRV.utilsf.emulator_utils import rescale_Ac_to_target_ngal
 
 # ============================================================================
-# Configuration (matches other common_test scripts)
+# Configuration (mirrors cross_check_numerical.py)
 # ============================================================================
 
 HALO_PATH = "/Users/ler13nrv/Documents/flamingo_data/parquet_halo_catalogue_L1000N1800.parquet"
@@ -43,10 +52,10 @@ PARTICLE_PATH = "/Users/ler13nrv/Documents/flamingo_data/particle_catalogue_L100
 BASELINE_CACHE = "baseline_dsigma_cache.npz"
 BENCHMARK_JSON = "benchmark_results.json"
 
-PLOT_OUTPUT = "cross_check_numerical.png"
-RESULTS_OUTPUT = "cross_check_numerical_results.txt"
+PLOT_OUTPUT = "cross_check_numerical_numba.png"
+RESULTS_OUTPUT = "cross_check_numerical_numba_results.txt"
 
-Lbox = 681.0        # Mpc/h
+Lbox = 681.0
 zeff = 1.0
 mass_definition = "200m"
 
@@ -78,22 +87,20 @@ base_hod_params = {
     "Mmin": 12.7,
     "sig_M": 0.3,
     "M1": 13.0,
-    "gamma":5.0,
+    "gamma": 5.0,
     "alpha": 1.10,
     "kappa": 0.80,
 }
 target_ngal = 2e-4  # (Mpc/h)^-3
 
-# Lensing bins (same as baseline)
 rp_bins = np.geomspace(0.1, 50.0, 16)
 BINS_COMP = np.geomspace(5e-3, 120, 151)
 
-# Use a different base seed from baseline (1000) to test statistical agreement
 BASE_SEED = 2000
 PARTICLE_SUBSAMPLE_SEED = 99
 
-# Pass/fail threshold
 THRESHOLD = 0.05  # 5% maximum deviation
+
 
 # ============================================================================
 # Helpers
@@ -135,14 +142,14 @@ def fmt_time(seconds):
 
 def main():
     print("=" * 70)
-    print("Numerical DeltaSigma Regression Test")
+    print("Numba Backend DeltaSigma Regression Test")
     print("=" * 70)
 
     # --- Load optimal settings from benchmark ---
     if not os.path.exists(BENCHMARK_JSON):
         raise FileNotFoundError(
             f"Benchmark results not found: {BENCHMARK_JSON}\n"
-            f"Run the convergence benchmark first to generate it."
+            "Run the convergence benchmark first to generate it."
         )
 
     with open(BENCHMARK_JSON) as f:
@@ -151,7 +158,7 @@ def main():
     optimal = bench["optimal"]
     particle_fraction = optimal["particle_fraction"]
     galaxy_fraction = optimal["galaxy_fraction"]
-    n_real= 10#optimal["n_realizations"]
+    n_real = 10 #optimal["n_realizations"]
 
     print(f"\nOptimal settings from {BENCHMARK_JSON}:")
     print(f"  Particle fraction: {particle_fraction*100:.0f}%")
@@ -163,7 +170,7 @@ def main():
     if not os.path.exists(BASELINE_CACHE):
         raise FileNotFoundError(
             f"Baseline cache not found: {BASELINE_CACHE}\n"
-            f"Run numerical_dsigma_example.py first to generate it."
+            "Run numerical_dsigma_example.py first to generate it."
         )
 
     print(f"\nLoading baseline from {BASELINE_CACHE}...")
@@ -211,13 +218,20 @@ def main():
     Ac_rescaled, As_rescaled = rescale_Ac_to_target_ngal(
         halo.HOD, base_hod_params, target_ngal=target_ngal
     )
-
     hod_params = base_hod_params.copy()
     hod_params["Ac"] = Ac_rescaled
     hod_params["As"] = As_rescaled
-
     print(f"  Ac = {Ac_rescaled[0]:.6f}")
     print(f"  As = {As_rescaled[0]:.6f}")
+
+    # --- Extract halo arrays as numpy ---
+    positions_h = np.array(halo.positions)
+    velocities_h = np.array(halo.velocities)
+    mass_h = np.array(halo.mass)
+    radius_h = np.array(halo.radius)
+    concentration_h = np.array(halo.concentration)
+    vrms_h = np.array(halo.vrms)
+    logM_h = np.array(halo.logM)
 
     # --- Downsample particles ---
     positions_part_full = np.array(halo.positions_part)
@@ -227,36 +241,68 @@ def main():
     print(f"\nParticle downsampling: {len(positions_part_full):,} -> "
           f"{len(positions_part_sub):,} ({particle_fraction*100:.0f}%)")
 
-    # --- JIT warmup ---
+    # --- JAX warmup (for fair timing comparison) ---
     print("\nWarming up JAX JIT (throw-away population)...")
     t0 = time.perf_counter()
     halo.populate_haloes(hod_params, random_seed=0)
-    warmup_time = time.perf_counter() - t0
-    print(f"  Warmup time: {fmt_time(warmup_time)}")
+    jax_warmup_time = time.perf_counter() - t0
+    print(f"  JAX warmup: {fmt_time(jax_warmup_time)}")
 
-    # --- Run optimized realizations ---
-    print(f"\nRunning {n_real} optimized realizations (seed base={BASE_SEED})...")
-    ds_opt_all = []
-    timing_all = []
+    # --- Numba warmup ---
+    print("Warming up Numba JIT (throw-away population)...")
+    t0 = time.perf_counter()
+    populate_haloes_full_numba(
+        positions_h, velocities_h, mass_h, radius_h,
+        concentration_h, vrms_h, logM_h,
+        halo.HOD, hod_params,
+        triaxial_NFW=False, apply_rsd=False,
+        rsd_factor=halo.rsd_factor, rsd_axis_index=halo.rsd_axis_index,
+        Lbox=Lbox, random_seed=0,
+    )
+    numba_warmup_time = time.perf_counter() - t0
+    print(f"  Numba warmup: {fmt_time(numba_warmup_time)}")
+
+    # --- Run realizations ---
+    print(f"\nRunning {n_real} realizations (seed base={BASE_SEED})...")
+    print(f"  {'Seed':>6s}  {'Backend':>8s}  {'N_gal':>8s}  {'f_sat':>6s}  "
+          f"{'pop':>8s}  {'lens':>8s}  {'total':>8s}")
+    print("  " + "-" * 68)
+
+    ds_numba_all = []
+    timing_jax = []
+    timing_numba_pop = []
+    timing_numba_total = []
     ngal_all = []
     sat_frac_all = []
 
     for i in range(n_real):
         seed = BASE_SEED + i
-        print(f"  Realization {i+1}/{n_real} (seed={seed})...", end=" ", flush=True)
 
-        t_pop = time.perf_counter()
+        # JAX population (timing only — no lensing)
+        t_jax = time.perf_counter()
         halo.populate_haloes(hod_params, random_seed=seed)
+        t_jax = time.perf_counter() - t_jax
+        timing_jax.append(t_jax)
+
+        # Numba population
+        t_pop = time.perf_counter()
+        pos_gal, vel_gal, f_sat, cent_idx = populate_haloes_full_numba(
+            positions_h, velocities_h, mass_h, radius_h,
+            concentration_h, vrms_h, logM_h,
+            halo.HOD, hod_params,
+            triaxial_NFW=False, apply_rsd=False,
+            rsd_factor=halo.rsd_factor, rsd_axis_index=halo.rsd_axis_index,
+            Lbox=Lbox, random_seed=seed,
+        )
         t_pop = time.perf_counter() - t_pop
 
-        n_gal = len(halo.positions_gal)
-        f_sat = halo.satellite_fraction
+        n_gal = len(pos_gal)
         ngal_all.append(n_gal)
         sat_frac_all.append(f_sat)
+        timing_numba_pop.append(t_pop)
 
         # Subsample galaxies
-        gal_pos = np.array(halo.positions_gal)
-        gal_pos_sub = subsample_array(gal_pos, galaxy_fraction, seed=88 + i)
+        gal_pos_sub = subsample_array(pos_gal, galaxy_fraction, seed=88 + i)
 
         # Compute lensing
         t_lens = time.perf_counter()
@@ -266,51 +312,60 @@ def main():
         )
         t_lens = time.perf_counter() - t_lens
 
-        ds_opt_all.append(ds)
-        timing_all.append(t_pop + t_lens)
+        ds_numba_all.append(ds)
+        timing_numba_total.append(t_pop + t_lens)
 
-        print(f"N_gal={n_gal:,}, f_sat={f_sat:.3f}, "
-              f"pop={fmt_time(t_pop)}, lens={fmt_time(t_lens)}, "
-              f"total={fmt_time(t_pop + t_lens)}")
+        print(f"  {seed:>6d}  {'JAX':>8s}  {'':>8s}  {'':>6s}  "
+              f"{fmt_time(t_jax):>8s}  {'':>8s}  {'':>8s}")
+        print(f"  {seed:>6d}  {'Numba':>8s}  {n_gal:>8,}  {f_sat:>6.3f}  "
+              f"{fmt_time(t_pop):>8s}  {fmt_time(t_lens):>8s}  "
+              f"{fmt_time(t_pop + t_lens):>8s}")
 
-    ds_opt_all = np.array(ds_opt_all)
-    timing_all = np.array(timing_all)
-    ds_opt_mean = ds_opt_all.mean(axis=0)
+    ds_numba_all = np.array(ds_numba_all)
+    timing_jax = np.array(timing_jax)
+    timing_numba_pop = np.array(timing_numba_pop)
+    timing_numba_total = np.array(timing_numba_total)
+    ds_numba_mean = ds_numba_all.mean(axis=0)
 
     # --- Comparison metrics ---
     print("\n" + "=" * 70)
-    print("Comparison: Optimized vs Full-Resolution Baseline")
+    print("Comparison: Numba Backend vs Full-Resolution Baseline")
     print("=" * 70)
 
-    metrics = compute_deviation_metrics(ds_opt_mean, ds_baseline_mean)
+    metrics = compute_deviation_metrics(ds_numba_mean, ds_baseline_mean)
 
-    print(f"\n  Settings: {particle_fraction*100:.0f}% particles, "
-          f"{galaxy_fraction*100:.0f}% galaxies, {n_real} realizations")
-    print(f"  Baseline: {n_baseline} realizations (100% particles/galaxies)")
+    print(f"\n  Backend: NumPy/Numba NFW ({particle_fraction*100:.0f}% particles, "
+          f"{galaxy_fraction*100:.0f}% galaxies, {n_real} realizations)")
+    print(f"  Baseline: JAX {n_baseline} realizations (100% particles/galaxies)")
     print(f"\n  Mean ngal:      {np.mean(ngal_all):,.0f}")
     print(f"  Mean sat_frac:  {np.mean(sat_frac_all):.4f}")
 
-    print(f"\n  Deviation metrics (mean of {n_real} vs mean of {n_baseline}):")
+    print(f"\n  Deviation metrics (mean of {n_real} Numba vs mean of {n_baseline} baseline):")
     print(f"    Median fractional:  {metrics['median_frac_dev']*100:.2f}%")
     print(f"    Max fractional:     {metrics['max_frac_dev']*100:.2f}%")
     print(f"    RMS fractional:     {metrics['rms_frac_dev']*100:.2f}%")
 
     # Per-bin deviation table
     mask = np.abs(ds_baseline_mean) > 1e-10
-    per_bin_dev = np.zeros_like(ds_opt_mean)
+    per_bin_dev = np.zeros_like(ds_numba_mean)
     per_bin_dev[mask] = np.abs(
-        (ds_opt_mean[mask] - ds_baseline_mean[mask]) / ds_baseline_mean[mask]
+        (ds_numba_mean[mask] - ds_baseline_mean[mask]) / ds_baseline_mean[mask]
     )
 
-    print(f"\n  {'rp [Mpc/h]':>14s}  {'Baseline':>14s}  {'Optimized':>14s}  {'Deviation':>10s}")
+    print(f"\n  {'rp [Mpc/h]':>14s}  {'Baseline':>14s}  {'Numba':>14s}  {'Deviation':>10s}")
     print("  " + "-" * 58)
-    for r, ds_b, ds_o, dev in zip(rp_centers, ds_baseline_mean, ds_opt_mean, per_bin_dev):
-        print(f"    {r:12.4f}  {ds_b:14.6e}  {ds_o:14.6e}  {dev*100:8.2f}%")
+    for r, ds_b, ds_n, dev in zip(rp_centers, ds_baseline_mean, ds_numba_mean, per_bin_dev):
+        print(f"    {r:12.4f}  {ds_b:14.6e}  {ds_n:14.6e}  {dev*100:8.2f}%")
 
-    # Timing
-    print(f"\n  Timing:")
-    print(f"    Mean per realization: {fmt_time(timing_all.mean())}")
-    print(f"    Total ({n_real} realizations): {fmt_time(timing_all.sum())}")
+    # Timing comparison
+    print(f"\n  Timing (population step only, {n_real} realizations):")
+    print(f"    JAX backend:   mean {fmt_time(timing_jax.mean())}  "
+          f"total {fmt_time(timing_jax.sum())}")
+    print(f"    Numba backend: mean {fmt_time(timing_numba_pop.mean())}  "
+          f"total {fmt_time(timing_numba_pop.sum())}")
+    speedup = timing_jax.mean() / timing_numba_pop.mean()
+    print(f"    Speedup (Numba/JAX): {speedup:.2f}x")
+    print(f"\n  Numba total (pop + lens): mean {fmt_time(timing_numba_total.mean())}")
 
     # --- PASS/FAIL verdict ---
     max_dev = metrics["max_frac_dev"]
@@ -325,8 +380,9 @@ def main():
 
     # --- Save results text ---
     with open(RESULTS_OUTPUT, "w") as f:
-        f.write("# Numerical DeltaSigma Regression Test Results\n")
+        f.write("# Numba Backend DeltaSigma Regression Test Results\n")
         f.write(f"# Date: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"# Backend: NumPy/Numba NFW\n")
         f.write(f"# Settings: {particle_fraction*100:.0f}% particles, "
                 f"{galaxy_fraction*100:.0f}% galaxies, {n_real} realizations\n")
         f.write(f"# Baseline: {n_baseline} realizations (100% particles/galaxies)\n")
@@ -338,9 +394,13 @@ def main():
         f.write(f"# Max deviation:    {metrics['max_frac_dev']*100:.2f}%\n")
         f.write(f"# RMS deviation:    {metrics['rms_frac_dev']*100:.2f}%\n")
         f.write(f"#\n")
-        f.write(f"# {'rp [Mpc/h]':>14s}  {'Baseline':>14s}  {'Optimized':>14s}  {'Deviation':>10s}\n")
-        for r, ds_b, ds_o, dev in zip(rp_centers, ds_baseline_mean, ds_opt_mean, per_bin_dev):
-            f.write(f"  {r:14.6f}  {ds_b:14.6e}  {ds_o:14.6e}  {dev*100:8.2f}%\n")
+        f.write(f"# JAX pop mean:   {timing_jax.mean():.3f} s\n")
+        f.write(f"# Numba pop mean: {timing_numba_pop.mean():.3f} s\n")
+        f.write(f"# Speedup: {speedup:.2f}x\n")
+        f.write(f"#\n")
+        f.write(f"# {'rp [Mpc/h]':>14s}  {'Baseline':>14s}  {'Numba':>14s}  {'Deviation':>10s}\n")
+        for r, ds_b, ds_n, dev in zip(rp_centers, ds_baseline_mean, ds_numba_mean, per_bin_dev):
+            f.write(f"  {r:14.6f}  {ds_b:14.6e}  {ds_n:14.6e}  {dev*100:8.2f}%\n")
     print(f"\n  Saved results: {RESULTS_OUTPUT}")
 
     # --- Plot ---
@@ -349,27 +409,22 @@ def main():
         sharex=True, gridspec_kw={"hspace": 0.05},
     )
 
-    # Top panel: DeltaSigma comparison
-    ax1.loglog(rp_centers, ds_baseline_mean, "k-", lw=2,
-               label=f"Baseline (mean of {n_baseline})")
-    ax1.loglog(rp_centers, ds_opt_mean, "ro--", lw=1.5, ms=5,
-               label=f"Optimized (mean of {n_real})")
-
-    # Individual realizations as faint lines
+    ax1.semilogx(rp_centers, rp_centers*ds_baseline_mean, "k-", lw=2,
+               label=f"Baseline JAX (mean of {n_baseline})")
+    ax1.semilogx(rp_centers, rp_centers*ds_numba_mean, "bs--", lw=1.5, ms=5,
+               label=f"Numba (mean of {n_real})")
     for i in range(n_real):
-        ax1.loglog(rp_centers, ds_opt_all[i], color="red", alpha=0.15, lw=0.5)
-
+        ax1.semilogx(rp_centers, rp_centers*ds_numba_all[i], color="blue", alpha=0.15, lw=0.5)
     ax1.set_ylabel(r"$\Delta\Sigma$ [$h\,M_\odot/\mathrm{pc}^2$]")
     ax1.legend(loc="upper right")
-    ax1.set_title("Numerical Regression Test: Optimized vs Baseline DeltaSigma")
+    ax1.set_title("Numba Backend Regression Test: Numba vs Baseline DeltaSigma")
 
-    # Bottom panel: fractional difference
     frac_diff = np.where(
         np.abs(ds_baseline_mean) > 1e-10,
-        (ds_opt_mean - ds_baseline_mean) / ds_baseline_mean,
+        (ds_numba_mean - ds_baseline_mean) / ds_baseline_mean,
         0.0,
     )
-    ax2.semilogx(rp_centers, frac_diff * 100, "ko-", ms=4)
+    ax2.semilogx(rp_centers, frac_diff * 100, "bo-", ms=4)
     ax2.axhline(0, color="gray", ls="--", lw=0.8)
     ax2.axhspan(-THRESHOLD * 100, THRESHOLD * 100, color="green", alpha=0.1,
                 label=rf"$\pm {THRESHOLD*100:.0f}\%$")

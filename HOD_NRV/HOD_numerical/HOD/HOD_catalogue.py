@@ -7,6 +7,7 @@ from HOD_NRV.utilsf.data_reader import (
     setup_assembly_bias_data, apply_rsd_preprocessing, validate_rsd_axis
 )
 from .population_engine import populate_haloes_full
+from .population_engine_numba import populate_haloes_full_numba
 from HOD_NRV.HOD_numerical.twopoint_calculator.standard_two_point_calculator import (
     compute_galaxy_clustering, compute_galaxy_lensing
 )
@@ -137,9 +138,13 @@ class HaloOccupation:
                  rsd_axis: str = 'z',
                  do_test: bool = True,
                  particle_fraction: float = 1.0,
-                 particle_subsample_seed: int = 42):
+                 particle_subsample_seed: int = 42,
+                 population_backend: str = "jax"):
 
         # Store configuration parameters
+        if population_backend not in ("jax", "numba"):
+            raise ValueError(f"population_backend must be 'jax' or 'numba', got {population_backend!r}")
+        self.population_backend = population_backend
         self.dict_cosmology = cosmology
         self.zeff = zeff
         self.Lbox = Lbox
@@ -336,8 +341,9 @@ class HaloOccupation:
         lambda_NFW = dict_params.get('lambda_NFW', 1.0)
 
         # Use the population engine for the complete workflow
+        _engine = populate_haloes_full_numba if self.population_backend == "numba" else populate_haloes_full
         (self.positions_gal, self.velocities_gal,
-         self.satellite_fraction, self.cent_halo_indices) = populate_haloes_full(
+         self.satellite_fraction, self.cent_halo_indices) = _engine(
             positions=self.positions,
             velocities=self.velocities,
             mass=self.mass,
