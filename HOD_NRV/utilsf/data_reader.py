@@ -130,11 +130,12 @@ def setup_cosmology(dict_cosmology: Dict[str, float],
     return cosmology, RHO_M, rsd_factor, logM_bins, mass_function
 
 
-def setup_data_arrays(df: pd.DataFrame, 
-                     column_mapping: Dict[str, str]) -> Tuple[jnp.ndarray, ...]:
+def setup_data_arrays(df: pd.DataFrame,
+                     column_mapping: Dict[str, str],
+                     backend: str = "jax") -> tuple:
     """
-    Convert pandas DataFrame columns to JAX arrays for core halo properties.
-    
+    Convert pandas DataFrame columns to arrays for core halo properties.
+
     Parameters
     ----------
     df : pd.DataFrame
@@ -142,62 +143,71 @@ def setup_data_arrays(df: pd.DataFrame,
     column_mapping : dict
         Dictionary mapping standard names to DataFrame column names:
         - 'x', 'y', 'z': Position coordinates
-        - 'vx', 'vy', 'vz': Velocity components  
+        - 'vx', 'vy', 'vz': Velocity components
         - 'mass': Halo mass
         - 'radius': Halo virial radius
         - 'c': Concentration parameter
         - 'vrms': Velocity dispersion
-        
+    backend : str, default "jax"
+        Array backend: "jax" returns jnp arrays; "numba" returns float64 numpy arrays.
+
     Returns
     -------
-    positions : jnp.ndarray, shape (N, 3)
+    positions : array, shape (N, 3)
         Halo positions in Cartesian coordinates [Mpc/h]
-    velocities : jnp.ndarray, shape (N, 3) 
+    velocities : array, shape (N, 3)
         Halo velocities [km/s]
-    mass : jnp.ndarray, shape (N,)
+    mass : array, shape (N,)
         Halo masses [Msun/h]
-    radius : jnp.ndarray, shape (N,)
+    radius : array, shape (N,)
         Halo virial radii [Mpc/h]
-    concentration : jnp.ndarray, shape (N,)
+    concentration : array, shape (N,)
         Halo concentration parameters (dimensionless)
-    vrms : jnp.ndarray, shape (N,)
-        Halo velocity dispersions [km/s]  
-    logM : jnp.ndarray, shape (N,)
+    vrms : array, shape (N,)
+        Halo velocity dispersions [km/s]
+    logM : array, shape (N,)
         Logarithm (base 10) of halo masses
-        
+
     Examples
     --------
     >>> cm = {'x': 'pos_x', 'y': 'pos_y', 'z': 'pos_z', 'vx': 'vel_x', ...}
     >>> pos, vel, mass, R, c, vrms, logM = setup_data_arrays(df, cm)
-    
-    Notes
-    -----
-    All arrays are converted to JAX arrays for compatibility with JAX-accelerated
-    functions used throughout the codebase.
     """
     cm = column_mapping  # shorthand
-    
-    # Stack position coordinates
-    positions = jnp.stack([
-        jnp.array(df[cm['x']]),
-        jnp.array(df[cm['y']]),
-        jnp.array(df[cm['z']])
-    ], axis=-1)
-    
-    # Stack velocity components
-    velocities = jnp.stack([
-        jnp.array(df[cm['vx']]),
-        jnp.array(df[cm['vy']]),
-        jnp.array(df[cm['vz']])
-    ], axis=-1)
-    
-    # Individual halo properties
-    mass = jnp.array(df[cm['mass']])
-    radius = jnp.array(df[cm['radius']])
-    concentration = jnp.array(df[cm['c']])
-    vrms = jnp.array(df[cm['vrms']])
-    logM = jnp.log10(mass)
-    
+
+    if backend == "numba":
+        positions = np.stack([
+            np.asarray(df[cm['x']], dtype=np.float64),
+            np.asarray(df[cm['y']], dtype=np.float64),
+            np.asarray(df[cm['z']], dtype=np.float64),
+        ], axis=-1)
+        velocities = np.stack([
+            np.asarray(df[cm['vx']], dtype=np.float64),
+            np.asarray(df[cm['vy']], dtype=np.float64),
+            np.asarray(df[cm['vz']], dtype=np.float64),
+        ], axis=-1)
+        mass          = np.asarray(df[cm['mass']],   dtype=np.float64)
+        radius        = np.asarray(df[cm['radius']], dtype=np.float64)
+        concentration = np.asarray(df[cm['c']],      dtype=np.float64)
+        vrms          = np.asarray(df[cm['vrms']],   dtype=np.float64)
+        logM          = np.log10(mass)
+    else:  # "jax"
+        positions = jnp.stack([
+            jnp.array(df[cm['x']]),
+            jnp.array(df[cm['y']]),
+            jnp.array(df[cm['z']])
+        ], axis=-1)
+        velocities = jnp.stack([
+            jnp.array(df[cm['vx']]),
+            jnp.array(df[cm['vy']]),
+            jnp.array(df[cm['vz']])
+        ], axis=-1)
+        mass          = jnp.array(df[cm['mass']])
+        radius        = jnp.array(df[cm['radius']])
+        concentration = jnp.array(df[cm['c']])
+        vrms          = jnp.array(df[cm['vrms']])
+        logM          = jnp.log10(mass)
+
     return positions, velocities, mass, radius, concentration, vrms, logM
 
 
@@ -241,35 +251,38 @@ def setup_particle_data_arrays(df_part: pd.DataFrame,
     return positions_part, velocities_part
 
 
-def setup_triaxial_shapes(df: pd.DataFrame, 
-                         column_mapping: Dict[str, str]) -> Tuple[jnp.ndarray, jnp.ndarray]:
+def setup_triaxial_shapes(df: pd.DataFrame,
+                         column_mapping: Dict[str, str],
+                         backend: str = "jax") -> tuple:
     """
     Set up triaxial halo shape data for elliptical NFW profiles.
-    
+
     Parameters
     ----------
     df : pd.DataFrame
         Halo catalog DataFrame
-    column_mapping : dict  
+    column_mapping : dict
         Dictionary with triaxial shape column mappings:
         - 'a_x', 'a_y', 'a_z': Major axis components
-        - 'b_x', 'b_y', 'b_z': Intermediate axis components  
+        - 'b_x', 'b_y', 'b_z': Intermediate axis components
         - 'b_to_a': Axis ratio b/a
         - 'c_to_a': Axis ratio c/a
-        
+    backend : str, default "jax"
+        Array backend: "jax" returns jnp arrays; "numba" returns float64 numpy arrays.
+
     Returns
     -------
-    shapes : jnp.ndarray, shape (N, 3, 3)
+    shapes : array, shape (N, 3, 3)
         Orthonormal basis vectors for each halo: [a_hat, b_hat, c_hat]
         where c_hat = a_hat × b_hat
-    ratios : jnp.ndarray, shape (N, 2)
+    ratios : array, shape (N, 2)
         Axis ratios [b/a, c/a] for each halo
-        
+
     Examples
     --------
     >>> cm = {'a_x': 'axis_A_x', 'a_y': 'axis_A_y', ...}
     >>> shapes, ratios = setup_triaxial_shapes(df, cm)
-    
+
     Notes
     -----
     The major (a) and intermediate (b) axes are normalized to unit vectors.
@@ -277,35 +290,52 @@ def setup_triaxial_shapes(df: pd.DataFrame,
     a right-handed orthonormal coordinate system.
     """
     cm = column_mapping
-    
-    # Read and normalize major axis
-    a = jnp.stack([
-        jnp.array(df[cm['a_x']]),
-        jnp.array(df[cm['a_y']]),
-        jnp.array(df[cm['a_z']])
-    ], axis=-1)
-    a = a / jnp.linalg.norm(a, axis=-1)[:, None]
-    
-    # Read and normalize intermediate axis
-    b = jnp.stack([
-        jnp.array(df[cm['b_x']]),
-        jnp.array(df[cm['b_y']]),
-        jnp.array(df[cm['b_z']])
-    ], axis=-1)
-    b = b / jnp.linalg.norm(b, axis=-1)[:, None]
-    
-    # Compute minor axis via cross product
-    c = jnp.cross(a, b)
-    
-    # Stack into shape tensor
-    shapes = jnp.stack([a, b, c], axis=-1)
-    
-    # Read axis ratios  
-    ratios = jnp.stack([
-        jnp.array(df[cm['b_to_a']]),
-        jnp.array(df[cm['c_to_a']])
-    ], axis=-1)
-    
+
+    if backend == "numba":
+        a = np.stack([
+            np.asarray(df[cm['a_x']], dtype=np.float64),
+            np.asarray(df[cm['a_y']], dtype=np.float64),
+            np.asarray(df[cm['a_z']], dtype=np.float64),
+        ], axis=-1)
+        a = a / np.linalg.norm(a, axis=-1)[:, None]
+
+        b = np.stack([
+            np.asarray(df[cm['b_x']], dtype=np.float64),
+            np.asarray(df[cm['b_y']], dtype=np.float64),
+            np.asarray(df[cm['b_z']], dtype=np.float64),
+        ], axis=-1)
+        b = b / np.linalg.norm(b, axis=-1)[:, None]
+
+        c = np.cross(a, b)
+        shapes = np.stack([a, b, c], axis=-1)
+
+        ratios = np.stack([
+            np.asarray(df[cm['b_to_a']], dtype=np.float64),
+            np.asarray(df[cm['c_to_a']], dtype=np.float64),
+        ], axis=-1)
+    else:  # "jax"
+        a = jnp.stack([
+            jnp.array(df[cm['a_x']]),
+            jnp.array(df[cm['a_y']]),
+            jnp.array(df[cm['a_z']])
+        ], axis=-1)
+        a = a / jnp.linalg.norm(a, axis=-1)[:, None]
+
+        b = jnp.stack([
+            jnp.array(df[cm['b_x']]),
+            jnp.array(df[cm['b_y']]),
+            jnp.array(df[cm['b_z']])
+        ], axis=-1)
+        b = b / jnp.linalg.norm(b, axis=-1)[:, None]
+
+        c = jnp.cross(a, b)
+        shapes = jnp.stack([a, b, c], axis=-1)
+
+        ratios = jnp.stack([
+            jnp.array(df[cm['b_to_a']]),
+            jnp.array(df[cm['c_to_a']])
+        ], axis=-1)
+
     return shapes, ratios
 
 

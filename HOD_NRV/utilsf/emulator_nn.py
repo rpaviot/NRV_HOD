@@ -1,7 +1,7 @@
 """
-PyTorch MLP emulator for DeltaSigma(rp) predictions.
+CosmoPower neural emulator for DeltaSigma(rp) predictions.
 
-Trains a 4-layer residual MLP mapping normalized HOD parameters θ → log ΔΣ(rp).
+Trains a cosmopower_NN mapping HOD parameters → log10 ΔΣ(rp).
 Designed to replace the slow numerical forward model (~3.2s/call) with a fast
 emulator (~μs/call) for Nautilus nested sampling.
 
@@ -12,328 +12,177 @@ Training::
     from HOD_NRV.utilsf.emulator_nn import train_emulator, load_emulator
 
     emulator = train_emulator(
-        params, dsigma, rp_centers,
-        save_path="emulator_STANDARD_NFW.pt"
+        params, dsigma, param_names, rp_centers,
+        save_path="emulator_STANDARD_NFW"
     )
 
 Inference::
 
-    emulator, norm_stats = load_emulator("emulator_STANDARD_NFW.pt")
-    theta_norm = (theta - norm_stats["x_mean"]) / norm_stats["x_std"]
-    log_ds_norm = emulator(torch.tensor(theta_norm, dtype=torch.float32))
-    ds_pred = np.exp(log_ds_norm.detach().numpy() * norm_stats["y_std"] + norm_stats["y_mean"])
+    model, norm_stats = load_emulator("emulator_STANDARD_NFW")
+    ds_pred = predict_dsigma(model, norm_stats, theta)
 """
 
 import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
-from typing import Optional, Tuple
-
-
-class DeltaSigmaEmulator(nn.Module):
-    """
-    4-hidden-layer MLP with residual connections for DeltaSigma emulation.
-
-    Architecture: Input(n_params) → [256→256→256→256] ReLU + skip → Output(n_rp)
-
-    Each pair of consecutive layers forms a residual block:
-      - Block 1: layers[0] → layers[1] (with a learned projection if dims differ)
-      - Block 2: layers[2] → layers[3]
-
-    Parameters
-    ----------
-    n_params : int
-        Number of input HOD parameters.
-    n_rp : int
-        Number of rp bins (output dimension).
-    hidden_size : int, default=256
-        Width of all hidden layers.
-    """
-
-    def __init__(self, n_params: int, n_rp: int, hidden_size: int = 256):
-        super().__init__()
-        self.n_params = n_params
-        self.n_rp = n_rp
-        self.hidden_size = hidden_size
-
-        # Input projection
-        self.input_proj = nn.Linear(n_params, hidden_size)
-
-        # Residual blocks: each block has 2 linear layers + ReLU
-        self.block1 = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-        )
-        self.block2 = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.ReLU(),
-            nn.Linear(hidden_size, hidden_size),
-        )
-
-        self.relu = nn.ReLU()
-        self.output = nn.Linear(hidden_size, n_rp)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
-
-        Parameters
-        ----------
-        x : torch.Tensor, shape (..., n_params)
-            Normalized input parameters.
-
-        Returns
-        -------
-        torch.Tensor, shape (..., n_rp)
-            Normalized log DeltaSigma predictions.
-        """
-        h = self.relu(self.input_proj(x))
-        h = self.relu(self.block1(h) + h)   # residual
-        h = self.relu(self.block2(h) + h)   # residual
-        return self.output(h)
-
-
-def _compute_norm_stats(
-    params: np.ndarray,
-    log_dsigma: np.ndarray,
-) -> dict:
-    """Compute input/output normalization statistics."""
-    x_mean = params.mean(axis=0)
-    x_std = params.std(axis=0)
-    x_std = np.where(x_std == 0, 1.0, x_std)  # avoid division by zero
-
-    y_mean = log_dsigma.mean(axis=0)
-    y_std = log_dsigma.std(axis=0)
-    y_std = np.where(y_std == 0, 1.0, y_std)
-
-    return {
-        "x_mean": x_mean.astype(np.float32),
-        "x_std": x_std.astype(np.float32),
-        "y_mean": y_mean.astype(np.float32),
-        "y_std": y_std.astype(np.float32),
-    }
+from cosmopower_NN import cosmopower_NN
 
 
 def train_emulator(
     params: np.ndarray,
     dsigma: np.ndarray,
+    param_names: list,
     rp_centers: np.ndarray,
-    val_fraction: float = 0.2,
-    n_epochs: int = 2000,
-    batch_size: int = 512,
-    lr: float = 1e-3,
-    patience: int = 100,
-    hidden_size: int = 256,
-    save_path: Optional[str] = None,
+    save_path: str,
+    n_hidden: list = [1024, 1024, 1024, 1024],
+    validation_split: float = 0.1,
+    learning_rates: list = [1e-2, 1e-3, 1e-4, 1e-5],
+    batch_sizes: list = [512, 512, 512, 512],
+    patience_values: list = [100, 100, 100, 100],
+    max_epochs: list = [1000, 1000, 1000, 1000],
     verbose: bool = True,
-) -> "DeltaSigmaEmulator":
+) -> "cosmopower_NN":
     """
-    Train a DeltaSigmaEmulator MLP on a pre-computed HOD grid.
+    Train a cosmopower_NN emulator on a pre-computed HOD grid.
 
     Parameters
     ----------
     params : np.ndarray, shape (N, n_params)
         Raw HOD parameter values from the grid.
     dsigma : np.ndarray, shape (N, n_rp)
-        Corresponding DeltaSigma values. Rows with any NaN are discarded.
+        Corresponding DeltaSigma values. Rows with any non-positive or
+        non-finite value are discarded.
+    param_names : list of str
+        Parameter name for each column of params.
     rp_centers : np.ndarray, shape (n_rp,)
-        Projected separation bin centers [Mpc/h]. Stored in the saved file.
-    val_fraction : float, default=0.2
-        Fraction of data held out for validation / early stopping.
-    n_epochs : int, default=2000
-        Maximum training epochs.
-    batch_size : int, default=512
-        Mini-batch size.
-    lr : float, default=1e-3
-        Initial learning rate (Adam optimizer).
-    patience : int, default=100
-        Early stopping: stop if validation loss does not improve for this
-        many epochs.
-    hidden_size : int, default=256
-        Width of hidden layers in the MLP.
-    save_path : str, optional
-        If provided, save the trained model + normalization stats to this path.
-        Two files are written:
-          - ``save_path`` — torch model state dict (.pt)
-          - ``save_path + ".norm.npz"`` — normalization stats
+        Projected separation bin centers [Mpc/h]. Stored in the metadata file.
+    save_path : str
+        Base path for saving. cosmopower writes the model weights here;
+        metadata is saved to ``save_path + ".meta.npz"``.
+    n_hidden : list of int, default=[1024, 1024, 1024, 1024]
+        Number of units in each hidden layer.
+    validation_split : float, default=0.1
+        Fraction of data held out for validation.
+    learning_rates : list of float, default=[1e-2, 1e-3, 1e-4, 1e-5]
+        Learning rate for each training stage.
+    batch_sizes : list of int, default=[512, 512, 512, 512]
+        Batch size for each training stage.
+    patience_values : list of int, default=[100, 100, 100, 100]
+        Early stopping patience for each training stage.
+    max_epochs : list of int, default=[1000, 1000, 1000, 1000]
+        Maximum epochs for each training stage.
     verbose : bool, default=True
         Print training progress.
 
     Returns
     -------
-    model : DeltaSigmaEmulator
-        Trained model (on CPU, in eval mode).
+    cp_nn : cosmopower_NN
+        Trained cosmopower model.
 
     Notes
     -----
-    * Inputs are normalized: ``(θ - μ_θ) / σ_θ``
-    * Outputs are trained on ``log(ΔΣ)``, normalized: ``(log ΔΣ - μ_y) / σ_y``
-    * Rows where any ΔΣ value is NaN or non-positive are dropped before training.
+    * Training is performed in log10(ΔΣ) space — critical because ΔΣ varies
+      by orders of magnitude across rp bins and HOD parameters.
+    * Rows where any ΔΣ value is NaN, non-positive, or params are non-finite
+      are dropped before training.
+    * The metadata file stores rp_centers and param_names for later loading.
     """
-    # Drop rows with invalid DeltaSigma
-    valid = np.all(np.isfinite(dsigma) & (dsigma > 0), axis=1)
-    params = params[valid].astype(np.float32)
-    dsigma = dsigma[valid].astype(np.float32)
+    # Drop rows with invalid DeltaSigma or non-finite params
+    valid_ds = np.all(np.isfinite(dsigma) & (dsigma > 0), axis=1)
+    valid_params = np.all(np.isfinite(params), axis=1)
+    valid = valid_ds & valid_params
+
+    params = params[valid]
+    dsigma = dsigma[valid]
 
     n_total = len(params)
     if n_total < 10:
         raise ValueError(f"Only {n_total} valid grid points — not enough to train.")
 
-    log_dsigma = np.log(dsigma)
-
-    # Normalization
-    norm_stats = _compute_norm_stats(params, log_dsigma)
-    x_norm = (params - norm_stats["x_mean"]) / norm_stats["x_std"]
-    y_norm = (log_dsigma - norm_stats["y_mean"]) / norm_stats["y_std"]
-
-    # Train/val split (random shuffle)
-    rng = np.random.default_rng(seed=0)
-    idx = rng.permutation(n_total)
-    n_val = max(1, int(val_fraction * n_total))
-    val_idx, train_idx = idx[:n_val], idx[n_val:]
-
-    x_train = torch.from_numpy(x_norm[train_idx])
-    y_train = torch.from_numpy(y_norm[train_idx])
-    x_val   = torch.from_numpy(x_norm[val_idx])
-    y_val   = torch.from_numpy(y_norm[val_idx])
-
-    train_loader = DataLoader(
-        TensorDataset(x_train, y_train),
-        batch_size=batch_size,
-        shuffle=True,
-    )
-
-    n_params_dim = params.shape[1]
-    n_rp = dsigma.shape[1]
-    model = DeltaSigmaEmulator(n_params_dim, n_rp, hidden_size=hidden_size)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=patience // 2
-    )
-    loss_fn = nn.MSELoss()
-
-    best_val_loss = float("inf")
-    best_state = None
-    epochs_no_improve = 0
-
-    for epoch in range(1, n_epochs + 1):
-        model.train()
-        train_loss = 0.0
-        for xb, yb in train_loader:
-            optimizer.zero_grad()
-            pred = model(xb)
-            loss = loss_fn(pred, yb)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item() * len(xb)
-        train_loss /= len(x_train)
-
-        model.eval()
-        with torch.no_grad():
-            val_pred = model(x_val)
-            val_loss = loss_fn(val_pred, y_val).item()
-
-        scheduler.step(val_loss)
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_state = {k: v.clone() for k, v in model.state_dict().items()}
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-
-        if verbose and epoch % 100 == 0:
-            print(
-                f"Epoch {epoch:5d}/{n_epochs}  "
-                f"train_loss={train_loss:.4e}  val_loss={val_loss:.4e}  "
-                f"best={best_val_loss:.4e}"
-            )
-
-        if epochs_no_improve >= patience:
-            if verbose:
-                print(f"Early stopping at epoch {epoch} (no improvement for {patience} epochs)")
-            break
-
-    # Restore best weights
-    if best_state is not None:
-        model.load_state_dict(best_state)
-    model.eval()
-
     if verbose:
-        print(f"Training complete. Best val loss: {best_val_loss:.4e}  "
-              f"({n_total} points, {n_rp} rp bins)")
+        print(f"Training on {n_total} valid grid points, {dsigma.shape[1]} rp bins.")
 
-    if save_path is not None:
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "n_params": n_params_dim,
-                "n_rp": n_rp,
-                "hidden_size": hidden_size,
-            },
-            save_path,
-        )
-        norm_path = save_path + ".norm.npz"
-        np.savez(
-            norm_path,
-            x_mean=norm_stats["x_mean"],
-            x_std=norm_stats["x_std"],
-            y_mean=norm_stats["y_mean"],
-            y_std=norm_stats["y_std"],
-            rp_centers=rp_centers.astype(np.float32),
-        )
-        if verbose:
-            print(f"Saved model to: {save_path}")
-            print(f"Saved norm stats to: {norm_path}")
+    # Train in log10 space
+    features = np.log10(dsigma)
 
-    return model
+    # Build cosmopower training dict
+    training_parameters = {name: list(params[:, i]) for i, name in enumerate(param_names)}
+
+    n_rp = dsigma.shape[1]
+    n_stages = len(learning_rates)
+
+    cp_nn = cosmopower_NN(
+        parameters=param_names,
+        modes=np.linspace(-1, 1, n_rp),
+        n_hidden=n_hidden,
+        verbose=verbose,
+    )
+
+    cp_nn.train(
+        training_parameters=training_parameters,
+        training_features=features,
+        filename_saved_model=save_path,
+        validation_split=validation_split,
+        learning_rates=learning_rates,
+        batch_sizes=batch_sizes,
+        gradient_accumulation_steps=[1] * n_stages,
+        patience_values=patience_values,
+        max_epochs=max_epochs,
+    )
+
+    # Save metadata
+    meta_path = save_path + ".meta.npz"
+    np.savez(
+        meta_path,
+        rp_centers=rp_centers.astype(np.float64),
+        param_names=np.array(param_names),
+    )
+    if verbose:
+        print(f"Saved metadata to: {meta_path}")
+
+    return cp_nn
 
 
-def load_emulator(path: str) -> Tuple["DeltaSigmaEmulator", dict]:
+def load_emulator(path: str) -> tuple:
     """
-    Load a trained DeltaSigmaEmulator and its normalization statistics.
+    Load a trained cosmopower_NN emulator and its metadata.
 
     Parameters
     ----------
     path : str
-        Path to the saved .pt model file (written by train_emulator()).
-        The companion .norm.npz file must exist at ``path + ".norm.npz"``.
+        Base path used when saving (written by train_emulator()).
+        The companion ``<path>.meta.npz`` must exist.
 
     Returns
     -------
-    model : DeltaSigmaEmulator
-        Loaded model in eval mode on CPU.
+    cp_nn : cosmopower_NN
+        Restored cosmopower model.
     norm_stats : dict
-        Normalization statistics with keys:
-        ``x_mean``, ``x_std``, ``y_mean``, ``y_std``, ``rp_centers``.
-        All values are float32 numpy arrays.
+        Metadata dict with keys:
+        ``rp_centers`` — projected separation bin centers (float64 array),
+        ``param_names`` — list of parameter names.
     """
-    ckpt = torch.load(path, map_location="cpu", weights_only=True)
-    model = DeltaSigmaEmulator(
-        n_params=ckpt["n_params"],
-        n_rp=ckpt["n_rp"],
-        hidden_size=ckpt.get("hidden_size", 256),
-    )
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
+    meta_path = path + ".meta.npz"
+    meta = np.load(meta_path, allow_pickle=True)
+    rp_centers = meta["rp_centers"]
+    param_names = list(meta["param_names"])
 
-    norm_path = path + ".norm.npz"
-    norm_data = np.load(norm_path)
+    n_rp = len(rp_centers)
+
+    cp_nn = cosmopower_NN(
+        parameters=param_names,
+        modes=np.linspace(-1, 1, n_rp),
+    )
+    cp_nn.restore(path)
+
     norm_stats = {
-        "x_mean": norm_data["x_mean"],
-        "x_std": norm_data["x_std"],
-        "y_mean": norm_data["y_mean"],
-        "y_std": norm_data["y_std"],
-        "rp_centers": norm_data["rp_centers"],
+        "rp_centers": rp_centers,
+        "param_names": param_names,
     }
 
-    return model, norm_stats
+    return cp_nn, norm_stats
 
 
 def predict_dsigma(
-    model: "DeltaSigmaEmulator",
+    model: "cosmopower_NN",
     norm_stats: dict,
     params: np.ndarray,
 ) -> np.ndarray:
@@ -342,12 +191,12 @@ def predict_dsigma(
 
     Parameters
     ----------
-    model : DeltaSigmaEmulator
+    model : cosmopower_NN
         Trained model (from load_emulator or train_emulator).
     norm_stats : dict
-        Normalization stats (from load_emulator or _compute_norm_stats).
+        Metadata dict (from load_emulator). Must contain ``param_names``.
     params : np.ndarray, shape (N, n_params) or (n_params,)
-        Raw (unnormalized) HOD parameter values.
+        Raw HOD parameter values.
 
     Returns
     -------
@@ -358,15 +207,10 @@ def predict_dsigma(
     if scalar_input:
         params = params[np.newaxis, :]
 
-    x_norm = ((params.astype(np.float32) - norm_stats["x_mean"])
-              / norm_stats["x_std"])
-    x_t = torch.from_numpy(x_norm)
+    param_names = norm_stats["param_names"]
+    params_dict = {name: params[:, i] for i, name in enumerate(param_names)}
 
-    model.eval()
-    with torch.no_grad():
-        y_norm = model(x_t).numpy()
+    log10_ds = model.predictions_np(params_dict)
+    ds = 10.0 ** log10_ds
 
-    log_ds = y_norm * norm_stats["y_std"] + norm_stats["y_mean"]
-    dsigma_pred = np.exp(log_ds)
-
-    return dsigma_pred[0] if scalar_input else dsigma_pred
+    return ds[0] if scalar_input else ds

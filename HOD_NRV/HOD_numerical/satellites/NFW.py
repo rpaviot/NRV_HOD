@@ -295,12 +295,11 @@ def extended_NFW_positions_numba(halo_centers, Rvir, c, N_s,
     u_theta = np.random.uniform(0.0, 1.0, N_s_tot)
     u_phi = np.random.uniform(0.0, 1.0, N_s_tot)
 
-    # Exponential component: r >= Rvir, decays as exp(-(r-Rvir)/(tau*Rs))
+    # Exponential component: r in [0, Rmax], decays as exp(-r/(tau*Rs))
     Rmax_exp = sat_Rvir * 3.0
-    delta_max = Rmax_exp - sat_Rvir
-    u_max = 1.0 - np.exp(-delta_max / (tau * sat_Rs))
+    u_max = 1.0 - np.exp(-Rmax_exp / (tau * sat_Rs))
     u_scaled = u * u_max
-    radii_exp = sat_Rvir - tau * sat_Rs * np.log(1.0 - u_scaled)
+    radii_exp = -tau * sat_Rs * np.log(1.0 - u_scaled)
 
     # NFW component with rescaled concentration
     radii_nfw = _sample_radii_kernel(u, sat_Rvir, sat_Rs / lambda_NFW,
@@ -348,12 +347,11 @@ def extended_elliptical_NFW_positions_numba(halo_centers, Rvir, c, shapes, axis_
     u_theta = np.random.uniform(0.0, 1.0, N_s_tot)
     u_phi = np.random.uniform(0.0, 1.0, N_s_tot)
 
-    # Exponential component
+    # Exponential component: r in [0, Rmax], decays as exp(-r/(tau*Rs))
     Rmax_exp = sat_Rvir * 3.0
-    delta_max = Rmax_exp - sat_Rvir
-    u_max = 1.0 - np.exp(-delta_max / (tau * sat_Rs))
+    u_max = 1.0 - np.exp(-Rmax_exp / (tau * sat_Rs))
     u_scaled = u * u_max
-    radii_exp = sat_Rvir - tau * sat_Rs * np.log(1.0 - u_scaled)
+    radii_exp = -tau * sat_Rs * np.log(1.0 - u_scaled)
 
     # NFW component
     radii_nfw = _sample_radii_kernel(u, sat_Rvir, sat_Rs / lambda_NFW,

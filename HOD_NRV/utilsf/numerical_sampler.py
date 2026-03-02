@@ -14,8 +14,6 @@ import numpy as np
 from enum import IntEnum
 from typing import Dict, Optional, Tuple, Any
 
-import torch
-
 from .emulator_utils import rescale_Ac_to_target_ngal
 from .emulator_nn import load_emulator, predict_dsigma
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
@@ -677,10 +675,7 @@ class EmulatorFitter:
         if param_names_ordered is not None:
             self.emulator_param_order = param_names_ordered
         else:
-            # Use the same order as NumericalDeltaSigmaFitter._build_params produces
-            # Full params include Ac, As, Mmin, sig_M, gamma, M1, alpha, kappa,
-            # lambda_NFW, [f_exp, tau], [kappa_EE]
-            self.emulator_param_order = self._default_emulator_param_order()
+            self.emulator_param_order = list(self.norm_stats["param_names"])
 
         # Apply scale cuts to obs data
         self.rp_obs = np.asarray(rp_obs)

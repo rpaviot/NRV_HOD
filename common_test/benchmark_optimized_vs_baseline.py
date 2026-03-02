@@ -154,6 +154,8 @@ def main():
         apply_rsd=False,
         triaxial_NFW=False,
         do_test=False,
+        population_backend='numba'
+
     )
 
     # --- Set HOD model and rescale Ac/As ---

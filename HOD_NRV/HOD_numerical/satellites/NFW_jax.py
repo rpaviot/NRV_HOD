@@ -181,47 +181,43 @@ def dispersion_velocities_satellites(key, halo_velocities, vrms_h, N_s, N_s_tot)
 
 
 @jit
-def exponential_profile_CDF_continuous(r, tau, Rs, Rvir):
+def exponential_profile_CDF_continuous(r, tau, Rs):
     """
-    CDF for exponential profile with continuity enforcement at Rvir.
+    CDF for exponential profile dN/dr = exp(-r / (tau * Rs)) for r in [0, Rmax].
 
     Parameters
     ----------
-    r : radius (must be >= Rvir)
+    r : radius
     tau : exponential decay scale in units of Rs
     Rs : scale radius
-    Rvir : virial radius
 
     Returns
     -------
-    CDF value for r >= Rvir
+    CDF value
     """
-    delta_r = r - Rvir
-    return 1.0 - jnp.exp(-delta_r / (tau * Rs))
+    return 1.0 - jnp.exp(-r / (tau * Rs))
 
 
 @jit
-def single_exponential_inverse_CDF_continuous(u, tau, Rs, Rvir, Rmax):
+def single_exponential_inverse_CDF_continuous(u, tau, Rs, Rmax):
     """
-    Inverse CDF for exponential profile starting at Rvir with continuity.
+    Inverse CDF for exponential profile dN/dr = exp(-r / (tau * Rs)) for r in [0, Rmax].
 
     Parameters
     ----------
     u : uniform random variable [0,1]
     tau : exponential decay scale in units of Rs
     Rs : scale radius
-    Rvir : virial radius (starting point of exponential)
     Rmax : maximum radius cutoff
 
     Returns
     -------
-    radius sample (r >= Rvir)
+    radius sample in [0, Rmax]
     """
-    delta_max = Rmax - Rvir
-    u_max = 1.0 - jnp.exp(-delta_max / (tau * Rs))
+    u_max = 1.0 - jnp.exp(-Rmax / (tau * Rs))
     u_scaled = u * u_max
 
-    return Rvir - tau * Rs * jnp.log(1.0 - u_scaled)
+    return -tau * Rs * jnp.log(1.0 - u_scaled)
 
 
 @partial(jit, static_argnames=['N_s_tot'])
@@ -263,8 +259,8 @@ def extended_NFW_satellites_positions(key, halo_centers, Rvir, c, N_s, N_s_tot,
 
     # Exponential component
     Rmax_exp = sat_Rvir * 3.0
-    radii_exp = vmap(single_exponential_inverse_CDF_continuous, in_axes=(0, None, 0, 0, 0))(
-        u_samples, tau, sat_Rs, sat_Rvir, Rmax_exp
+    radii_exp = vmap(single_exponential_inverse_CDF_continuous, in_axes=(0, None, 0, 0))(
+        u_samples, tau, sat_Rs, Rmax_exp
     )
 
     # NFW component with pre-computed grid
@@ -321,8 +317,8 @@ def extended_elliptical_NFW_satellites_positions(key, halo_centers, Rvir, c,
 
     # Exponential component
     Rmax_exp = sat_Rvir * 3.0
-    radii_exp = vmap(single_exponential_inverse_CDF_continuous, in_axes=(0, None, 0, 0, 0))(
-        u_samples, tau, sat_Rs, sat_Rvir, Rmax_exp
+    radii_exp = vmap(single_exponential_inverse_CDF_continuous, in_axes=(0, None, 0, 0))(
+        u_samples, tau, sat_Rs, Rmax_exp
     )
 
     # NFW component with pre-computed grid

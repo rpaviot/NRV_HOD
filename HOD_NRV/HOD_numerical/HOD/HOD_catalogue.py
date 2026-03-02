@@ -176,7 +176,7 @@ class HaloOccupation:
         # === HALO DATA ARRAYS ===
         (self.positions, self.velocities, self.mass, self.radius,
          self.concentration, self.vrms, self.logM) = setup_data_arrays(
-            self.DataFrame, column_mapping
+            self.DataFrame, column_mapping, backend=self.population_backend
         )
 
         # === PARTICLE DATA ARRAYS ===
@@ -203,7 +203,7 @@ class HaloOccupation:
         # === TRIAXIAL SHAPES ===
         if self.triaxial_NFW:
             self.shapes, self.ratios = setup_triaxial_shapes(
-                self.DataFrame, column_mapping
+                self.DataFrame, column_mapping, backend=self.population_backend
             )
         else:
             self.shapes = None

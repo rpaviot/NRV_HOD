@@ -225,13 +225,8 @@ def populate_haloes_full_numba(
     cent_halo_indices : (N_centrals,) indices of halos hosting centrals
     """
     if random_seed is None:
-        random_seed = np.random.randint(1, int(1e18))
+        random_seed = np.random.randint(1, int(2**32)-1)
     np.random.seed(random_seed)
-
-    # Ensure inputs are numpy (JAX arrays are auto-converted)
-    positions = np.asarray(positions, dtype=np.float64)
-    velocities = np.asarray(velocities, dtype=np.float64)
-    logM = np.asarray(logM, dtype=np.float64)
 
     # Compute occupation probabilities (JAX-JIT; handles numpy->jax conversion)
     probC = np.asarray(hod_model.compute_central_occupation(logM, dict_params))
