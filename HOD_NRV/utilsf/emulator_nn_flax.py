@@ -343,6 +343,17 @@ def train_emulator(
         n_outputs=n_outputs,
     )
 
+    # --- Post-training validation report ---
+    if verbose:
+        log_ds_va_pred = emulator.predict(params_va)          # (n_val, n_rp), log10 ΔΣ
+        ds_va_pred = 10.0 ** log_ds_va_pred
+        ds_va_true = 10.0 ** log_ds_va
+        frac_err = np.abs(ds_va_pred - ds_va_true) / ds_va_true
+        print(f"Validation set ({n_val} points):")
+        print(f"  Median |ΔΣ_pred - ΔΣ_true| / ΔΣ_true = {np.median(frac_err)*100:.2f}%")
+        print(f"  95th pct                               = {np.percentile(frac_err, 95)*100:.2f}%")
+        print(f"  Max                                    = {frac_err.max()*100:.2f}%")
+
     # --- Save weights ---
     weights_path = save_path + ".flax.npz"
     flat_params  = flatten_dict({'params': best_params}, sep='/')
