@@ -15,7 +15,7 @@ from enum import IntEnum
 from typing import Dict, Optional, Tuple, Any
 
 from .emulator_utils import rescale_Ac_to_target_ngal
-from .emulator_nn import load_emulator, predict_dsigma
+from .emulator_nn_flax import load_emulator, predict_dsigma
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
 
 
