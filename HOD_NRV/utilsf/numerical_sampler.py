@@ -600,42 +600,50 @@ class EmulatorFitter:
     Parameters
     ----------
     emulator_path : str
-        Path to the saved .pt model file written by train_emulator().
-        The companion <emulator_path>.norm.npz must also exist.
-    ds_obs : np.ndarray, shape (n_bins,)
-        Observed DeltaSigma signal.
-    cov_inv : np.ndarray, shape (n_bins, n_bins)
-        Inverse covariance matrix.
-    rp_obs : np.ndarray, shape (n_bins,)
-        Projected separation bin centers corresponding to ds_obs [Mpc/h].
+        Path to the saved model file written by train_emulator().
+        The companion <emulator_path>.meta.npz must also exist.
     fit_case : FitCase
         Which model complexity to use (determines free parameters).
-    target_ngal : float
-        Fixed galaxy number density [(Mpc/h)^-3] used for Ac/As rescaling.
+    data_path : str, optional
+        Path to .npz file with observed DeltaSigma data. Flexible key names:
+        ``rp`` / ``rp_centers``, ``rp_bins`` / ``rp_edges``,
+        ``delta_sigma`` / ``dsigma``, ``cov_delta_sigma`` / ``cov_dsigma``.
+        Provide either ``data_path`` or all three of (``ds_obs``, ``cov_inv``,
+        ``rp_obs``).
+    ds_obs : np.ndarray, shape (n_bins,), optional
+        Observed DeltaSigma signal. Used when ``data_path`` is not given.
+    cov_inv : np.ndarray, shape (n_bins, n_bins), optional
+        Inverse covariance matrix. Used when ``data_path`` is not given.
+    rp_obs : np.ndarray, shape (n_bins,), optional
+        Projected separation bin centers [Mpc/h]. Used when ``data_path`` is
+        not given.
     param_names_ordered : list of str, optional
         Ordered list of HOD parameter names as stored in the emulator grid.
         Must match the column order of the param_grid used during training.
-        Defaults to the order implied by fit_case via _get_free_params + M1.
+        Defaults to the order read from the emulator metadata.
     M1_fixed : float, default=13.0
         Fixed log10(M1) value.
     rp_min : float, optional
         Minimum rp scale cut [Mpc/h].
     rp_max : float, optional
         Maximum rp scale cut [Mpc/h].
-    hod_model : HaloOccupation or object with .HOD, optional
-        Needed only for the Ac/As rescaling step. If None, Ac rescaling
-        is skipped and parameters are passed directly to the emulator — only
-        valid if the emulator was trained with Ac already rescaled (as produced
-        by generate_hod_parameter_grid).
 
     Examples
     --------
+    Load data from file:
+
     >>> fitter = EmulatorFitter(
-    ...     emulator_path="emulator_STANDARD_NFW.pt",
+    ...     emulator_path="emulator_STANDARD_NFW",
+    ...     data_path="observed_ds.npz",
+    ...     fit_case=FitCase.STANDARD_NFW,
+    ... )
+
+    Or pass arrays directly (backward-compatible):
+
+    >>> fitter = EmulatorFitter(
+    ...     emulator_path="emulator_STANDARD_NFW",
     ...     ds_obs=ds_obs, cov_inv=cov_inv, rp_obs=rp_centers,
     ...     fit_case=FitCase.STANDARD_NFW,
-    ...     target_ngal=2e-4,
-    ...     hod_model=halo,
     ... )
     >>> points, weights, log_l, log_z = fitter.run(n_live=500, n_eff=5000)
     """
@@ -643,21 +651,20 @@ class EmulatorFitter:
     def __init__(
         self,
         emulator_path: str,
-        ds_obs: np.ndarray,
-        cov_inv: np.ndarray,
-        rp_obs: np.ndarray,
         fit_case: FitCase = FitCase.STANDARD_NFW,
-        target_ngal: float = 2.3e-4,
+        # --- Data: provide EITHER data_path OR (ds_obs + cov_inv + rp_obs) ---
+        data_path: str = "",
+        ds_obs: Optional[np.ndarray] = None,
+        cov_inv: Optional[np.ndarray] = None,
+        rp_obs: Optional[np.ndarray] = None,
+        # --- Remaining params ---
         param_names_ordered: Optional[list] = None,
         M1_fixed: float = 13.0,
         rp_min: Optional[float] = None,
         rp_max: Optional[float] = None,
-        hod_model=None,
     ):
         self.fit_case = FitCase(fit_case)
-        self.target_ngal = target_ngal
         self.M1_fixed = M1_fixed
-        self.hod_model = hod_model
         self.rp_min = rp_min
         self.rp_max = rp_max
 
@@ -671,120 +678,110 @@ class EmulatorFitter:
         self.n_params = len(self.free_params)
 
         # Parameter order expected by the emulator (column order of training grid)
-        # Default: full parameter dict order as built by _build_params_full()
         if param_names_ordered is not None:
             self.emulator_param_order = param_names_ordered
         else:
             self.emulator_param_order = list(self.norm_stats["param_names"])
 
-        # Apply scale cuts to obs data
-        self.rp_obs = np.asarray(rp_obs)
-        self.ds_obs = np.asarray(ds_obs)
-        self.cov_inv = np.asarray(cov_inv)
+        # Load observed data
+        if data_path:
+            self._load_data(data_path)
+        elif ds_obs is not None and cov_inv is not None and rp_obs is not None:
+            self.rp_obs = np.asarray(rp_obs)
+            self.ds_obs = np.asarray(ds_obs)
+            self.cov_inv = np.asarray(cov_inv)
 
-        mask = np.ones(len(self.rp_obs), dtype=bool)
-        if rp_min is not None:
-            mask &= (self.rp_obs >= rp_min)
-        if rp_max is not None:
-            mask &= (self.rp_obs <= rp_max)
-        if not mask.all():
-            self.rp_obs   = self.rp_obs[mask]
-            self.ds_obs   = self.ds_obs[mask]
-            self.cov_inv  = self.cov_inv[np.ix_(mask, mask)]
+            mask = np.ones(len(self.rp_obs), dtype=bool)
+            if rp_min is not None:
+                mask &= (self.rp_obs >= rp_min)
+            if rp_max is not None:
+                mask &= (self.rp_obs <= rp_max)
+            if not mask.all():
+                self.rp_obs  = self.rp_obs[mask]
+                self.ds_obs  = self.ds_obs[mask]
+                self.cov_inv = self.cov_inv[np.ix_(mask, mask)]
 
-        self.n_bins = len(self.ds_obs)
+            self.n_bins = len(self.ds_obs)
+        else:
+            raise ValueError(
+                "Provide either data_path or all three of (ds_obs, cov_inv, rp_obs)."
+            )
 
         # Pre-compute emulator → obs interpolation indices
-        # We interpolate emulator predictions onto rp_obs using log-linear interp
         self._setup_interp()
 
-    def _default_emulator_param_order(self):
-        """Default parameter order expected by the emulator.
+    def _load_data(self, data_path: str):
+        """Load observed DeltaSigma data from .npz file.
 
-        Matches the column order of the param_grid produced by
-        generate_hod_parameter_grid(): free LHS-sampled params + fixed M1.
-        Ac is NOT included — it is a derived parameter never stored in the grid.
+        Expected keys (flexible naming):
+            rp or rp_centers — projected separations
+            rp_bins or rp_edges — bin edges (optional, constructed from rp if absent)
+            delta_sigma or dsigma — observed DeltaSigma signal
+            cov_delta_sigma or cov_dsigma — covariance matrix
         """
-        order = ["As", "Mmin", "sig_M", "gamma", "M1", "alpha", "kappa", "lambda_NFW"]
-        if self.fit_case >= FitCase.EXTENDED_PROFILE:
-            order += ["f_exp", "tau"]
-        if self.fit_case >= FitCase.CONFORMITY:
-            order += ["kappa_EE"]
-        return order
+        data = np.load(data_path)
+
+        # rp centers
+        for key in ("rp", "rp_centers"):
+            if key in data:
+                self.rp_obs = data[key]
+                break
+        else:
+            raise KeyError("Data file must contain 'rp' or 'rp_centers'")
+
+        # rp bin edges
+        for key in ("rp_bins", "rp_edges"):
+            if key in data:
+                self.rp_bins = data[key]
+                break
+        else:
+            log_rp = np.log10(self.rp_obs)
+            dlog = np.diff(log_rp)[0] / 2
+            edges = np.concatenate([
+                [log_rp[0] - dlog],
+                (log_rp[:-1] + log_rp[1:]) / 2,
+                [log_rp[-1] + dlog]
+            ])
+            self.rp_bins = 10**edges
+
+        # DeltaSigma signal
+        for key in ("delta_sigma", "dsigma"):
+            if key in data:
+                self.ds_obs = data[key]
+                break
+        else:
+            raise KeyError("Data file must contain 'delta_sigma' or 'dsigma'")
+
+        # Covariance
+        for key in ("cov_delta_sigma", "cov_dsigma"):
+            if key in data:
+                self.cov = data[key]
+                break
+        else:
+            raise KeyError("Data file must contain 'cov_delta_sigma' or 'cov_dsigma'")
+
+        # Apply scale cuts
+        mask = np.ones(len(self.rp_obs), dtype=bool)
+        if self.rp_min is not None:
+            mask &= (self.rp_obs >= self.rp_min)
+        if self.rp_max is not None:
+            mask &= (self.rp_obs <= self.rp_max)
+
+        if not mask.all():
+            self.rp_obs  = self.rp_obs[mask]
+            self.ds_obs  = self.ds_obs[mask]
+            self.cov     = self.cov[np.ix_(mask, mask)]
+            idx = np.where(mask)[0]
+            self.rp_bins = self.rp_bins[idx[0] : idx[-1] + 2]
+
+        self.cov_inv = np.linalg.inv(self.cov)
+        self.n_bins = len(self.ds_obs)
 
     def _setup_interp(self):
         """Pre-compute interpolation from emulator rp grid to obs rp grid."""
         # We will interpolate log(DS_emulator)(log rp_emulator) onto log rp_obs
         self._log_rp_emu = np.log(self.emulator_rp)
         self._log_rp_obs = np.log(self.rp_obs)
-
-    def _build_params_full(self, theta) -> Optional[Dict[str, float]]:
-        """Convert sampler parameter vector to full HOD parameter dict.
-
-        Mirrors NumericalDeltaSigmaFitter._build_params but is used only
-        to drive the Ac/As rescaling step. Returns None on failure.
-        """
-        if isinstance(theta, dict):
-            free_dict = dict(theta)
-        else:
-            free_dict = dict(zip(self.param_names, theta))
-
-        As_sampled = free_dict.pop("As")
-
-        params_no_AcAs = {
-            "Mmin": free_dict["Mmin"],
-            "sig_M": free_dict["sig_M"],
-            "gamma": free_dict["gamma"],
-            "M1": self.M1_fixed,
-            "alpha": free_dict["alpha"],
-            "kappa": free_dict["kappa"],
-        }
-
-        if self.hod_model is not None:
-            try:
-                Ac_fid = 0.01
-                params_for_rescale = params_no_AcAs.copy()
-                params_for_rescale["As"] = As_sampled
-                Ac, As = rescale_Ac_to_target_ngal(
-                    self.hod_model.HOD, params_for_rescale,
-                    self.target_ngal, Ac_fiducial=Ac_fid
-                )
-            except Exception:
-                return None
-            if Ac <= 0 or As <= 0 or not np.isfinite(Ac) or not np.isfinite(As):
-                return None
-        else:
-            # No HOD model provided: pass As directly, Ac = 1 (placeholder)
-            Ac = 1.0
-            As = As_sampled
-
-        full_params = {
-            "Ac": Ac,
-            "As": As,
-            "Mmin": free_dict["Mmin"],
-            "sig_M": free_dict["sig_M"],
-            "gamma": free_dict["gamma"],
-            "M1": self.M1_fixed,
-            "alpha": free_dict["alpha"],
-            "kappa": free_dict["kappa"],
-            "lambda_NFW": free_dict["lambda_NFW"],
-        }
-
-        if self.fit_case >= FitCase.EXTENDED_PROFILE:
-            full_params["f_exp"] = free_dict["f_exp"]
-            full_params["tau"] = free_dict["tau"]
-
-        if self.fit_case >= FitCase.CONFORMITY:
-            full_params["kappa_EE"] = free_dict["kappa_EE"]
-
-        return full_params
-
-    def _params_to_emulator_vector(self, full_params: dict) -> np.ndarray:
-        """Extract ordered parameter vector for emulator input."""
-        return np.array(
-            [full_params[k] for k in self.emulator_param_order],
-            dtype=np.float32,
-        )
 
     def log_likelihood(self, theta) -> float:
         """Compute log-likelihood using the emulator forward pass.
@@ -893,3 +890,105 @@ class EmulatorFitter:
         log_z = sampler.evidence()
 
         return points, weights, log_l, log_z
+
+    def get_best_fit(self, points: np.ndarray, log_l: np.ndarray) -> Dict[str, float]:
+        """Return the MAP (maximum a-posteriori) parameter estimate.
+
+        Parameters
+        ----------
+        points : array of shape (n, n_params)
+            Posterior samples from run().
+        log_l : array of shape (n,)
+            Corresponding log-likelihoods.
+
+        Returns
+        -------
+        dict
+            Free parameter values at the MAP, plus M1_fixed.
+        """
+        idx_best = np.argmax(log_l)
+        theta_best = points[idx_best]
+        result = dict(zip(self.param_names, theta_best))
+        result["M1"] = self.M1_fixed
+        return result
+
+    def get_posterior_summary(
+        self, points: np.ndarray, weights: np.ndarray
+    ) -> Dict[str, Dict[str, float]]:
+        """Compute weighted posterior summary statistics.
+
+        Parameters
+        ----------
+        points : array of shape (n, n_params)
+            Posterior samples.
+        weights : array of shape (n,)
+            Normalized sample weights.
+
+        Returns
+        -------
+        dict
+            For each parameter: mean, std, median, q16, q84.
+        """
+        summary = {}
+        for i, (name, _, _) in enumerate(self.free_params):
+            vals = points[:, i]
+            w = weights
+
+            mean = np.average(vals, weights=w)
+            std = np.sqrt(np.average((vals - mean) ** 2, weights=w))
+
+            sorted_idx = np.argsort(vals)
+            vals_sorted = vals[sorted_idx]
+            w_sorted = w[sorted_idx]
+            cumw = np.cumsum(w_sorted)
+            cumw /= cumw[-1]
+
+            median = vals_sorted[np.searchsorted(cumw, 0.5)]
+            q16 = vals_sorted[np.searchsorted(cumw, 0.16)]
+            q84 = vals_sorted[np.searchsorted(cumw, 0.84)]
+
+            summary[name] = {
+                "mean": mean,
+                "std": std,
+                "median": median,
+                "q16": q16,
+                "q84": q84,
+            }
+        return summary
+
+    def save_results(
+        self,
+        path: str,
+        points: np.ndarray,
+        weights: np.ndarray,
+        log_l: np.ndarray,
+        log_z: float,
+    ):
+        """Save sampler results to .npz file.
+
+        Parameters
+        ----------
+        path : str
+            Output file path.
+        points, weights, log_l : arrays
+            Posterior samples, weights, log-likelihoods from run().
+        log_z : float
+            Log-evidence.
+        """
+        arrays = dict(
+            points=points,
+            weights=weights,
+            log_l=log_l,
+            log_z=log_z,
+            param_names=self.param_names,
+            fit_case=int(self.fit_case),
+            M1_fixed=self.M1_fixed,
+            rp_obs=self.rp_obs,
+            ds_obs=self.ds_obs,
+        )
+        # cov and rp_bins are only present when data was loaded from file
+        if hasattr(self, "cov"):
+            arrays["cov"] = self.cov
+        if hasattr(self, "rp_bins"):
+            arrays["rp_bins"] = self.rp_bins
+        np.savez(path, **arrays)
