@@ -400,7 +400,7 @@ def populate_haloes_full(positions: jnp.ndarray,
                         rsd_factor: float = 1.0,
                         rsd_axis_index: int = 2,
                         Lbox: float = 1000.0,
-                        random_seed: Optional[int] = None) -> Tuple[jnp.ndarray, jnp.ndarray, float, jnp.ndarray]:
+                        random_seed: Optional[int] = None) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, float, jnp.ndarray]:
     """
     Complete halo population pipeline: centrals + satellites + RSD.
     
@@ -449,8 +449,11 @@ def populate_haloes_full(positions: jnp.ndarray,
         
     Returns
     -------
-    positions_gal : jnp.ndarray, shape (N_galaxies, 3)
-        Final galaxy positions (with RSD if requested) [Mpc/h]
+    positions_gal_real : jnp.ndarray, shape (N_galaxies, 3)
+        Real-space galaxy positions (PBC-wrapped) [Mpc/h]. Use for lensing.
+    positions_gal_rsd : jnp.ndarray, shape (N_galaxies, 3)
+        Redshift-space galaxy positions [Mpc/h]. Use for clustering.
+        Identical to positions_gal_real when apply_rsd=False.
     velocities_gal : jnp.ndarray, shape (N_galaxies, 3)
         Final galaxy velocities [km/s]
     satellite_fraction : float
@@ -458,10 +461,10 @@ def populate_haloes_full(positions: jnp.ndarray,
     cent_halo_indices : jnp.ndarray, shape (N_centrals,)
         Indices of halos that host central galaxies. Used for optimized
         lensing calculations with precomputed halo-center profiles.
-        
+
     Examples
     --------
-    >>> pos_gal, vel_gal, sat_frac, cent_idx = populate_haloes_full(
+    >>> pos_real, pos_rsd, vel_gal, sat_frac, cent_idx = populate_haloes_full(
     ...     halo_pos, halo_vel, halo_mass, halo_R, halo_c, halo_vrms,
     ...     halo_logM, hod_model, hod_params
     ... )
@@ -517,19 +520,21 @@ def populate_haloes_full(positions: jnp.ndarray,
         cent_positions, cent_velocities, sat_positions, sat_velocities
     )
     
-    # Apply redshift space distortions if requested
+    # Real-space positions with PBC applied (used for lensing)
+    positions_gal_real = (positions_gal + Lbox) % Lbox
+
+    # RSD positions (used for clustering)
     if apply_rsd:
-        positions_gal = apply_rsd_to_galaxies(
+        positions_gal_rsd = apply_rsd_to_galaxies(
             positions_gal, velocities_gal, rsd_factor, rsd_axis_index, Lbox
         )
     else:
-        # Just apply periodic boundary conditions
-        positions_gal = (positions_gal + Lbox) % Lbox
-    
+        positions_gal_rsd = positions_gal_real
+
     # Calculate satellite fraction
     n_centrals = len(cent_positions)
     n_satellites = len(sat_positions)
     n_total = n_centrals + n_satellites
     satellite_fraction = n_satellites / n_total if n_total > 0 else 0.0
 
-    return positions_gal, velocities_gal, satellite_fraction, cent_halo_indices
+    return positions_gal_real, positions_gal_rsd, velocities_gal, satellite_fraction, cent_halo_indices

@@ -169,13 +169,20 @@ class Occupation:
     def compute_HOD_occupation(self,logM,dict_params,has_central=None):
         self.set_params(dict_params)
         probC = self.HOD_central(logM, *self.central_args)
-        
-        if self.conformity and has_central is not None:
-            # For conformity, use the actual central realization
-            probS = self.HOD_satellite(logM, *self.satellite_args, has_central)
+
+        if self.conformity:
+            if has_central is not None:
+                # For conformity, use the actual central realization
+                probS = self.HOD_satellite(logM, *self.satellite_args, has_central)
+            else:
+                # Expected value: no realization available, weight by probC
+                ones  = jnp.ones_like(logM, dtype=bool)
+                zeros = jnp.zeros_like(logM, dtype=bool)
+                probS = (probC * self.HOD_satellite(logM, *self.satellite_args, ones)
+                         + (1.0 - probC) * self.HOD_satellite(logM, *self.satellite_args, zeros))
         else:
             probS = self.HOD_satellite(logM, *self.satellite_args)
-            
+
         return probC,probS
     
     def compute_central_occupation(self,logM,dict_params):
@@ -194,13 +201,31 @@ class Occupation:
             
         return probS
     
-    def compute_ngal(self,dict_params):
-        probC,probS = self.compute_HOD_occupation(self.logM_bins,dict_params)
-        ngal = compute_ngal_(self.logM_bins,self.mass_function,probC,probS)
+    def compute_ngal(self, dict_params):
+        self.set_params(dict_params)
+        probC = self.HOD_central(self.logM_bins, *self.central_args)
+        if self.conformity:
+            # Expected satellite occupation: weight N_sat evaluated at each extreme
+            # E[N_sat] = probC * N_sat(M1_EE) + (1 - probC) * N_sat(M1)
+            ones  = jnp.ones_like(self.logM_bins, dtype=bool)
+            zeros = jnp.zeros_like(self.logM_bins, dtype=bool)
+            probS = (probC * self.HOD_satellite(self.logM_bins, *self.satellite_args, ones)
+                     + (1.0 - probC) * self.HOD_satellite(self.logM_bins, *self.satellite_args, zeros))
+        else:
+            probS = self.HOD_satellite(self.logM_bins, *self.satellite_args)
+        ngal = compute_ngal_(self.logM_bins, self.mass_function, probC, probS)
         return ngal
 
-    def compute_fsat(self,dict_params):
-        probC,probS = self.compute_HOD_occupation(self.logM_bins,dict_params)
-        fsat = compute_fsat_(self.logM_bins,self.mass_function,probC,probS)
+    def compute_fsat(self, dict_params):
+        self.set_params(dict_params)
+        probC = self.HOD_central(self.logM_bins, *self.central_args)
+        if self.conformity:
+            ones  = jnp.ones_like(self.logM_bins, dtype=bool)
+            zeros = jnp.zeros_like(self.logM_bins, dtype=bool)
+            probS = (probC * self.HOD_satellite(self.logM_bins, *self.satellite_args, ones)
+                     + (1.0 - probC) * self.HOD_satellite(self.logM_bins, *self.satellite_args, zeros))
+        else:
+            probS = self.HOD_satellite(self.logM_bins, *self.satellite_args)
+        fsat = compute_fsat_(self.logM_bins, self.mass_function, probC, probS)
         return fsat
     

@@ -189,7 +189,7 @@ def populate_haloes_full_numba(
     rsd_axis_index: int = 2,
     Lbox: float = 1000.0,
     random_seed: Optional[int] = None,
-) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]:
     """Complete halo population pipeline: centrals + satellites + RSD (NumPy/Numba).
 
     Drop-in replacement for populate_haloes_full() with same return signature.
@@ -219,7 +219,8 @@ def populate_haloes_full_numba(
 
     Returns
     -------
-    positions_gal : (N_galaxies, 3) final galaxy positions [Mpc/h]
+    positions_gal_real : (N_galaxies, 3) real-space positions [Mpc/h]. Use for lensing.
+    positions_gal_rsd : (N_galaxies, 3) redshift-space positions [Mpc/h]. Use for clustering.
     velocities_gal : (N_galaxies, 3) galaxy velocities [km/s]
     satellite_fraction : float
     cent_halo_indices : (N_centrals,) indices of halos hosting centrals
@@ -253,16 +254,20 @@ def populate_haloes_full_numba(
         cent_positions, cent_velocities, sat_positions, sat_velocities
     )
 
+    # Real-space positions with PBC applied (used for lensing)
+    positions_gal_real = (positions_gal + Lbox) % Lbox
+
+    # RSD positions (used for clustering)
     if apply_rsd:
-        positions_gal = apply_rsd_to_galaxies_numba(
+        positions_gal_rsd = apply_rsd_to_galaxies_numba(
             positions_gal, velocities_gal, rsd_factor, rsd_axis_index, Lbox
         )
     else:
-        positions_gal = (positions_gal + Lbox) % Lbox
+        positions_gal_rsd = positions_gal_real
 
     n_centrals = len(cent_positions)
     n_satellites = len(sat_positions)
     n_total = n_centrals + n_satellites
     satellite_fraction = n_satellites / n_total if n_total > 0 else 0.0
 
-    return positions_gal, velocities_gal, satellite_fraction, cent_halo_indices
+    return positions_gal_real, positions_gal_rsd, velocities_gal, satellite_fraction, cent_halo_indices

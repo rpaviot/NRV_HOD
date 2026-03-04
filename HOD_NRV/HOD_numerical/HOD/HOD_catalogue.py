@@ -4,7 +4,7 @@ from HOD_NRV.HOD_numerical.HOD_models import Occupation
 from HOD_NRV.utilsf.data_reader import (
     read_halo_catalog, setup_cosmology, setup_data_arrays,
     setup_particle_data_arrays, setup_triaxial_shapes,
-    setup_assembly_bias_data, apply_rsd_preprocessing, validate_rsd_axis
+    setup_assembly_bias_data, validate_rsd_axis
 )
 from .population_engine import populate_haloes_full
 from .population_engine_numba import populate_haloes_full_numba
@@ -185,14 +185,8 @@ class HaloOccupation:
                 self.DataFrame_part, column_mapping
             )
 
-            # Apply RSD preprocessing to particles if requested
-            if self.apply_rsd:
-                self.positions_part = apply_rsd_preprocessing(
-                    self.positions_part, self.velocities_part, self.Lbox,
-                    self.rsd_factor, self.rsd_axis_index
-                )
-            else:
-                self.positions_part = (self.positions_part + self.Lbox) % self.Lbox
+            # Particles always stay in real space (lensing assumes isotropic ξ_gm)
+            self.positions_part = (self.positions_part + self.Lbox) % self.Lbox
 
             # Subsample particles if requested
             if particle_fraction < 1.0:
@@ -342,7 +336,8 @@ class HaloOccupation:
 
         # Use the population engine for the complete workflow
         _engine = populate_haloes_full_numba if self.population_backend == "numba" else populate_haloes_full
-        (self.positions_gal, self.velocities_gal,
+        (self.positions_gal, self.positions_gal_rsd,
+         self.velocities_gal,
          self.satellite_fraction, self.cent_halo_indices) = _engine(
             positions=self.positions,
             velocities=self.velocities,
@@ -402,7 +397,7 @@ class HaloOccupation:
             raise RuntimeError("Galaxies not populated. Call populate_haloes() first.")
 
         return compute_galaxy_clustering(
-            self.positions_gal, self.Lbox, self.rsd_axis, mode, bins1,
+            self.positions_gal_rsd, self.Lbox, self.rsd_axis, mode, bins1,
             catalog2=catalog2, bins2=bins2, output=output
         )
 
