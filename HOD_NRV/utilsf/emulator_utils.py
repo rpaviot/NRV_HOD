@@ -40,6 +40,9 @@ DEFAULT_PARAM_RANGES = {
     # kappa_EE > 1 means satellites prefer halos with centrals
     # kappa_EE < 1 means satellites avoid halos with centrals
     'kappa_EE': (0.5, 2.0),
+    # ELG satellite cutoff parameters
+    'Mcut': (11.0, 13.0),
+    'Mmax': (13.5, 15.5),
     # Extended NFW profile parameters
     'f_exp': (0.0, 0.5),        # Exponential component fraction
     'tau': (2.0, 10.0),         # Decay scale in units of Rs
@@ -250,7 +253,8 @@ def _get_required_parameters(
     halo,
     hod_type: str,
     conformity: bool,
-    include_nfw_extensions: bool = False
+    include_nfw_extensions: bool = False,
+    elg_satellite: bool = False,
 ) -> Set[str]:
     """
     Get the complete set of required HOD parameters based on model and extensions.
@@ -265,6 +269,8 @@ def _get_required_parameters(
         Whether conformity is enabled
     include_nfw_extensions : bool, default=False
         Whether to include NFW extension parameters
+    elg_satellite : bool, default=False
+        Whether to use ELG satellite cutoff (Mcut/Mmax) instead of standard kappa
 
     Returns
     -------
@@ -272,7 +278,13 @@ def _get_required_parameters(
         Set of required parameter names (excluding Ac which is computed)
     """
     # Base parameters for all models
-    required = {'Mmin', 'sig_M', 'As', 'M1', 'alpha', 'kappa'}
+    required = {'Mmin', 'sig_M', 'As', 'M1', 'alpha'}
+
+    # Satellite cutoff: kappa (standard) or Mcut+Mmax (ELG)
+    if elg_satellite:
+        required.update({'Mcut', 'Mmax'})
+    else:
+        required.add('kappa')
 
     # Add gamma for ELG_SFR and ELG_mHMQ
     if hod_type in ('ELG_SFR', 'ELG_mHMQ'):
@@ -353,6 +365,7 @@ def generate_hod_parameter_grid(
     fixed_params: Optional[Dict[str, float]] = None,
     random_seed: Optional[int] = None,
     conformity: bool = False,
+    elg_satellite: bool = False,
     include_nfw_extensions: bool = False,
     auto_add_defaults: bool = True,
     save_path: Optional[str] = None,
@@ -496,13 +509,14 @@ def generate_hod_parameter_grid(
 
     # Detect required parameters based on extensions
     required_params = _get_required_parameters(
-        halo, hod_type, conformity, include_nfw_extensions
+        halo, hod_type, conformity, include_nfw_extensions, elg_satellite
     )
 
     if verbose:
         print(f"\nDetected extensions:")
         print(f"  Assembly bias: {halo.assembly_bias if hasattr(halo, 'assembly_bias') else False}")
         print(f"  Conformity: {conformity}")
+        print(f"  ELG satellite: {elg_satellite}")
         print(f"  NFW extensions: {include_nfw_extensions}")
         print(f"\nRequired parameters: {sorted(required_params)}")
 
@@ -545,7 +559,7 @@ def generate_hod_parameter_grid(
         print(f"\nFixed parameters: {fixed_params_copy}")
 
     # Set HOD model
-    halo.set_halo_model(hod_type, conformity=conformity)
+    halo.set_halo_model(hod_type, conformity=conformity, elg_satellite=elg_satellite)
 
     # Generate LHS samples for free parameters (those in param_ranges)
     if verbose:

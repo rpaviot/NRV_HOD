@@ -41,14 +41,15 @@ N_SAMPLES         = 5
 
 Lbox             = 681.0
 zeff             = 1.0
-mass_definition  = "200m"
+mass_definition = "MassDef200m"
 
 cosmo_params = {
-    "H0": 68.1,
-    "Om0": 0.306,
-    "Ob0": 0.0486,
-    "sigma8": 0.807,
-    "ns": 0.967,
+    "h": 0.681,
+    "Omc": 0.306 - 0.0486 - 1.39e-3,
+    "Omb": 0.0486,
+    "A_s": 2.099e-9,
+    "n_s": 0.967,
+    "Omnu": 1.39e-3,
 }
 
 column_mapping = {

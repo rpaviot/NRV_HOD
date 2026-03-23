@@ -77,6 +77,22 @@ def HOD_satellite_conformity(logM, As, Mmin, M1, alpha, kappa, kappa_EE, has_cen
     return Nsat
 
 
+@jit
+def ELG_satellite_cutoff(logM, As, M1, alpha, Mcut, Mmax):
+    M = 10**logM
+    Nsat = As * jnp.power(M / 10**M1, alpha) * jnp.exp(-10**Mcut / M) * jnp.exp(-M / 10**Mmax)
+    return Nsat
+
+
+@jit
+def ELG_satellite_conformity_cutoff(logM, As, M1, alpha, Mcut, Mmax, kappa_EE, has_central):
+    M1_EE = M1 + jnp.log10(kappa_EE)          # log10(kappa_EE * M1)
+    M1_eff = jnp.where(has_central, M1_EE, M1)
+    M = 10**logM
+    Nsat = As * jnp.power(M / 10**M1_eff, alpha) * jnp.exp(-10**Mcut / M) * jnp.exp(-M / 10**Mmax)
+    return Nsat
+
+
 def compute_ngal_(logM,mass_function,probC,probS):
     integrand = mass_function*(probC + probS)
     func_intg = CS(logM,integrand)
@@ -89,6 +105,13 @@ def compute_fsat_(logM,mass_function,probC,probS):
     func_intg = CS(logM,integrand)
     nsat = gauss_legendre_integration(func_intg,logM.min(),logM.max())
     return nsat/ngal
+
+def compute_Meff_(logM,mass_function,probC,probS):
+    ngal = compute_ngal_(logM,mass_function,probC,probS)
+    integrand = mass_function*probC*10**logM
+    func_intg = CS(logM,integrand)
+    Mnum = gauss_legendre_integration(func_intg,logM.min(),logM.max())
+    return Mnum/ngal
 
 def assembly_bias_mass(logM,A,B,IntrinsicProperty,ExternalProperty):
     return logM + A*IntrinsicProperty + B*ExternalProperty
@@ -105,9 +128,12 @@ class Occupation:
 
     satellite_params=["As", "Mmin", "M1", "alpha", "kappa"]
     satellite_conformity_params=["As", "Mmin", "M1", "alpha", "kappa", "kappa_EE"]
+    satellite_elg_params=["As", "M1", "alpha", "Mcut", "Mmax"]
+    satellite_elg_conformity_params=["As", "M1", "alpha", "Mcut", "Mmax", "kappa_EE"]
     assembly_bias_params=['A_cent','B_cent','A_sat','B_sat']
 
-    def __init__(self, hod_type,logM_bins,mass_function,assembly_bias=False,conformity=False,fI=None,fE=None):
+    def __init__(self, hod_type, logM_bins, mass_function, assembly_bias=False,
+                 conformity=False, elg_satellite=False, fI=None, fE=None):
 
         if hod_type not in self.central_funcs:
             raise AttributeError(f"Unknown HOD type: {hod_type}")
@@ -118,19 +144,26 @@ class Occupation:
         self.HOD_central, self.central_params = self.central_funcs[hod_type]
         self.assembly_bias = assembly_bias
         self.conformity = conformity
-        
-        # Set satellite function and parameters based on conformity
-        if self.conformity:
+        self.elg_satellite = elg_satellite
+
+        # Set satellite function and parameters based on conformity / elg_satellite
+        if self.conformity and self.elg_satellite:
+            self.HOD_satellite = ELG_satellite_conformity_cutoff
+            self._sat_param_names = self.satellite_elg_conformity_params
+        elif self.conformity:
             self.HOD_satellite = HOD_satellite_conformity
-            sat_params = self.satellite_conformity_params
+            self._sat_param_names = self.satellite_conformity_params
+        elif self.elg_satellite:
+            self.HOD_satellite = ELG_satellite_cutoff
+            self._sat_param_names = self.satellite_elg_params
         else:
             self.HOD_satellite = HOD_satellite
-            sat_params = self.satellite_params
+            self._sat_param_names = self.satellite_params
 
         if self.assembly_bias:
-            self.key = set(self.central_params + sat_params + self.assembly_bias_params)
+            self.key = set(self.central_params + self._sat_param_names + self.assembly_bias_params)
         else:
-            self.key = set(self.central_params + sat_params)
+            self.key = set(self.central_params + self._sat_param_names)
 
         self.fI=fI
         self.fE=fE
@@ -141,9 +174,8 @@ class Occupation:
         except KeyError as e:
             raise KeyError(f"Missing an argument: {e.args[0]}")
 
-        # Set satellite parameter list based on conformity
-        sat_params = self.satellite_conformity_params if self.conformity else self.satellite_params
-        
+        sat_params = self._sat_param_names
+
         self.central_args, self.satellite_args = (
             [dict_params[key] for key in self.central_params],
             [dict_params[key] for key in sat_params])
@@ -228,4 +260,17 @@ class Occupation:
             probS = self.HOD_satellite(self.logM_bins, *self.satellite_args)
         fsat = compute_fsat_(self.logM_bins, self.mass_function, probC, probS)
         return fsat
+
+    def compute_Meff(self, dict_params):
+        self.set_params(dict_params)
+        probC = self.HOD_central(self.logM_bins, *self.central_args)
+        if self.conformity:
+            ones  = jnp.ones_like(self.logM_bins, dtype=bool)
+            zeros = jnp.zeros_like(self.logM_bins, dtype=bool)
+            probS = (probC * self.HOD_satellite(self.logM_bins, *self.satellite_args, ones)
+                     + (1.0 - probC) * self.HOD_satellite(self.logM_bins, *self.satellite_args, zeros))
+        else:
+            probS = self.HOD_satellite(self.logM_bins, *self.satellite_args)
+        Meff = compute_Meff_(self.logM_bins, self.mass_function, probC, probS)
+        return Meff
     

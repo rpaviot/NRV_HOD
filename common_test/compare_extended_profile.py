@@ -25,9 +25,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
-from HOD_NRV.HOD_numerical.twopoint_calculator.standard_two_point_calculator import (
-    compute_galaxy_lensing,
-)
 from HOD_NRV.utilsf.emulator_utils import rescale_Ac_to_target_ngal
 
 # ============================================================================
@@ -40,7 +37,7 @@ PLOT_OUTPUT = "extended_vs_standard_profile.png"
 
 Lbox = 681.0
 zeff = 1.0
-mass_definition = "200m"
+mass_definition = "MassDef200m"
 
 column_mapping = {
     "x": "x", "y": "y", "z": "z",
@@ -55,14 +52,6 @@ dict_cosmo = {
     "A_s": 2.099e-9,
     "n_s": 0.967,
     "Omnu": 1.39e-3,
-}
-
-cosmo_params = {
-    "H0": dict_cosmo["h"] * 100,
-    "Om0": dict_cosmo["Omc"] + dict_cosmo["Omb"] + dict_cosmo["Omnu"],
-    "Ob0": dict_cosmo["Omb"],
-    "sigma8": 0.807,
-    "ns": 0.967,
 }
 
 base_hod_params = {
@@ -94,16 +83,6 @@ EXTENDED_PARAMS = {"lambda_NFW": 1.0, "f_exp": 0.5, "tau": 5}
 # ============================================================================
 # Helpers
 # ============================================================================
-
-def subsample_array(positions, fraction, seed):
-    """Subsample positions array with sorted indices for cache locality."""
-    if fraction >= 1.0:
-        return positions
-    n_keep = int(len(positions) * fraction)
-    rng = np.random.RandomState(seed)
-    indices = np.sort(rng.choice(len(positions), n_keep, replace=False))
-    return positions[indices]
-
 
 def fmt_time(seconds):
     """Pretty-print a duration."""
@@ -140,7 +119,7 @@ def main():
     # --- Initialize HaloOccupation ---
     print("\nInitializing HaloOccupation (numba backend)...")
     halo = HaloOccupation(
-        cosmology=cosmo_params,
+        cosmology=dict_cosmo,
         zeff=zeff,
         Lbox=Lbox,
         column_mapping=column_mapping,
@@ -169,15 +148,12 @@ def main():
     print(f"  As = {As_rescaled[0]:.6f}")
 
     # --- Downsample particles ---
-    positions_part_full = np.array(halo.positions_part)
-    positions_part_sub = subsample_array(
-        positions_part_full, PARTICLE_FRACTION, PARTICLE_SUBSAMPLE_SEED
+    n_part_full = len(halo.positions_part)
+    halo.positions_part = halo._subsample_array(
+        halo.positions_part, PARTICLE_FRACTION, PARTICLE_SUBSAMPLE_SEED
     )
-    print(f"\nParticle downsampling: {len(positions_part_full):,} -> "
-          f"{len(positions_part_sub):,} ({PARTICLE_FRACTION*100:.0f}%)")
-
-    # Overwrite so compute_galaxy_lensing uses downsampled particles
-    halo.positions_part = positions_part_sub
+    print(f"\nParticle downsampling: {n_part_full:,} -> "
+          f"{len(halo.positions_part):,} ({PARTICLE_FRACTION*100:.0f}%)")
 
     # --- Numba warmup ---
     print("\nWarming up Numba JIT (throw-away population)...")
@@ -187,54 +163,27 @@ def main():
 
     # --- Standard variant ---
     print(f"\nRunning {N_REAL} standard NFW realizations...")
-    ds_std_all = []
-    rp_centers = None
-
-    for i in range(N_REAL):
-        seed = BASE_SEED + i
-        print(f"  Realization {i+1}/{N_REAL} (seed={seed})...", end=" ", flush=True)
-        t0 = time.perf_counter()
-
-        halo.populate_haloes(hod_params_std, random_seed=seed)
-        n_gal = len(halo.positions_gal)
-        f_sat = halo.satellite_fraction
-        gal_pos_sub = subsample_array(np.array(halo.positions_gal), GALAXY_FRACTION, seed=88 + i)
-
-        rp_centers, ds = compute_galaxy_lensing(
-            gal_pos_sub, positions_part_sub,
-            Lbox, "z", halo.RHO_M, rp_bins, bins_comp=BINS_COMP,
-        )
-        ds_std_all.append(ds)
-        print(f"N_gal={n_gal:,}, f_sat={f_sat:.3f}, time={fmt_time(time.perf_counter() - t0)}")
-
-    ds_std_all = np.array(ds_std_all)
-    ds_std_mean = ds_std_all.mean(axis=0)
+    t0 = time.perf_counter()
+    rp_centers, ds_std_mean, ds_std_std = halo.compute_avg_lensing(
+        hod_params_std, N_REAL, rp_bins,
+        galaxy_fraction=GALAXY_FRACTION,
+        base_seed=BASE_SEED,
+        bins_comp=BINS_COMP,
+    )
+    print(f"  Done in {fmt_time(time.perf_counter() - t0)}")
 
     # --- Extended variant ---
     print(f"\nRunning {N_REAL} extended NFW realizations "
           f"(lambda_NFW={EXTENDED_PARAMS['lambda_NFW']}, "
           f"f_exp={EXTENDED_PARAMS['f_exp']}, tau={EXTENDED_PARAMS['tau']})...")
-    ds_ext_all = []
-
-    for i in range(N_REAL):
-        seed = BASE_SEED + i  # identical seeds — isolates profile difference
-        print(f"  Realization {i+1}/{N_REAL} (seed={seed})...", end=" ", flush=True)
-        t0 = time.perf_counter()
-
-        halo.populate_haloes(hod_params_ext, random_seed=seed)
-        n_gal = len(halo.positions_gal)
-        f_sat = halo.satellite_fraction
-        gal_pos_sub = subsample_array(np.array(halo.positions_gal), GALAXY_FRACTION, seed=88 + i)
-
-        _, ds = compute_galaxy_lensing(
-            gal_pos_sub, positions_part_sub,
-            Lbox, "z", halo.RHO_M, rp_bins, bins_comp=BINS_COMP,
-        )
-        ds_ext_all.append(ds)
-        print(f"N_gal={n_gal:,}, f_sat={f_sat:.3f}, time={fmt_time(time.perf_counter() - t0)}")
-
-    ds_ext_all = np.array(ds_ext_all)
-    ds_ext_mean = ds_ext_all.mean(axis=0)
+    t0 = time.perf_counter()
+    _, ds_ext_mean, ds_ext_std = halo.compute_avg_lensing(
+        hod_params_ext, N_REAL, rp_bins,
+        galaxy_fraction=GALAXY_FRACTION,
+        base_seed=BASE_SEED,
+        bins_comp=BINS_COMP,
+    )
+    print(f"  Done in {fmt_time(time.perf_counter() - t0)}")
 
     # --- Per-bin table ---
     ratio = np.where(np.abs(ds_std_mean) > 1e-10, ds_ext_mean / ds_std_mean, np.nan)
@@ -253,12 +202,11 @@ def main():
         sharex=True, gridspec_kw={"hspace": 0.05},
     )
 
-    # Faint individual realizations
-    for i in range(N_REAL):
-        ax1.semilogx(rp_centers, rp_centers * ds_std_all[i],
-                     color="steelblue", alpha=0.20, lw=0.6)
-        ax1.semilogx(rp_centers, rp_centers * ds_ext_all[i],
-                     color="tomato", alpha=0.20, lw=0.6)
+    # ±1σ bands across realizations
+    ax1.fill_between(rp_centers, rp_centers * (ds_std_mean - ds_std_std),
+                     rp_centers * (ds_std_mean + ds_std_std), color="steelblue", alpha=0.20)
+    ax1.fill_between(rp_centers, rp_centers * (ds_ext_mean - ds_ext_std),
+                     rp_centers * (ds_ext_mean + ds_ext_std), color="tomato", alpha=0.20)
 
     # Mean curves
     ax1.semilogx(rp_centers, rp_centers * ds_std_mean,

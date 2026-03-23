@@ -1,8 +1,9 @@
 from typing import Dict, Optional, Union, Any
 
 from HOD_NRV.HOD_numerical.HOD_models import Occupation
+from HOD_NRV.HOD_analytical.pycosmo import Cosmology
 from HOD_NRV.utilsf.data_reader import (
-    read_halo_catalog, setup_cosmology, setup_data_arrays,
+    read_halo_catalog, setup_data_arrays,
     setup_particle_data_arrays, setup_triaxial_shapes,
     setup_assembly_bias_data, validate_rsd_axis
 )
@@ -139,7 +140,8 @@ class HaloOccupation:
                  do_test: bool = True,
                  particle_fraction: float = 1.0,
                  particle_subsample_seed: int = 42,
-                 population_backend: str = "jax"):
+                 population_backend: str = "jax",
+                 mass_function: str = 'Tinker08'):
 
         # Store configuration parameters
         if population_backend not in ("jax", "numba"):
@@ -168,9 +170,22 @@ class HaloOccupation:
             self.DataFrame_part = DataFrame_part
 
         # === COSMOLOGICAL SETUP ===
-        (self.cosmology, self.RHO_M, self.rsd_factor,
-         self.logM_bins, self.mass_function) = setup_cosmology(
-            self.dict_cosmology, self.zeff, self.mass_definition
+        self.pycosmo = Cosmology(
+            self.dict_cosmology,
+            mass_function=mass_function,
+            mass_definition=mass_definition,
+            use_dark_emulator=False,
+            verbose=False,
+            units_per_h=True,
+        )
+        h = self.pycosmo.h
+        self.RHO_M = self.pycosmo.get_rho_m()
+        a = 1.0 / (1.0 + zeff)
+        self.rsd_factor = h / (self.pycosmo.Hz(zeff) * a)
+        self.logM_bins = np.log10(np.logspace(11, 15, 1024))
+        M_Msun = 10**self.logM_bins / h
+        self.mass_function = (
+            self.pycosmo.mass_func(self.pycosmo.ccl_cosmo, M_Msun, a) / h**3
         )
 
         # === HALO DATA ARRAYS ===
@@ -220,7 +235,8 @@ class HaloOccupation:
             from ..test import test_satellites
             test_satellites.run_all_tests()
 
-    def set_halo_model(self, hod_type: str, conformity: bool = False):
+    def set_halo_model(self, hod_type: str, conformity: bool = False,
+                       elg_satellite: bool = False):
         """
         Configure the Halo Occupation Distribution model.
 
@@ -231,15 +247,22 @@ class HaloOccupation:
             - "LRG": Error function (erf) model for Luminous Red Galaxies
             - "ELG_GHOD": Gaussian HOD model for Emission Line Galaxies
             - "ELG_SFR": Star Formation Rate based ELG model
+            - "ELG_mHMQ": Modified HMQ model for ELGs
         conformity : bool, default=False
             Whether to use AbacusHOD-style conformity for satellites.
             When True, satellite occupation depends on actual central
             galaxy realization rather than just central probability.
+        elg_satellite : bool, default=False
+            Whether to use ELG satellite HOD with high-mass exponential cutoff.
+            When True, uses: <N_sat> = As * (M/M1)^alpha * exp(-Mcut/M) * exp(-M/Mmax).
+            Required dict_params keys: {"Ac", "Mmin", "sig_M", "As", "M1", "alpha", "Mcut", "Mmax"}.
+            Ignored when conformity=True (conformity takes precedence).
 
         Examples
         --------
         >>> halo.set_halo_model("LRG")  # Standard LRG model
         >>> halo.set_halo_model("ELG_GHOD", conformity=True)  # ELG with conformity
+        >>> halo.set_halo_model("ELG_mHMQ", elg_satellite=True)  # ELG with cutoff satellites
 
         Notes
         -----
@@ -254,6 +277,7 @@ class HaloOccupation:
         self.HOD = Occupation(
             hod_type, self.logM_bins, self.mass_function,
             assembly_bias=self.assembly_bias, conformity=conformity,
+            elg_satellite=elg_satellite,
             fI=self.fI, fE=self.fE
         )
 

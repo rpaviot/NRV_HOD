@@ -40,7 +40,7 @@ PARTICLE_PATH = "/Users/ler13nrv/Documents/flamingo_data/particle_catalogue_L100
 
 Lbox = 681.0  # Mpc/h
 zeff = 1.0
-mass_definition = "200m"
+mass_definition = "MassDef200m"
 
 column_mapping = {
     "x": "x", "y": "y", "z": "z",
@@ -55,14 +55,6 @@ dict_cosmo = {
     "A_s": 2.099e-9,
     "n_s": 0.967,
     "Omnu": 1.39e-3,
-}
-
-cosmo_params = {
-    "H0": dict_cosmo["h"] * 100,
-    "Om0": dict_cosmo["Omc"] + dict_cosmo["Omb"] + dict_cosmo["Omnu"],
-    "Ob0": dict_cosmo["Omb"],
-    "sigma8": 0.807,
-    "ns": 0.967,
 }
 
 base_hod_params = {
@@ -326,7 +318,7 @@ def main():
     print("\nInitializing HaloOccupation...")
     t0 = time.perf_counter()
     halo = HaloOccupation(
-        cosmology=cosmo_params,
+        cosmology=dict_cosmo,
         zeff=zeff,
         Lbox=Lbox,
         column_mapping=column_mapping,

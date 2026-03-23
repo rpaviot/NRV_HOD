@@ -271,6 +271,11 @@ class Cosmology:
         """
         return self._k_array_h.copy()
     
+    def Hz(self, z: float) -> float:
+        """Hubble parameter H(z) in km/s/Mpc."""
+        a = 1.0 / (1.0 + z)
+        return ccl.h_over_h0(self.ccl_cosmo, a) * self.h * 100.0
+
     def get_rho_m(self) -> float:
         """
         Get matter density in user's preferred units.

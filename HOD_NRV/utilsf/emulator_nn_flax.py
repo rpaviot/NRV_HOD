@@ -18,12 +18,12 @@ Training::
 
     emulator = train_emulator(
         params, dsigma, param_names, rp_centers,
-        save_path="emulator_STANDARD_NFW"
+        output_path="emulator_dsigma.npz"
     )
 
 Inference::
 
-    model, norm_stats = load_emulator("emulator_STANDARD_NFW")
+    model, norm_stats = load_emulator("emulator_dsigma.npz")
     ds_pred = predict_dsigma(model, norm_stats, theta)
 """
 
@@ -158,7 +158,7 @@ def train_emulator(
     dsigma: np.ndarray,
     param_names: list,
     rp_centers: np.ndarray,
-    save_path: str,
+    output_path: str,
     n_hidden: list = None,
     validation_split: float = 0.1,
     learning_rates: list = None,
@@ -180,10 +180,11 @@ def train_emulator(
     param_names : list of str
         Parameter name for each column of params.
     rp_centers : np.ndarray, shape (n_rp,)
-        Projected separation bin centers [Mpc/h]. Stored in the metadata file.
-    save_path : str
-        Base path for saving. Weights go to ``save_path.flax.npz``;
-        metadata is saved to ``save_path.meta.npz``.
+        Projected separation bin centers [Mpc/h]. Stored in the output file.
+    output_path : str
+        Full path for the single output file (e.g. ``emulator_dsigma.npz``).
+        Weights, normalization statistics, rp_centers, and param_names are
+        all saved together in this one file.
     n_hidden : list of int, default=[1024, 1024, 1024, 1024]
         Number of units in each hidden layer.
     validation_split : float, default=0.1
@@ -209,7 +210,8 @@ def train_emulator(
     * Training is performed in log10(ΔΣ) space.
     * Rows where any ΔΣ value is NaN, non-positive, or params are non-finite
       are dropped before training.
-    * The metadata file stores rp_centers and param_names for later loading.
+    * ``output_path`` is a single file containing weights, normalization
+      statistics, rp_centers, and param_names.
     """
     # Defaults
     if n_hidden is None:
@@ -354,45 +356,36 @@ def train_emulator(
         print(f"  95th pct                               = {np.percentile(frac_err, 95)*100:.2f}%")
         print(f"  Max                                    = {frac_err.max()*100:.2f}%")
 
-    # --- Save weights ---
-    weights_path = save_path + ".flax.npz"
-    flat_params  = flatten_dict({'params': best_params}, sep='/')
-    save_dict    = {
+    # --- Save single output file (weights + metadata) ---
+    flat_params = flatten_dict({'params': best_params}, sep='/')
+    save_dict   = {
         'arch_n_hidden':      np.array(n_hidden, dtype=np.int32),
         'arch_n_outputs':     np.array([n_outputs], dtype=np.int32),
         'norm_params_mean':   params_mean.astype(np.float64),
         'norm_params_std':    params_std.astype(np.float64),
         'norm_features_mean': features_mean.astype(np.float64),
         'norm_features_std':  features_std.astype(np.float64),
+        'rp_centers':         rp_centers.astype(np.float64),
+        'param_names':        np.array(param_names),
     }
     for k, v in flat_params.items():
         save_dict[f'w_{k}'] = np.array(v)
-    np.savez(weights_path, **save_dict)
-
-    # --- Save metadata (same format as emulator_nn.py) ---
-    meta_path = save_path + ".meta.npz"
-    np.savez(
-        meta_path,
-        rp_centers=rp_centers.astype(np.float64),
-        param_names=np.array(param_names),
-    )
+    np.savez(output_path, **save_dict)
 
     if verbose:
-        print(f"Saved weights to: {weights_path}")
-        print(f"Saved metadata to: {meta_path}")
+        print(f"Saved emulator to: {output_path}")
 
     return emulator
 
 
-def load_emulator(path: str) -> tuple:
+def load_emulator(output_path: str) -> tuple:
     """
-    Load a trained Flax emulator and its metadata.
+    Load a trained Flax emulator from a single file.
 
     Parameters
     ----------
-    path : str
-        Base path used when saving (written by train_emulator()).
-        The companion ``<path>.meta.npz`` must exist.
+    output_path : str
+        Path to the ``.npz`` file written by train_emulator().
 
     Returns
     -------
@@ -403,11 +396,8 @@ def load_emulator(path: str) -> tuple:
         ``rp_centers`` — projected separation bin centers (float64 array),
         ``param_names`` — list of parameter names.
     """
-    weights_path = path + ".flax.npz"
-    meta_path    = path + ".meta.npz"
-
-    # --- Load weights file ---
-    data = np.load(weights_path, allow_pickle=False)
+    # --- Load single file ---
+    data = np.load(output_path, allow_pickle=True)
 
     n_hidden  = list(data['arch_n_hidden'])
     n_outputs = int(data['arch_n_outputs'][0])
@@ -446,10 +436,9 @@ def load_emulator(path: str) -> tuple:
         n_outputs=n_outputs,
     )
 
-    # --- Load metadata ---
-    meta      = np.load(meta_path, allow_pickle=True)
-    rp_centers = meta["rp_centers"]
-    param_names = list(meta["param_names"])
+    # --- Extract metadata from same file ---
+    rp_centers  = data["rp_centers"]
+    param_names = list(data["param_names"])
 
     norm_stats = {
         "rp_centers":  rp_centers,
@@ -491,3 +480,7 @@ def predict_dsigma(
     ds = 10.0 ** log10_ds
 
     return ds[0] if scalar_input else ds
+
+
+# Alias: wgg emulators use the same log10-space convention as DeltaSigma
+predict_wgg = predict_dsigma

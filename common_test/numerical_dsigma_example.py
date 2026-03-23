@@ -39,7 +39,7 @@ CACHE_FILE = "baseline_dsigma_cache.npz"
 
 Lbox = 681.0        # Mpc/h
 zeff = 1.0
-mass_definition = "200m"
+mass_definition = "MassDef200m"
 
 column_mapping = {
     "x": "x", "y": "y", "z": "z",
@@ -58,7 +58,6 @@ dict_cosmo = {
     }
 
 
-cosmo_params = {'H0': dict_cosmo['h']*100, 'Om0': dict_cosmo['Omc']+dict_cosmo['Omb'] + dict_cosmo['Omnu'], 'Ob0': dict_cosmo['Omb'], 'sigma8': 0.807, 'ns': 0.967}
 # Base HOD parameters for ELG_GHOD (Ac and As will be rescaled)
 base_hod_params = {
     "As": 0.3,
@@ -97,7 +96,7 @@ print(f"  {len(df_part)} particles loaded")
 
 print("\nInitializing HaloOccupation...")
 halo = HaloOccupation(
-    cosmology=cosmo_params,
+    cosmology=dict_cosmo,
     zeff=zeff,
     Lbox=Lbox,
     column_mapping=column_mapping,

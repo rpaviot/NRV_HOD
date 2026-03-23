@@ -15,7 +15,7 @@ from enum import IntEnum
 from typing import Dict, Optional, Tuple, Any
 
 from .emulator_utils import rescale_Ac_to_target_ngal
-from .emulator_nn_flax import load_emulator, predict_dsigma
+from .emulator_nn_flax import load_emulator, predict_dsigma, predict_wgg
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
 
 
@@ -60,10 +60,18 @@ _CONFORMITY_PARAMS = [
     ("kappa_EE", 0.5, 2.0),
 ]
 
+_ELG_SATELLITE_PARAMS = [
+    ("Mcut", 11.0, 13.0),
+    ("Mmax", 13.5, 15.5),
+]
 
-def _get_free_params(fit_case: FitCase):
+
+def _get_free_params(fit_case: FitCase, elg_satellite: bool = False):
     """Return list of (name, low, high) for the given fit case."""
-    params = list(_BASE_PARAMS)
+    if elg_satellite:
+        params = [p for p in _BASE_PARAMS if p[0] != 'kappa'] + _ELG_SATELLITE_PARAMS
+    else:
+        params = list(_BASE_PARAMS)
     if fit_case >= FitCase.EXTENDED_PROFILE:
         params.extend(_EXTENDED_PARAMS)
     if fit_case >= FitCase.CONFORMITY:
@@ -160,6 +168,7 @@ class NumericalDeltaSigmaFitter:
         precomputed_cache=None,
         # --- Fitter-specific args ---
         fit_case: FitCase = FitCase.STANDARD_NFW,
+        elg_satellite: bool = False,
         data_path: str = "",
         target_ngal: float = 2.3e-4,
         n_realizations: int = 5,
@@ -182,6 +191,7 @@ class NumericalDeltaSigmaFitter:
         )
         self.precomputed_cache = precomputed_cache
         self.fit_case = FitCase(fit_case)
+        self.elg_satellite = elg_satellite
         self.target_ngal = target_ngal
         self.n_realizations = n_realizations
         self.galaxy_fraction = galaxy_fraction
@@ -192,10 +202,10 @@ class NumericalDeltaSigmaFitter:
 
         # Configure HOD model
         use_conformity = (self.fit_case == FitCase.CONFORMITY)
-        self.halo.set_halo_model("ELG_mHMQ", conformity=use_conformity)
+        self.halo.set_halo_model("ELG_mHMQ", conformity=use_conformity, elg_satellite=elg_satellite)
 
         # Free parameters for this case
-        self.free_params = _get_free_params(self.fit_case)
+        self.free_params = _get_free_params(self.fit_case, elg_satellite=elg_satellite)
         self.param_names = [p[0] for p in self.free_params]
         self.n_params = len(self.free_params)
 
@@ -306,14 +316,25 @@ class NumericalDeltaSigmaFitter:
         As_sampled = free_dict.pop("As")
 
         # Build the non-Ac/As params needed for ngal rescaling
-        params_no_AcAs = {
-            "Mmin": free_dict["Mmin"],
-            "sig_M": free_dict["sig_M"],
-            "gamma": free_dict["gamma"],
-            "M1": self.M1_fixed,
-            "alpha": free_dict["alpha"],
-            "kappa": free_dict["kappa"],
-        }
+        if self.elg_satellite:
+            params_no_AcAs = {
+                "Mmin": free_dict["Mmin"],
+                "sig_M": free_dict["sig_M"],
+                "gamma": free_dict["gamma"],
+                "M1": self.M1_fixed,
+                "alpha": free_dict["alpha"],
+                "Mcut": free_dict["Mcut"],
+                "Mmax": free_dict["Mmax"],
+            }
+        else:
+            params_no_AcAs = {
+                "Mmin": free_dict["Mmin"],
+                "sig_M": free_dict["sig_M"],
+                "gamma": free_dict["gamma"],
+                "M1": self.M1_fixed,
+                "alpha": free_dict["alpha"],
+                "kappa": free_dict["kappa"],
+            }
 
         try:
             Ac, As = self._derive_Ac_As(As_sampled, params_no_AcAs)
@@ -324,17 +345,31 @@ class NumericalDeltaSigmaFitter:
             return None
 
         # Full parameter dict
-        full_params = {
-            "Ac": Ac,
-            "As": As,
-            "Mmin": free_dict["Mmin"],
-            "sig_M": free_dict["sig_M"],
-            "gamma": free_dict["gamma"],
-            "M1": self.M1_fixed,
-            "alpha": free_dict["alpha"],
-            "kappa": free_dict["kappa"],
-            "lambda_NFW": free_dict["lambda_NFW"],
-        }
+        if self.elg_satellite:
+            full_params = {
+                "Ac": Ac,
+                "As": As,
+                "Mmin": free_dict["Mmin"],
+                "sig_M": free_dict["sig_M"],
+                "gamma": free_dict["gamma"],
+                "M1": self.M1_fixed,
+                "alpha": free_dict["alpha"],
+                "Mcut": free_dict["Mcut"],
+                "Mmax": free_dict["Mmax"],
+                "lambda_NFW": free_dict["lambda_NFW"],
+            }
+        else:
+            full_params = {
+                "Ac": Ac,
+                "As": As,
+                "Mmin": free_dict["Mmin"],
+                "sig_M": free_dict["sig_M"],
+                "gamma": free_dict["gamma"],
+                "M1": self.M1_fixed,
+                "alpha": free_dict["alpha"],
+                "kappa": free_dict["kappa"],
+                "lambda_NFW": free_dict["lambda_NFW"],
+            }
 
         if self.fit_case >= FitCase.EXTENDED_PROFILE:
             full_params["f_exp"] = free_dict["f_exp"]
@@ -597,11 +632,15 @@ class EmulatorFitter:
     compute_avg_lensing() forward model (~3.2 s/call) with an emulator forward
     pass (~μs/call), making full Nautilus runs feasible in minutes.
 
+    Supports optional joint fitting of DeltaSigma + w_gg by supplying a second
+    wgg emulator path and corresponding data. The joint log-likelihood is:
+        log L = -½(χ²_DS + χ²_wgg)
+    with independent covariances assumed between the two probes.
+
     Parameters
     ----------
     emulator_path : str
-        Path to the saved model file written by train_emulator().
-        The companion <emulator_path>.meta.npz must also exist.
+        Path to the DeltaSigma emulator ``.npz`` file written by train_emulator().
     fit_case : FitCase
         Which model complexity to use (determines free parameters).
     data_path : str, optional
@@ -624,13 +663,31 @@ class EmulatorFitter:
     M1_fixed : float, default=13.0
         Fixed log10(M1) value.
     rp_min : float, optional
-        Minimum rp scale cut [Mpc/h].
+        Minimum rp scale cut for DeltaSigma [Mpc/h].
     rp_max : float, optional
-        Maximum rp scale cut [Mpc/h].
+        Maximum rp scale cut for DeltaSigma [Mpc/h].
+    emulator_wgg_path : str, optional
+        Path to the w_gg emulator ``.npz`` file. When provided, enables joint
+        DeltaSigma + w_gg fitting.
+    data_path_wgg : str, optional
+        Path to .npz file with observed w_gg data. Flexible key names:
+        ``rp`` / ``rp_centers``, ``wgg`` / ``wp`` / ``w_gg``,
+        ``cov_wgg`` / ``cov_wp`` / ``cov_w_gg``.
+    wgg_obs : np.ndarray, shape (n_bins_wgg,), optional
+        Observed w_p(rp) signal. Used when ``data_path_wgg`` is not given.
+    cov_inv_wgg : np.ndarray, shape (n_bins_wgg, n_bins_wgg), optional
+        Inverse covariance for w_gg. Used when ``data_path_wgg`` is not given.
+    rp_obs_wgg : np.ndarray, shape (n_bins_wgg,), optional
+        Projected separations for w_gg [Mpc/h]. Used when ``data_path_wgg``
+        is not given.
+    rp_min_wgg : float, optional
+        Minimum rp scale cut for w_gg [Mpc/h].
+    rp_max_wgg : float, optional
+        Maximum rp scale cut for w_gg [Mpc/h].
 
     Examples
     --------
-    Load data from file:
+    DeltaSigma-only fit (existing interface):
 
     >>> fitter = EmulatorFitter(
     ...     emulator_path="emulator_STANDARD_NFW",
@@ -638,12 +695,15 @@ class EmulatorFitter:
     ...     fit_case=FitCase.STANDARD_NFW,
     ... )
 
-    Or pass arrays directly (backward-compatible):
+    Joint DeltaSigma + w_gg fit:
 
     >>> fitter = EmulatorFitter(
     ...     emulator_path="emulator_STANDARD_NFW",
-    ...     ds_obs=ds_obs, cov_inv=cov_inv, rp_obs=rp_centers,
+    ...     data_path="observed_ds.npz",
     ...     fit_case=FitCase.STANDARD_NFW,
+    ...     emulator_wgg_path="emulator_wgg_STANDARD_NFW",
+    ...     data_path_wgg="observed_wgg.npz",
+    ...     rp_min_wgg=1.0,
     ... )
     >>> points, weights, log_l, log_z = fitter.run(n_live=500, n_eff=5000)
     """
@@ -662,6 +722,14 @@ class EmulatorFitter:
         M1_fixed: float = 13.0,
         rp_min: Optional[float] = None,
         rp_max: Optional[float] = None,
+        # --- Optional wgg emulator & data ---
+        emulator_wgg_path: str = "",
+        data_path_wgg: str = "",
+        wgg_obs: Optional[np.ndarray] = None,
+        cov_inv_wgg: Optional[np.ndarray] = None,
+        rp_obs_wgg: Optional[np.ndarray] = None,
+        rp_min_wgg: Optional[float] = None,
+        rp_max_wgg: Optional[float] = None,
     ):
         self.fit_case = FitCase(fit_case)
         self.M1_fixed = M1_fixed
@@ -709,6 +777,39 @@ class EmulatorFitter:
 
         # Pre-compute emulator → obs interpolation indices
         self._setup_interp()
+
+        # --- Optional wgg emulator ---
+        self.rp_min_wgg = rp_min_wgg
+        self.rp_max_wgg = rp_max_wgg
+        self._fit_wgg = False
+
+        if emulator_wgg_path:
+            self.model_wgg, self.norm_stats_wgg = load_emulator(emulator_wgg_path)
+            self.emulator_rp_wgg = self.norm_stats_wgg["rp_centers"]
+
+            if data_path_wgg:
+                self._load_data_wgg(data_path_wgg)
+            elif wgg_obs is not None and cov_inv_wgg is not None and rp_obs_wgg is not None:
+                self.rp_obs_wgg = np.asarray(rp_obs_wgg)
+                self.wgg_obs = np.asarray(wgg_obs)
+                self.cov_inv_wgg = np.asarray(cov_inv_wgg)
+                mask = np.ones(len(self.rp_obs_wgg), dtype=bool)
+                if rp_min_wgg is not None:
+                    mask &= (self.rp_obs_wgg >= rp_min_wgg)
+                if rp_max_wgg is not None:
+                    mask &= (self.rp_obs_wgg <= rp_max_wgg)
+                if not mask.all():
+                    self.rp_obs_wgg  = self.rp_obs_wgg[mask]
+                    self.wgg_obs     = self.wgg_obs[mask]
+                    self.cov_inv_wgg = self.cov_inv_wgg[np.ix_(mask, mask)]
+            else:
+                raise ValueError(
+                    "emulator_wgg_path given but no wgg data provided. "
+                    "Supply data_path_wgg or (wgg_obs, cov_inv_wgg, rp_obs_wgg)."
+                )
+
+            self._setup_interp_wgg()
+            self._fit_wgg = True
 
     def _load_data(self, data_path: str):
         """Load observed DeltaSigma data from .npz file.
@@ -783,6 +884,55 @@ class EmulatorFitter:
         self._log_rp_emu = np.log(self.emulator_rp)
         self._log_rp_obs = np.log(self.rp_obs)
 
+    def _load_data_wgg(self, data_path_wgg: str):
+        """Load observed w_gg data from .npz file.
+
+        Flexible key names:
+            rp or rp_centers        — projected separations
+            wgg, wp, or w_gg        — observed w_p(rp) signal
+            cov_wgg, cov_wp, or cov_w_gg — covariance matrix
+        """
+        data = np.load(data_path_wgg)
+
+        for key in ("rp", "rp_centers"):
+            if key in data:
+                self.rp_obs_wgg = data[key]
+                break
+        else:
+            raise KeyError("wgg data file must contain 'rp' or 'rp_centers'")
+
+        for key in ("wgg", "wp", "w_gg"):
+            if key in data:
+                self.wgg_obs = data[key]
+                break
+        else:
+            raise KeyError("wgg data file must contain 'wgg', 'wp', or 'w_gg'")
+
+        for key in ("cov_wgg", "cov_wp", "cov_w_gg"):
+            if key in data:
+                self.cov_wgg = data[key]
+                break
+        else:
+            raise KeyError("wgg data file must contain 'cov_wgg', 'cov_wp', or 'cov_w_gg'")
+
+        # Apply scale cuts
+        mask = np.ones(len(self.rp_obs_wgg), dtype=bool)
+        if self.rp_min_wgg is not None:
+            mask &= (self.rp_obs_wgg >= self.rp_min_wgg)
+        if self.rp_max_wgg is not None:
+            mask &= (self.rp_obs_wgg <= self.rp_max_wgg)
+        if not mask.all():
+            self.rp_obs_wgg = self.rp_obs_wgg[mask]
+            self.wgg_obs    = self.wgg_obs[mask]
+            self.cov_wgg    = self.cov_wgg[np.ix_(mask, mask)]
+
+        self.cov_inv_wgg = np.linalg.inv(self.cov_wgg)
+
+    def _setup_interp_wgg(self):
+        """Pre-compute interpolation from wgg emulator rp grid to obs rp grid."""
+        self._log_rp_emu_wgg = np.log(self.emulator_rp_wgg)
+        self._log_rp_obs_wgg = np.log(self.rp_obs_wgg)
+
     def log_likelihood(self, theta) -> float:
         """Compute log-likelihood using the emulator forward pass.
 
@@ -824,6 +974,27 @@ class EmulatorFitter:
 
         residual = ds_at_obs - self.ds_obs
         chi2 = residual @ self.cov_inv @ residual
+
+        # --- Optional wgg chi² ---
+        if self._fit_wgg:
+            try:
+                theta_vec_wgg = np.array([
+                    self.M1_fixed if p == 'M1' else free_dict[p]
+                    for p in list(self.norm_stats_wgg["param_names"])
+                ], dtype=np.float32)
+                wgg_pred = predict_wgg(self.model_wgg, self.norm_stats_wgg, theta_vec_wgg)
+            except Exception:
+                return -1e100
+            if not np.all(np.isfinite(wgg_pred)):
+                return -1e100
+            log_wgg_emu = np.log(wgg_pred)
+            log_wgg_at_obs = np.interp(
+                self._log_rp_obs_wgg, self._log_rp_emu_wgg, log_wgg_emu
+            )
+            wgg_at_obs = np.exp(log_wgg_at_obs)
+            residual_wgg = wgg_at_obs - self.wgg_obs
+            chi2 += residual_wgg @ self.cov_inv_wgg @ residual_wgg
+
         return -0.5 * chi2
 
     def run(
@@ -991,4 +1162,9 @@ class EmulatorFitter:
             arrays["cov"] = self.cov
         if hasattr(self, "rp_bins"):
             arrays["rp_bins"] = self.rp_bins
+        if self._fit_wgg:
+            arrays["rp_obs_wgg"] = self.rp_obs_wgg
+            arrays["wgg_obs"]    = self.wgg_obs
+            if hasattr(self, "cov_wgg"):
+                arrays["cov_wgg"] = self.cov_wgg
         np.savez(path, **arrays)

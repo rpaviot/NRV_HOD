@@ -3,8 +3,6 @@ import jax.numpy as jnp
 import jax.random as jrandom
 from numba import vectorize, njit, prange
 from jax import jit
-from colossus.cosmology import cosmology
-from colossus.lss import mass_function
 from scipy.special import roots_legendre
 from functools import partial
 import pandas as pd
@@ -21,12 +19,6 @@ def gauss_legendre_integration(f, a, b, **kwargs):
     integral = 0.5 * (b - a) * np.dot(w_legendre, f_values)
     return integral
 
-
-def set_mass_function(dict_cosmology,logM, z,mass_definition):
-    ##Colossus mass function. Will be replace by pyccl mass function in the future.
-    cosmo = cosmology.setCosmology('myCosmo', dict_cosmology)
-    dndlogM = mass_function.massFunction(10**logM, z , mdef = mass_definition, model = 'tinker08', q_out = 'dndlnM')
-    return dndlogM*np.log(10)
 
 
 @njit(parallel=True, fastmath=True)

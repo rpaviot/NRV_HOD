@@ -28,9 +28,6 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
-from HOD_NRV.HOD_numerical.twopoint_calculator.standard_two_point_calculator import (
-    compute_galaxy_lensing,
-)
 from HOD_NRV.utilsf.emulator_utils import rescale_Ac_to_target_ngal
 
 # ============================================================================
@@ -48,7 +45,7 @@ RESULTS_OUTPUT = "cross_check_numerical_results.txt"
 
 Lbox = 681.0        # Mpc/h
 zeff = 1.0
-mass_definition = "200m"
+mass_definition = "MassDef200m"
 
 column_mapping = {
     "x": "x", "y": "y", "z": "z",
@@ -63,14 +60,6 @@ dict_cosmo = {
     "A_s": 2.099e-9,
     "n_s": 0.967,
     "Omnu": 1.39e-3,
-}
-
-cosmo_params = {
-    "H0": dict_cosmo["h"] * 100,
-    "Om0": dict_cosmo["Omc"] + dict_cosmo["Omb"] + dict_cosmo["Omnu"],
-    "Ob0": dict_cosmo["Omb"],
-    "sigma8": 0.807,
-    "ns": 0.967,
 }
 
 base_hod_params = {
@@ -98,16 +87,6 @@ THRESHOLD = 0.05  # 5% maximum deviation
 # ============================================================================
 # Helpers
 # ============================================================================
-
-def subsample_array(positions, fraction, seed):
-    """Subsample positions array with sorted indices for cache locality."""
-    if fraction >= 1.0:
-        return positions
-    n_keep = int(len(positions) * fraction)
-    rng = np.random.RandomState(seed)
-    indices = np.sort(rng.choice(len(positions), n_keep, replace=False))
-    return positions[indices]
-
 
 def compute_deviation_metrics(ds_test, ds_ref):
     """Compute fractional deviation metrics between test and reference."""
@@ -190,7 +169,7 @@ def main():
     # --- Initialize HaloOccupation ---
     print("\nInitializing HaloOccupation...")
     halo = HaloOccupation(
-        cosmology=cosmo_params,
+        cosmology=dict_cosmo,
         zeff=zeff,
         Lbox=Lbox,
         column_mapping=column_mapping,
@@ -220,12 +199,12 @@ def main():
     print(f"  As = {As_rescaled[0]:.6f}")
 
     # --- Downsample particles ---
-    positions_part_full = np.array(halo.positions_part)
-    positions_part_sub = subsample_array(
-        positions_part_full, particle_fraction, PARTICLE_SUBSAMPLE_SEED
+    n_part_full = len(halo.positions_part)
+    halo.positions_part = halo._subsample_array(
+        halo.positions_part, particle_fraction, PARTICLE_SUBSAMPLE_SEED
     )
-    print(f"\nParticle downsampling: {len(positions_part_full):,} -> "
-          f"{len(positions_part_sub):,} ({particle_fraction*100:.0f}%)")
+    print(f"\nParticle downsampling: {n_part_full:,} -> "
+          f"{len(halo.positions_part):,} ({particle_fraction*100:.0f}%)")
 
     # --- JIT warmup ---
     print("\nWarming up JAX JIT (throw-away population)...")
@@ -236,46 +215,14 @@ def main():
 
     # --- Run optimized realizations ---
     print(f"\nRunning {n_real} optimized realizations (seed base={BASE_SEED})...")
-    ds_opt_all = []
-    timing_all = []
-    ngal_all = []
-    sat_frac_all = []
-
-    for i in range(n_real):
-        seed = BASE_SEED + i
-        print(f"  Realization {i+1}/{n_real} (seed={seed})...", end=" ", flush=True)
-
-        t_pop = time.perf_counter()
-        halo.populate_haloes(hod_params, random_seed=seed)
-        t_pop = time.perf_counter() - t_pop
-
-        n_gal = len(halo.positions_gal)
-        f_sat = halo.satellite_fraction
-        ngal_all.append(n_gal)
-        sat_frac_all.append(f_sat)
-
-        # Subsample galaxies
-        gal_pos = np.array(halo.positions_gal)
-        gal_pos_sub = subsample_array(gal_pos, galaxy_fraction, seed=88 + i)
-
-        # Compute lensing
-        t_lens = time.perf_counter()
-        rp_centers, ds = compute_galaxy_lensing(
-            gal_pos_sub, positions_part_sub,
-            Lbox, "z", halo.RHO_M, rp_bins, bins_comp=BINS_COMP
-        )
-        t_lens = time.perf_counter() - t_lens
-
-        ds_opt_all.append(ds)
-        timing_all.append(t_pop + t_lens)
-
-        print(f"N_gal={n_gal:,}, f_sat={f_sat:.3f}, "
-              f"pop={fmt_time(t_pop)}, lens={fmt_time(t_lens)}, "
-              f"total={fmt_time(t_pop + t_lens)}")
-
-    ds_opt_all = np.array(ds_opt_all)
-    timing_all = np.array(timing_all)
-    ds_opt_mean = ds_opt_all.mean(axis=0)
+    t0 = time.perf_counter()
+    rp_centers, ds_opt_mean, ds_opt_std = halo.compute_avg_lensing(
+        hod_params, n_real, rp_bins,
+        galaxy_fraction=galaxy_fraction,
+        base_seed=BASE_SEED,
+        bins_comp=BINS_COMP,
+    )
+    total_time = time.perf_counter() - t0
 
     # --- Comparison metrics ---
     print("\n" + "=" * 70)
@@ -287,9 +234,6 @@ def main():
     print(f"\n  Settings: {particle_fraction*100:.0f}% particles, "
           f"{galaxy_fraction*100:.0f}% galaxies, {n_real} realizations")
     print(f"  Baseline: {n_baseline} realizations (100% particles/galaxies)")
-    print(f"\n  Mean ngal:      {np.mean(ngal_all):,.0f}")
-    print(f"  Mean sat_frac:  {np.mean(sat_frac_all):.4f}")
-
     print(f"\n  Deviation metrics (mean of {n_real} vs mean of {n_baseline}):")
     print(f"    Median fractional:  {metrics['median_frac_dev']*100:.2f}%")
     print(f"    Max fractional:     {metrics['max_frac_dev']*100:.2f}%")
@@ -309,8 +253,8 @@ def main():
 
     # Timing
     print(f"\n  Timing:")
-    print(f"    Mean per realization: {fmt_time(timing_all.mean())}")
-    print(f"    Total ({n_real} realizations): {fmt_time(timing_all.sum())}")
+    print(f"    Total ({n_real} realizations): {fmt_time(total_time)}")
+    print(f"    Mean per realization: {fmt_time(total_time / n_real)}")
 
     # --- PASS/FAIL verdict ---
     max_dev = metrics["max_frac_dev"]
@@ -355,9 +299,9 @@ def main():
     ax1.loglog(rp_centers, ds_opt_mean, "ro--", lw=1.5, ms=5,
                label=f"Optimized (mean of {n_real})")
 
-    # Individual realizations as faint lines
-    for i in range(n_real):
-        ax1.loglog(rp_centers, ds_opt_all[i], color="red", alpha=0.15, lw=0.5)
+    # ±1σ band across realizations
+    ax1.fill_between(rp_centers, ds_opt_mean - ds_opt_std, ds_opt_mean + ds_opt_std,
+                     color="red", alpha=0.2)
 
     ax1.set_ylabel(r"$\Delta\Sigma$ [$h\,M_\odot/\mathrm{pc}^2$]")
     ax1.legend(loc="upper right")

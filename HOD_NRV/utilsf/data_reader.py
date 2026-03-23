@@ -11,11 +11,7 @@ Author: NRVpy Development Team
 import pandas as pd
 import numpy as np
 import jax.numpy as jnp
-from astropy.cosmology import FlatLambdaCDM
-from astropy import units as u
 from typing import Dict, Optional, Tuple, Union, Any
-
-from .utils_functions import set_mass_function
 
 
 def read_halo_catalog(halo_path: Optional[str] = None, 
@@ -61,73 +57,6 @@ def read_halo_catalog(halo_path: Optional[str] = None,
     else:
         raise ValueError("You must provide either a DataFrame or a halo_path.")
 
-
-def setup_cosmology(dict_cosmology: Dict[str, float], 
-                   zeff: float, 
-                   mass_definition: str) -> Tuple[FlatLambdaCDM, float, float, np.ndarray, np.ndarray]:
-    """
-    Initialize cosmological parameters and compute derived quantities.
-    
-    Parameters
-    ----------
-    dict_cosmology : dict
-        Dictionary containing cosmological parameters with keys:
-        - 'Om0': Matter density parameter at z=0
-        - 'Ob0': Baryon density parameter at z=0  
-        - 'H0' or other Hubble parameter (H0 fixed at 100 in implementation)
-    zeff : float
-        Effective redshift for calculations
-    mass_definition : str
-        Halo mass definition (e.g., "M200c", "Mvir")
-        
-    Returns
-    -------
-    cosmology : astropy.cosmology.FlatLambdaCDM
-        Astropy cosmology object
-    RHO_M : float
-        Matter density in units of Msun/h/(Mpc/h)**3
-    rsd_factor : float
-        Redshift space distortion factor: 1/(H(z)*a)
-    logM_bins : np.ndarray
-        Logarithmic mass bins for mass function computation
-    mass_function : np.ndarray
-        Halo mass function dn/dlogM in units of h^3 Mpc^-3
-        
-    Examples
-    --------
-    >>> cosmo_dict = {'Om0': 0.3, 'Ob0': 0.049}
-    >>> cosmo, rho_m, rsd_fac, logM, mf = setup_cosmology(cosmo_dict, 1.0, "Mvir")
-    
-    Notes
-    -----
-    The Hubble parameter H0 is fixed at 100 km/s/Mpc in the implementation.
-    Mass function is computed using the Tinker08 prescription via colossus.
-    """
-    # Set up astropy cosmology (H0 fixed at 100)
-    cosmology = FlatLambdaCDM(
-        Om0=dict_cosmology['Om0'], 
-        Ob0=dict_cosmology['Ob0'], 
-        H0=100
-    )
-    
-    # Compute matter density in simulation units
-    RHO_M = (
-        (cosmology.critical_density0 * cosmology.Om0)
-        .to(u.Msun/u.Mpc**3) / cosmology.h**2
-    ).value
-    
-    # Compute RSD factor: 1/(H(z)*a)
-    Hz = cosmology.H(zeff)
-    a = 1. / (1 + zeff)
-    rsd_factor = 1. / (Hz * a).value
-    
-    # Set up mass function bins and compute mass function
-    logM_bins = np.log10(np.logspace(11, 15, 1024))
-    mass_function = set_mass_function(
-        dict_cosmology, logM_bins, z=zeff, mass_definition=mass_definition
-    )
-    
-    return cosmology, RHO_M, rsd_factor, logM_bins, mass_function
 
 
 def setup_data_arrays(df: pd.DataFrame,

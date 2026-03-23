@@ -39,8 +39,6 @@ dict_cosmo = {
     }
 
 
-cosmo_params = {'H0': dict_cosmo['h']*100, 'Om0': dict_cosmo['Omc']+dict_cosmo['Omb'] + dict_cosmo['Omnu'], 'Ob0': dict_cosmo['Omb'], 'sigma8': 0.807, 'ns': 0.967}
-
 # Base HOD parameters (numerical naming: Mmin, M1 in log10)
 base_hod_params_numerical = {
     "As": 0.3,
