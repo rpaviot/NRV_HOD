@@ -135,6 +135,11 @@ def parse_args():
         default="numba",
         help="Galaxy population backend: 'numba' (default, faster, float64) or 'jax'",
     )
+    parser.add_argument(
+        "--elg_satellite",
+        action="store_true",
+        help="Use ELG satellite cutoff (Mcut/Mmax) instead of standard kappa",
+    )
     return parser.parse_args()
 
 
@@ -191,16 +196,25 @@ _CONFORMITY_RANGES = {
     "kappa_EE": (0.5, 2.0),
 }
 
+_ELG_SATELLITE_RANGES = {
+    "Mcut": (11.0, 13.0),
+    "Mmax": (13.5, 15.5),
+}
+
 FIXED_PARAMS = {"M1": M1_FIXED}
 
 
-def get_param_ranges(fit_case_str: str) -> dict:
-    ranges = dict(_BASE_RANGES)
+def get_param_ranges(fit_case_str: str, elg_satellite: bool = False) -> dict:
+    if elg_satellite:
+        base = {k: v for k, v in _BASE_RANGES.items() if k != "kappa"}
+        base.update(_ELG_SATELLITE_RANGES)
+    else:
+        base = dict(_BASE_RANGES)
     if fit_case_str in ("EXTENDED_PROFILE", "CONFORMITY"):
-        ranges.update(_EXTENDED_RANGES)
+        base.update(_EXTENDED_RANGES)
     if fit_case_str == "CONFORMITY":
-        ranges.update(_CONFORMITY_RANGES)
-    return ranges
+        base.update(_CONFORMITY_RANGES)
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -388,9 +402,10 @@ def main():
         )
         hod_type = "ELG_mHMQ"
         use_conformity = (args.fit_case == "CONFORMITY")
-        halo_gen.set_halo_model(hod_type, conformity=use_conformity)
+        use_elg_satellite = args.elg_satellite
+        halo_gen.set_halo_model(hod_type, conformity=use_conformity, elg_satellite=use_elg_satellite)
 
-        param_ranges = get_param_ranges(args.fit_case)
+        param_ranges = get_param_ranges(args.fit_case, elg_satellite=use_elg_satellite)
         print(f"[Phase 1] Generating {args.n_samples} LHS grid points "
               f"for fit_case={args.fit_case}")
         param_grid = generate_hod_parameter_grid(
@@ -402,6 +417,7 @@ def main():
             fixed_params=FIXED_PARAMS,
             random_seed=args.base_seed,
             conformity=use_conformity,
+            elg_satellite=use_elg_satellite,
             verbose=True,
         )
         grid_meta_path = os.path.join(args.output_dir, "param_grid_full.parquet")
@@ -470,9 +486,10 @@ def main():
         )
         hod_type_tmp = "ELG_mHMQ"
         use_conformity_tmp = (args.fit_case == "CONFORMITY")
-        halo_grid.set_halo_model(hod_type_tmp, conformity=use_conformity_tmp)
+        use_elg_satellite_tmp = args.elg_satellite
+        halo_grid.set_halo_model(hod_type_tmp, conformity=use_conformity_tmp, elg_satellite=use_elg_satellite_tmp)
 
-        param_ranges = get_param_ranges(args.fit_case)
+        param_ranges = get_param_ranges(args.fit_case, elg_satellite=use_elg_satellite_tmp)
         print(f"[rank {rank}] Generating {args.n_samples} LHS grid points "
               f"for fit_case={args.fit_case}")
         param_grid = generate_hod_parameter_grid(
@@ -484,6 +501,7 @@ def main():
             fixed_params=FIXED_PARAMS,
             random_seed=args.base_seed,
             conformity=use_conformity_tmp,
+            elg_satellite=use_elg_satellite_tmp,
             verbose=True,
         )
         grid_meta_path = os.path.join(args.output_dir, "param_grid_full.parquet")
@@ -515,7 +533,8 @@ def main():
     )
     hod_type = "ELG_mHMQ"
     use_conformity = (args.fit_case == "CONFORMITY")
-    halo.set_halo_model(hod_type, conformity=use_conformity)
+    use_elg_satellite = args.elg_satellite
+    halo.set_halo_model(hod_type, conformity=use_conformity, elg_satellite=use_elg_satellite)
     print(f"[job {rank}/{size}] Population backend: {args.population_backend}")
     print(f"[job {rank}/{size}] Catalog loaded.")
 
