@@ -18,6 +18,7 @@ from typing import Tuple, Optional
 from HOD_NRV.HOD_numerical.satellites.NFW import (
     position_satellites_numba,
     dispersion_velocities_numba,
+    spherical_NFW_positions_numba,
 )
 
 
@@ -117,6 +118,118 @@ def populate_satellites_numba(
     return sat_positions, sat_velocities
 
 
+def populate_satellites_from_subhalos_numba(
+    probS: np.ndarray,
+    positions: np.ndarray,
+    radius: np.ndarray,
+    concentration: np.ndarray,
+    velocities: np.ndarray,
+    vrms: np.ndarray,
+    csr_offsets: np.ndarray,
+    csr_sorted_indices: np.ndarray,
+    sub_positions: np.ndarray,
+    sub_velocities: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Populate satellite galaxies by sampling real subhalos (NumPy backend).
+
+    For each halo i with N_s > 0 sampled from Poisson(probS[i]):
+    - The first min(N_s, n_avail) satellites are drawn from the CSR subhalo list
+      (without replacement, in r_to_cop order so the innermost subhalos are
+      preferentially selected for small N_s).
+    - Any excess N_s - n_avail satellites fall back to spherical NFW sampling
+      (using vrms for velocity dispersion), for halos with fewer real subhalos
+      than the Poisson draw.
+
+    Parameters
+    ----------
+    probS : (N_halos,) mean satellite occupation numbers (Poisson means)
+    positions : (N_halos, 3) halo positions [Mpc/h]
+    radius : (N_halos,) virial radii [kpc/h]  — NFW fallback
+    concentration : (N_halos,) concentrations  — NFW fallback
+    velocities : (N_halos, 3) halo bulk velocities [km/s]
+    vrms : (N_halos,) velocity dispersions [km/s]  — NFW fallback
+    csr_offsets : (N_halos+1,) CSR row-start offsets
+        Subhalos for host i are at indices csr_sorted_indices[offsets[i]:offsets[i+1]].
+    csr_sorted_indices : (N_sub,) flat subhalo index array (sorted by r_to_cop within host)
+    sub_positions : (N_sub, 3) subhalo positions [Mpc/h]
+    sub_velocities : (N_sub, 3) subhalo velocities [km/s]
+
+    Returns
+    -------
+    sat_positions : (N_satellites, 3)
+    sat_velocities : (N_satellites, 3)
+    """
+    probS = np.asarray(probS, dtype=np.float64)
+    pre_cond = probS > 0
+    if not np.any(pre_cond):
+        return np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.float64)
+
+    probS_filtered = probS[pre_cond]
+    N_s = np.random.poisson(probS_filtered).astype(np.int64)
+    N_s_tot = int(N_s.sum())
+
+    if N_s_tot == 0:
+        return np.empty((0, 3), dtype=np.float64), np.empty((0, 3), dtype=np.float64)
+
+    # Filter to halos that actually drew at least one satellite
+    has_sat = N_s > 0
+    pre_cond_indices = np.where(pre_cond)[0]
+    final_indices = pre_cond_indices[has_sat]   # (N_sat_halos,)
+    N_s_filt = N_s[has_sat]                     # (N_sat_halos,) Poisson draws
+
+    # Available subhalos per halo
+    n_avail = csr_offsets[final_indices + 1] - csr_offsets[final_indices]  # (N_sat_halos,)
+    n_from_sub = np.minimum(N_s_filt, n_avail)  # real subhalos to use
+    n_from_nfw = N_s_filt - n_from_sub          # NFW fallback count
+
+    # --- Part 1: sample from real subhalo list ---
+    n_sub_total = int(n_from_sub.sum())
+    sub_pos_out = np.empty((n_sub_total, 3), dtype=np.float64)
+    sub_vel_out = np.empty((n_sub_total, 3), dtype=np.float64)
+
+    out_idx = 0
+    for i in range(len(final_indices)):
+        ns = int(n_from_sub[i])
+        if ns == 0:
+            continue
+        halo_idx = int(final_indices[i])
+        n_av = int(n_avail[i])
+        # CSR is sorted by ranking criterion from build_halo_and_subhalo_catalogues();
+        # take the first ns slots deterministically (stochasticity is only in N_s ~ Poisson)
+        picked = np.arange(ns)
+        csr_start = int(csr_offsets[halo_idx])
+        sub_ids = csr_sorted_indices[csr_start + picked]
+        sub_pos_out[out_idx:out_idx + ns] = sub_positions[sub_ids]
+        sub_vel_out[out_idx:out_idx + ns] = sub_velocities[sub_ids]
+        out_idx += ns
+
+    # --- Part 2: NFW fallback for excess ---
+    n_nfw_total = int(n_from_nfw.sum())
+    if n_nfw_total > 0:
+        nfw_mask = n_from_nfw > 0
+        nfw_halo_idx = final_indices[nfw_mask]
+        nfw_counts = n_from_nfw[nfw_mask]
+
+        nfw_pos = spherical_NFW_positions_numba(
+            positions[nfw_halo_idx],
+            radius[nfw_halo_idx],
+            concentration[nfw_halo_idx],
+            nfw_counts,
+        )
+        nfw_vel = dispersion_velocities_numba(
+            velocities[nfw_halo_idx],
+            vrms[nfw_halo_idx],
+            nfw_counts,
+        )
+        sat_positions = np.vstack([sub_pos_out, nfw_pos])
+        sat_velocities = np.vstack([sub_vel_out, nfw_vel])
+    else:
+        sat_positions = sub_pos_out
+        sat_velocities = sub_vel_out
+
+    return sat_positions, sat_velocities
+
+
 def combine_galaxy_populations_numba(
     cent_pos: np.ndarray,
     cent_vel: np.ndarray,
@@ -189,6 +302,10 @@ def populate_haloes_full_numba(
     rsd_axis_index: int = 2,
     Lbox: float = 1000.0,
     random_seed: Optional[int] = None,
+    sub_positions: Optional[np.ndarray] = None,
+    sub_velocities: Optional[np.ndarray] = None,
+    csr_offsets: Optional[np.ndarray] = None,
+    csr_sorted_indices: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float, np.ndarray]:
     """Complete halo population pipeline: centrals + satellites + RSD (NumPy/Numba).
 
@@ -244,11 +361,17 @@ def populate_haloes_full_numba(
     else:
         probS = np.asarray(hod_model.compute_satellite_occupation(logM, dict_params))
 
-    sat_positions, sat_velocities = populate_satellites_numba(
-        positions, velocities, probS, radius, concentration, vrms,
-        triaxial_NFW=triaxial_NFW, shapes=shapes, ratios=ratios,
-        f_exp=f_exp, tau=tau, lambda_NFW=lambda_NFW,
-    )
+    if sub_positions is not None:
+        sat_positions, sat_velocities = populate_satellites_from_subhalos_numba(
+            probS, positions, radius, concentration, velocities, vrms,
+            csr_offsets, csr_sorted_indices, sub_positions, sub_velocities,
+        )
+    else:
+        sat_positions, sat_velocities = populate_satellites_numba(
+            positions, velocities, probS, radius, concentration, vrms,
+            triaxial_NFW=triaxial_NFW, shapes=shapes, ratios=ratios,
+            f_exp=f_exp, tau=tau, lambda_NFW=lambda_NFW,
+        )
 
     positions_gal, velocities_gal = combine_galaxy_populations_numba(
         cent_positions, cent_velocities, sat_positions, sat_velocities

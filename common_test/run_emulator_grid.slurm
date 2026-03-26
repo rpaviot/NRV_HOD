@@ -34,6 +34,7 @@ GALAXY_FRACTION=0.10
 PARTICLE_FRACTION=0.05
 CHECKPOINT_EVERY=200
 BASE_SEED=42
+ELG_SAT=0       # 1 = ELG satellite cutoff (Mcut/Mmax instead of kappa), 0 = standard kappa
 # =============================================================================
 
 mkdir -p logs
@@ -49,7 +50,8 @@ case "${PHASE:-array}" in
         --fit_case        ${FIT_CASE} \
         --n_samples       ${N_SAMPLES} \
         --output_dir      ${OUTPUT_DIR} \
-        --base_seed       ${BASE_SEED}
+        --base_seed       ${BASE_SEED} \
+        --elg_satellite   ${ELG_SAT}
     ;;
 
   array)
@@ -66,7 +68,8 @@ case "${PHASE:-array}" in
         --galaxy_fraction ${GALAXY_FRACTION} \
         --particle_fraction ${PARTICLE_FRACTION} \
         --checkpoint_every ${CHECKPOINT_EVERY} \
-        --base_seed       ${BASE_SEED}
+        --base_seed       ${BASE_SEED} \
+        --elg_satellite   ${ELG_SAT}
     ;;
 
   merge)

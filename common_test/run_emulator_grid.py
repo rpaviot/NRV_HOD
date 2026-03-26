@@ -174,9 +174,20 @@ def parse_args():
         help="Galaxy population backend: 'numba' (default, faster, float64) or 'jax'",
     )
     parser.add_argument(
+        "--subhalo_path",
+        type=str,
+        default=None,
+        help="Path to subhalo_catalogue.npz (from precompute_subhalo_catalogue.py). "
+             "When provided, satellites are sampled from real N-body subhalos instead "
+             "of NFW profiles. Requires the halo_path parquet to be the matching "
+             "host_catalogue.parquet from the same preprocessing run.",
+    )
+    parser.add_argument(
         "--elg_satellite",
-        action="store_true",
-        help="Use ELG satellite cutoff (Mcut/Mmax) instead of standard kappa",
+        type=lambda x: bool(int(x)),
+        default=0,
+        metavar="{0,1}",
+        help="Use ELG satellite cutoff (1) or standard kappa (0)",
     )
     return parser.parse_args()
 
@@ -289,6 +300,7 @@ def main():
             apply_rsd=False,
             do_test=False,
             population_backend=args.population_backend,
+            subhalo_path=args.subhalo_path,
         )
         hod_type = "ELG_mHMQ"
         use_conformity = (args.fit_case == "CONFORMITY")
@@ -296,6 +308,7 @@ def main():
         halo_gen.set_halo_model(hod_type, conformity=use_conformity, elg_satellite=use_elg_satellite)
 
         param_ranges = get_param_ranges(args.fit_case, elg_satellite=use_elg_satellite)
+        include_nfw_extensions = (args.fit_case in ("EXTENDED_PROFILE", "CONFORMITY"))
         print(f"[Phase 1] Generating {args.n_samples} LHS grid points "
               f"for fit_case={args.fit_case}")
         param_grid = generate_hod_parameter_grid(
@@ -308,6 +321,7 @@ def main():
             random_seed=args.base_seed,
             conformity=use_conformity,
             elg_satellite=use_elg_satellite,
+            include_nfw_extensions=include_nfw_extensions,
             verbose=True,
         )
         grid_meta_path = os.path.join(args.output_dir, "param_grid_full.parquet")
@@ -375,6 +389,7 @@ def main():
             apply_rsd=False,
             do_test=False,
             population_backend=args.population_backend,
+            subhalo_path=args.subhalo_path,
         )
         hod_type_tmp = "ELG_mHMQ"
         use_conformity_tmp = (args.fit_case == "CONFORMITY")
@@ -382,6 +397,7 @@ def main():
         halo_grid.set_halo_model(hod_type_tmp, conformity=use_conformity_tmp, elg_satellite=use_elg_satellite_tmp)
 
         param_ranges = get_param_ranges(args.fit_case, elg_satellite=use_elg_satellite_tmp)
+        include_nfw_extensions_tmp = (args.fit_case in ("EXTENDED_PROFILE", "CONFORMITY"))
         print(f"[rank {rank}] Generating {args.n_samples} LHS grid points "
               f"for fit_case={args.fit_case}")
         param_grid = generate_hod_parameter_grid(
@@ -394,6 +410,7 @@ def main():
             random_seed=args.base_seed,
             conformity=use_conformity_tmp,
             elg_satellite=use_elg_satellite_tmp,
+            include_nfw_extensions=include_nfw_extensions_tmp,
             verbose=True,
         )
         grid_meta_path = os.path.join(args.output_dir, "param_grid_full.parquet")
@@ -424,7 +441,10 @@ def main():
         particle_fraction=args.particle_fraction,
         particle_subsample_seed=args.particle_seed,
         population_backend=args.population_backend,
+        subhalo_path=args.subhalo_path,
     )
+    if args.subhalo_path is not None:
+        print(f"[job {rank}/{size}] Subhalo satellite mode: {args.subhalo_path}")
     print(f"[job {rank}/{size}] Population backend: {args.population_backend}")
     print(f"[job {rank}/{size}] Particle fraction: {args.particle_fraction} "
           f"(seed={args.particle_seed})")

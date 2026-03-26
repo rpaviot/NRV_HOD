@@ -141,7 +141,8 @@ class HaloOccupation:
                  particle_fraction: float = 1.0,
                  particle_subsample_seed: int = 42,
                  population_backend: str = "jax",
-                 mass_function: str = 'Tinker08'):
+                 mass_function: str = 'Tinker08',
+                 subhalo_path: Optional[str] = None):
 
         # Store configuration parameters
         if population_backend not in ("jax", "numba"):
@@ -227,8 +228,31 @@ class HaloOccupation:
             self.fI = None
             self.fE = None
 
+        # === SUBHALO DATA ===
+        self.sub_positions = None
+        self.sub_velocities = None
+        self.csr_offsets = None
+        self.csr_sorted_indices = None
+        if subhalo_path is not None:
+            d = np.load(subhalo_path)
+            self.sub_positions = d["sub_positions"].astype(np.float64)
+            self.sub_velocities = d["sub_velocities"].astype(np.float64)
+            self.csr_offsets = d["csr_offsets"].astype(np.int64)
+            self.csr_sorted_indices = d["csr_sorted_indices"].astype(np.int64)
+
         # Store number of halos
         self.n_halos = len(self.DataFrame)
+
+        # Validate subhalo catalogue size matches halo catalogue
+        if self.csr_offsets is not None:
+            expected = self.n_halos + 1
+            if len(self.csr_offsets) != expected:
+                raise ValueError(
+                    f"Subhalo catalogue mismatch: csr_offsets has length "
+                    f"{len(self.csr_offsets)} but expected {expected} "
+                    f"(n_halos={self.n_halos}). Ensure the subhalo catalogue "
+                    f"was built from the same halo parquet."
+                )
 
         # Run validation tests if requested
         if do_test:
@@ -358,11 +382,20 @@ class HaloOccupation:
         tau = dict_params.get('tau', 6.0)
         lambda_NFW = dict_params.get('lambda_NFW', 1.0)
 
-        # Use the population engine for the complete workflow
-        _engine = populate_haloes_full_numba if self.population_backend == "numba" else populate_haloes_full
-        (self.positions_gal, self.positions_gal_rsd,
-         self.velocities_gal,
-         self.satellite_fraction, self.cent_halo_indices) = _engine(
+        # Subhalo-based placement requires the numba backend (JAX cannot handle
+        # dynamic per-halo indexing into a CSR structure efficiently)
+        use_subhalos = self.csr_offsets is not None
+        if use_subhalos and self.population_backend == "jax":
+            import warnings
+            warnings.warn(
+                "Subhalo satellite placement requires population_backend='numba'; "
+                "switching to numba for this call.",
+                stacklevel=2,
+            )
+        use_numba = use_subhalos or self.population_backend == "numba"
+        _engine = populate_haloes_full_numba if use_numba else populate_haloes_full
+
+        engine_kwargs = dict(
             positions=self.positions,
             velocities=self.velocities,
             mass=self.mass,
@@ -382,8 +415,20 @@ class HaloOccupation:
             rsd_factor=self.rsd_factor,
             rsd_axis_index=self.rsd_axis_index,
             Lbox=self.Lbox,
-            random_seed=random_seed
+            random_seed=random_seed,
         )
+
+        if use_subhalos:
+            engine_kwargs.update(
+                sub_positions=self.sub_positions,
+                sub_velocities=self.sub_velocities,
+                csr_offsets=self.csr_offsets,
+                csr_sorted_indices=self.csr_sorted_indices,
+            )
+
+        (self.positions_gal, self.positions_gal_rsd,
+         self.velocities_gal,
+         self.satellite_fraction, self.cent_halo_indices) = _engine(**engine_kwargs)
 
     def compute_galaxy_clustering(self, mode: str, bins1: Union[int, Any],
                                  catalog2: Optional[Any] = None,

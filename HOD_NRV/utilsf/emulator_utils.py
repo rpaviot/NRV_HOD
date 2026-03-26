@@ -298,9 +298,10 @@ def _get_required_parameters(
     if hasattr(halo, 'assembly_bias') and halo.assembly_bias:
         required.update(['A_cent', 'B_cent', 'A_sat', 'B_sat'])
 
-    # Add NFW extension parameters if requested
+    # lambda_NFW is always free (all fit cases); f_exp/tau only for extended profile
+    required.add('lambda_NFW')
     if include_nfw_extensions:
-        required.update(['f_exp', 'tau', 'lambda_NFW'])
+        required.update(['f_exp', 'tau'])
 
     return required
 
@@ -517,7 +518,7 @@ def generate_hod_parameter_grid(
         print(f"  Assembly bias: {halo.assembly_bias if hasattr(halo, 'assembly_bias') else False}")
         print(f"  Conformity: {conformity}")
         print(f"  ELG satellite: {elg_satellite}")
-        print(f"  NFW extensions: {include_nfw_extensions}")
+        print(f"  NFW extensions: lambda_NFW=True, extended profile (f_exp,tau)={include_nfw_extensions}")
         print(f"\nRequired parameters: {sorted(required_params)}")
 
     # Make a copy of param_ranges to potentially modify
