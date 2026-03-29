@@ -206,4 +206,5 @@ HOD_NRV/HOD_numerical/test/output/
 *.hdf5
 *.txt
 HOD_NRV/utilsf/subhalo_catalogue.py 
-common_test/cross_check_nfw_vs_subhalo.py  
+#common_test/precompute_subhalo_catalogue.py 
+#common_test/cross_check_nfw_vs_subhalo.py  
