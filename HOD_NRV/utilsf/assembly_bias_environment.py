@@ -604,6 +604,7 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
                                    r_max: float = 6.0,
                                    dr: float = 0.25,
                                    rvir_factor: float = 2.25,
+                                   mass_bins: Union[int, np.ndarray] = 30,
                                    threads: int = 32) -> dict:
     """
     High-level function to compute assembly bias environmental properties.
@@ -638,6 +639,9 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
         Step size for smoothing radius grid in Mpc/h (default: 0.25)
     rvir_factor : float, optional
         Smoothing scale multiplier: R_h = rvir_factor * r_vir[h] (default: 2.25)
+    mass_bins : int or ndarray, optional
+        Number of mass bins for normalization (default: 30), or a pre-defined
+        array of bin edges in log10(M) units.
     threads : int, optional
         Number of threads for FFT operations (default: 32)
 
@@ -686,6 +690,7 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
         particle_pos, halo_positions, halo_masses,
         halo_rvir=halo_rvir,
         compute_shear=compute_shear,
+        mass_bins=mass_bins,
         r_min=r_min, r_max=r_max, dr=dr, rvir_factor=rvir_factor
     )
 
