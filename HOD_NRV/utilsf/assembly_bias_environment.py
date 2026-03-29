@@ -562,7 +562,7 @@ class AssemblyBiasEnvironment:
             # Normalize density and shear within each mass bin
             delta_norm = np.zeros_like(deltah)
             if compute_shear:
-                fs_norm = np.zeros_like(qr2)
+                fs_norm = np.zeros_like(results['qr2'])
             
             for n in range(len(bins_mass) - 1):
                 cond = bin_number == n + 1
@@ -575,7 +575,7 @@ class AssemblyBiasEnvironment:
                     delta_norm[cond] = fdi
                     
                 if compute_shear:
-                    qri = qr2[cond]
+                    qri = results['qr2'][cond]
                     if len(qri) != 0:
                         fsi = normalize_distribution(1 + qri)
                         fs_norm[cond] = fsi
