@@ -469,7 +469,7 @@ class AssemblyBiasEnvironment:
                                        halo_masses: Optional[np.ndarray] = None,
                                        halo_rvir: Optional[np.ndarray] = None,
                                        compute_shear: bool = True,
-                                       mass_bins: int = 30,
+                                       mass_bins: Union[int, np.ndarray] = 30,
                                        normalize_positions: bool = True,
                                        r_min: float = 0.5,
                                        r_max: float = 6.0,
@@ -493,8 +493,9 @@ class AssemblyBiasEnvironment:
             smoothing_radius set at construction time is used.
         compute_shear : bool, optional
             Whether to compute shear field (default: True)
-        mass_bins : int, optional
-            Number of mass bins for normalization (default: 30)
+        mass_bins : int or ndarray, optional
+            Number of mass bins for normalization (default: 30), or a pre-defined
+            array of bin edges in log10(M) units.
         normalize_positions : bool, optional
             Whether to normalize positions (default: True)
         r_min : float, optional
@@ -551,9 +552,12 @@ class AssemblyBiasEnvironment:
             
             # Create mass bins
             log_masses = np.log10(halo_masses)
-            low_m = log_masses.min()
-            high_m = log_masses.max()
-            bins_mass = np.linspace(low_m, high_m, mass_bins + 1)
+            if isinstance(mass_bins, np.ndarray):
+                bins_mass = mass_bins
+            else:
+                low_m = log_masses.min()
+                high_m = log_masses.max()
+                bins_mass = np.linspace(low_m, high_m, mass_bins + 1)
             
             # Assign halos to mass bins
             _, _, bin_number = stats.binned_statistic(log_masses, log_masses, 
