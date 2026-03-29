@@ -328,9 +328,12 @@ class AssemblyBiasEnvironment:
             positions = particle_positions.astype(np.float32)
 
         delta = TSC(positions, ncells_1d=self.Nmesh)
+        del positions
         delta = (delta - np.mean(delta)) / np.mean(delta)
 
         deltak = fft_3D_real(delta, threads=self.threads)
+        del delta
+        gc.collect()
         apply_interlacing(deltak)
         compensate_mas(deltak, p=3)  # TSC compensation
 
@@ -357,6 +360,8 @@ class AssemblyBiasEnvironment:
 
         # Apply Gaussian smoothing at the single global scale
         deltak = deltak_base * self.W
+        del deltak_base
+        gc.collect()
         delta = ifft_3D_real(deltak, threads=self.threads)
 
         return delta, deltak
@@ -388,7 +393,9 @@ class AssemblyBiasEnvironment:
         
         # Compute shear from eigenvalues
         qr2 = compute_shear_eigenvalues(T11, T12, T13, T22, T23, T33)
-        
+        del T11, T22, T33, T12, T13, T23
+        gc.collect()
+
         return qr2
     
     def compute_multiscale_properties(self, deltak_base: np.ndarray,
@@ -456,11 +463,14 @@ class AssemblyBiasEnvironment:
         t = (R_halo - R_arr[idx]) / (R_arr[idx + 1] - R_arr[idx])
         halo_idx = np.arange(N_halos)
         delta_rvir = (1 - t) * delta_grid[idx, halo_idx] + t * delta_grid[idx + 1, halo_idx]
+        del delta_grid
 
         results = {'delta_h': delta_rvir}
         if compute_shear:
             qr2_rvir = (1 - t) * qr2_grid[idx, halo_idx] + t * qr2_grid[idx + 1, halo_idx]
+            del qr2_grid
             results['qr2'] = qr2_rvir
+        gc.collect()
 
         return results
 
@@ -532,19 +542,27 @@ class AssemblyBiasEnvironment:
                 deltak_base, pos, halo_rvir, compute_shear,
                 r_min, r_max, dr, rvir_factor
             )
+            del deltak_base
+            gc.collect()
             deltah = ms['delta_h']
             results = {'delta_h': deltah}
             if compute_shear:
                 results['qr2'] = ms['qr2']
+            del ms
+            gc.collect()
         else:
             # --- Single global smoothing radius mode ---
             print("Computing density field...")
             delta, deltak = self.compute_density_field(particle_positions, normalize_positions)
             deltah = invTSC(delta, pos)
+            del delta
+            gc.collect()
             results = {'delta_h': deltah}
             if compute_shear:
                 print("Computing shear field...")
                 results['qr2'] = self.compute_shear_field(deltak, pos)
+            del deltak
+            gc.collect()
 
         # Mass-dependent normalization (same for both modes)
         if halo_masses is not None:
@@ -587,7 +605,9 @@ class AssemblyBiasEnvironment:
             results['delta_norm'] = delta_norm
             if compute_shear:
                 results['fs_norm'] = fs_norm
-        
+            del log_masses, bin_number, bins_mass
+            gc.collect()
+
         return results
 
 
@@ -667,6 +687,9 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
 
     halo_masses = df_halo[mass_column].values if mass_column in df_halo.columns else None
     halo_rvir = df_halo[rvir_column].values if rvir_column is not None else None
+    if isinstance(halo_catalogue, str):
+        del df_halo
+        gc.collect()
 
     # Load particle positions
     if isinstance(particle_positions, str):
@@ -693,6 +716,10 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
         mass_bins=mass_bins,
         r_min=r_min, r_max=r_max, dr=dr, rvir_factor=rvir_factor
     )
+    if isinstance(particle_positions, str):
+        del particle_pos
+    del halo_positions, halo_masses, halo_rvir
+    gc.collect()
 
     print("Assembly bias environmental properties computed successfully!")
     return results
