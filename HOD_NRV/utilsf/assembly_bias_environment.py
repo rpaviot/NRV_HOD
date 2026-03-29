@@ -302,22 +302,22 @@ class AssemblyBiasEnvironment:
         # Gaussian smoothing kernel
         self.W = np.exp(-0.5 * self.k2 * (smoothing_radius**2))
     
-    def compute_density_field(self, particle_positions: np.ndarray, 
-                            normalize: bool = True) -> np.ndarray:
+    def _compute_fourier_density(self, particle_positions: np.ndarray,
+                                normalize: bool = True) -> np.ndarray:
         """
-        Compute density field from particle positions.
-        
+        Compute MAS-compensated Fourier density field without Gaussian smoothing.
+
         Parameters
         ----------
         particle_positions : ndarray
             Particle positions array of shape (N, 3) in units of Lbox
         normalize : bool, optional
             Whether to normalize positions and apply periodic wrapping
-            
+
         Returns
         -------
         ndarray
-            Real-space density field δ(x)
+            Fourier-space density field (unsmoothed, MAS-compensated)
         """
         if normalize:
             positions = particle_positions.copy().astype(np.float32)
@@ -326,22 +326,39 @@ class AssemblyBiasEnvironment:
             positions = reorder_positions(positions)
         else:
             positions = particle_positions.astype(np.float32)
-            
-        # Create density field using TSC assignment
+
         delta = TSC(positions, ncells_1d=self.Nmesh)
         delta = (delta - np.mean(delta)) / np.mean(delta)
-        
-        # Fourier transform and apply corrections
+
         deltak = fft_3D_real(delta, threads=self.threads)
         apply_interlacing(deltak)
         compensate_mas(deltak, p=3)  # TSC compensation
-        
-        # Apply Gaussian smoothing
-        deltak = deltak * self.W
-        
-        # Transform back to real space
+
+        return deltak
+
+    def compute_density_field(self, particle_positions: np.ndarray,
+                              normalize: bool = True) -> np.ndarray:
+        """
+        Compute density field from particle positions.
+
+        Parameters
+        ----------
+        particle_positions : ndarray
+            Particle positions array of shape (N, 3) in units of Lbox
+        normalize : bool, optional
+            Whether to normalize positions and apply periodic wrapping
+
+        Returns
+        -------
+        ndarray
+            Real-space density field δ(x)
+        """
+        deltak_base = self._compute_fourier_density(particle_positions, normalize)
+
+        # Apply Gaussian smoothing at the single global scale
+        deltak = deltak_base * self.W
         delta = ifft_3D_real(deltak, threads=self.threads)
-        
+
         return delta, deltak
     
     def compute_shear_field(self, deltak: np.ndarray, 
@@ -374,30 +391,121 @@ class AssemblyBiasEnvironment:
         
         return qr2
     
+    def compute_multiscale_properties(self, deltak_base: np.ndarray,
+                                      pos: np.ndarray,
+                                      halo_rvir: np.ndarray,
+                                      compute_shear: bool = True,
+                                      r_min: float = 0.5,
+                                      r_max: float = 6.0,
+                                      dr: float = 0.25,
+                                      rvir_factor: float = 2.25) -> dict:
+        """
+        Compute density (and optionally shear) at a per-halo smoothing scale R = rvir_factor * r_vir.
+
+        The density field is computed at each smoothing radius in [r_min, r_max] (step dr).
+        The per-halo value is then obtained by linear interpolation at R = rvir_factor * r_vir,
+        clamped to [r_min, r_max].
+
+        Parameters
+        ----------
+        deltak_base : ndarray
+            Unsmoothed MAS-compensated Fourier density field from _compute_fourier_density()
+        pos : ndarray
+            Halo positions in [0, 1] units, shape (N_halos, 3)
+        halo_rvir : ndarray
+            Halo virial radii in Mpc/h, shape (N_halos,)
+        compute_shear : bool, optional
+            Whether to compute per-halo shear q_R² (default: True)
+        r_min : float, optional
+            Minimum smoothing radius in Mpc/h (default: 0.5)
+        r_max : float, optional
+            Maximum smoothing radius in Mpc/h (default: 6.0)
+        dr : float, optional
+            Step size for smoothing radius grid in Mpc/h (default: 0.25)
+        rvir_factor : float, optional
+            Smoothing scale multiplier: R_h = rvir_factor * r_vir[h] (default: 2.25)
+
+        Returns
+        -------
+        dict
+            - 'delta_h': per-halo density at R = rvir_factor * r_vir
+            - 'qr2': per-halo shear q_R² at R = rvir_factor * r_vir (if compute_shear=True)
+        """
+        R_arr = np.arange(r_min, r_max + dr / 2, dr).astype(np.float32)
+        N_R = len(R_arr)
+        N_halos = len(pos)
+
+        delta_grid = np.zeros((N_R, N_halos), dtype=np.float32)
+        if compute_shear:
+            qr2_grid = np.zeros((N_R, N_halos), dtype=np.float32)
+
+        for i, R in enumerate(R_arr):
+            print(f"  Scale {i + 1}/{N_R}: R = {R:.2f} Mpc/h")
+            W_R = np.exp(-0.5 * self.k2 * float(R) ** 2)
+            deltak_R = deltak_base * W_R
+            delta_R = ifft_3D_real(deltak_R, threads=self.threads)
+            delta_grid[i] = invTSC(delta_R, pos)
+            del delta_R
+            if compute_shear:
+                qr2_grid[i] = self.compute_shear_field(deltak_R, pos)
+            del deltak_R
+
+        # Vectorized per-halo linear interpolation along the R axis
+        R_halo = np.clip(rvir_factor * halo_rvir, R_arr[0], R_arr[-1]).astype(np.float32)
+        idx = np.clip(np.searchsorted(R_arr, R_halo) - 1, 0, N_R - 2)
+        t = (R_halo - R_arr[idx]) / (R_arr[idx + 1] - R_arr[idx])
+        halo_idx = np.arange(N_halos)
+        delta_rvir = (1 - t) * delta_grid[idx, halo_idx] + t * delta_grid[idx + 1, halo_idx]
+
+        results = {'delta_h': delta_rvir}
+        if compute_shear:
+            qr2_rvir = (1 - t) * qr2_grid[idx, halo_idx] + t * qr2_grid[idx + 1, halo_idx]
+            results['qr2'] = qr2_rvir
+
+        return results
+
     def compute_environmental_properties(self, particle_positions: np.ndarray,
                                        halo_positions: np.ndarray,
                                        halo_masses: Optional[np.ndarray] = None,
+                                       halo_rvir: Optional[np.ndarray] = None,
                                        compute_shear: bool = True,
                                        mass_bins: int = 30,
-                                       normalize_positions: bool = True) -> dict:
+                                       normalize_positions: bool = True,
+                                       r_min: float = 0.5,
+                                       r_max: float = 6.0,
+                                       dr: float = 0.25,
+                                       rvir_factor: float = 2.25) -> dict:
         """
         Compute density and shear environmental properties for assembly bias.
-        
+
         Parameters
         ----------
         particle_positions : ndarray
             Particle positions array of shape (N, 3)
-        halo_positions : ndarray  
+        halo_positions : ndarray
             Halo positions array of shape (M, 3)
         halo_masses : ndarray, optional
             Halo masses for mass-dependent normalization
+        halo_rvir : ndarray, optional
+            Halo virial radii in Mpc/h, shape (M,). If provided, the smoothing scale
+            is set per-halo to rvir_factor * r_vir[h], interpolated from a grid of
+            smoothing radii [r_min, r_max] with step dr. If None, the global
+            smoothing_radius set at construction time is used.
         compute_shear : bool, optional
             Whether to compute shear field (default: True)
         mass_bins : int, optional
             Number of mass bins for normalization (default: 30)
         normalize_positions : bool, optional
             Whether to normalize positions (default: True)
-            
+        r_min : float, optional
+            Minimum smoothing radius in Mpc/h for rvir mode (default: 0.5)
+        r_max : float, optional
+            Maximum smoothing radius in Mpc/h for rvir mode (default: 6.0)
+        dr : float, optional
+            Step size for smoothing radius grid in Mpc/h (default: 0.25)
+        rvir_factor : float, optional
+            Smoothing scale multiplier: R_h = rvir_factor * r_vir[h] (default: 2.25)
+
         Returns
         -------
         dict
@@ -407,8 +515,6 @@ class AssemblyBiasEnvironment:
             - 'qr2': shear field at halo positions (if compute_shear=True)
             - 'fs_norm': normalized shear field (if halo_masses provided and compute_shear=True)
         """
-        print("Computing density field...")
-        
         # Normalize halo positions
         if normalize_positions:
             pos = halo_positions.copy().astype(np.float32)
@@ -416,22 +522,30 @@ class AssemblyBiasEnvironment:
             periodic_wrap(pos)
         else:
             pos = halo_positions.astype(np.float32)
-        
-        # Compute density field
-        delta, deltak = self.compute_density_field(particle_positions, normalize_positions)
-        
-        # Interpolate density at halo positions
-        deltah = invTSC(delta, pos)
-        
-        results = {'delta_h': deltah}
-        
-        # Compute shear if requested
-        if compute_shear:
-            print("Computing shear field...")
-            qr2 = self.compute_shear_field(deltak, pos)
-            results['qr2'] = qr2
-        
-        # Mass-dependent normalization
+
+        if halo_rvir is not None:
+            # --- Per-halo virial radius mode ---
+            print("Computing multi-scale density and shear fields (per-halo Rvir)...")
+            deltak_base = self._compute_fourier_density(particle_positions, normalize_positions)
+            ms = self.compute_multiscale_properties(
+                deltak_base, pos, halo_rvir, compute_shear,
+                r_min, r_max, dr, rvir_factor
+            )
+            deltah = ms['delta_h']
+            results = {'delta_h': deltah}
+            if compute_shear:
+                results['qr2'] = ms['qr2']
+        else:
+            # --- Single global smoothing radius mode ---
+            print("Computing density field...")
+            delta, deltak = self.compute_density_field(particle_positions, normalize_positions)
+            deltah = invTSC(delta, pos)
+            results = {'delta_h': deltah}
+            if compute_shear:
+                print("Computing shear field...")
+                results['qr2'] = self.compute_shear_field(deltak, pos)
+
+        # Mass-dependent normalization (same for both modes)
         if halo_masses is not None:
             print("Applying mass-dependent normalization...")
             
@@ -481,10 +595,15 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
                                    smoothing_radius: float = 1.0,
                                    position_columns: Tuple[str, str, str] = ('x', 'y', 'z'),
                                    mass_column: str = 'mass',
+                                   rvir_column: Optional[str] = None,
+                                   r_min: float = 0.5,
+                                   r_max: float = 6.0,
+                                   dr: float = 0.25,
+                                   rvir_factor: float = 2.25,
                                    threads: int = 32) -> dict:
     """
     High-level function to compute assembly bias environmental properties.
-    
+
     Parameters
     ----------
     halo_catalogue : str or DataFrame
@@ -498,36 +617,49 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
     Lbox : float, optional
         Box size in Mpc/h (default: 681)
     smoothing_radius : float, optional
-        Gaussian smoothing radius in Mpc/h (default: 1.0)
+        Gaussian smoothing radius in Mpc/h for the single-scale mode (default: 1.0).
+        Ignored when rvir_column is provided.
     position_columns : tuple, optional
         Column names for x, y, z positions (default: ('x', 'y', 'z'))
     mass_column : str, optional
         Column name for halo masses (default: 'mass')
+    rvir_column : str, optional
+        Column name for halo virial radii in Mpc/h. If provided, per-halo smoothing
+        at R = rvir_factor * r_vir is used instead of the single global smoothing_radius.
+    r_min : float, optional
+        Minimum smoothing radius in Mpc/h for rvir mode (default: 0.5)
+    r_max : float, optional
+        Maximum smoothing radius in Mpc/h for rvir mode (default: 6.0)
+    dr : float, optional
+        Step size for smoothing radius grid in Mpc/h (default: 0.25)
+    rvir_factor : float, optional
+        Smoothing scale multiplier: R_h = rvir_factor * r_vir[h] (default: 2.25)
     threads : int, optional
         Number of threads for FFT operations (default: 32)
-        
+
     Returns
     -------
     dict
         Dictionary with environmental properties as described in compute_environmental_properties
     """
     print("Loading data...")
-    
+
     # Load halo catalogue
     if isinstance(halo_catalogue, str):
         df_halo = pd.read_parquet(halo_catalogue)
     else:
         df_halo = halo_catalogue
-    
+
     # Extract halo positions and masses
     halo_positions = np.column_stack([
         df_halo[position_columns[0]].values,
         df_halo[position_columns[1]].values,
         df_halo[position_columns[2]].values
     ])
-    
+
     halo_masses = df_halo[mass_column].values if mass_column in df_halo.columns else None
-    
+    halo_rvir = df_halo[rvir_column].values if rvir_column is not None else None
+
     # Load particle positions
     if isinstance(particle_positions, str):
         df_part = pd.read_parquet(particle_positions)
@@ -540,16 +672,19 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
         gc.collect()
     else:
         particle_pos = particle_positions
-    
+
     # Initialize calculator
-    calc = AssemblyBiasEnvironment(Nmesh=Nmesh, Lbox=Lbox, 
-                                 smoothing_radius=smoothing_radius, threads=threads)
-    
+    calc = AssemblyBiasEnvironment(Nmesh=Nmesh, Lbox=Lbox,
+                                   smoothing_radius=smoothing_radius, threads=threads)
+
     # Compute environmental properties
     results = calc.compute_environmental_properties(
-        particle_pos, halo_positions, halo_masses, compute_shear=compute_shear
+        particle_pos, halo_positions, halo_masses,
+        halo_rvir=halo_rvir,
+        compute_shear=compute_shear,
+        r_min=r_min, r_max=r_max, dr=dr, rvir_factor=rvir_factor
     )
-    
+
     print("Assembly bias environmental properties computed successfully!")
     return results
 

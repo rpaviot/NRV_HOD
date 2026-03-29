@@ -13,6 +13,7 @@ Data: Flamingo L1000N1800
   - Particles: particle_catalogue_L1000N1800_downsampled.parquet
 """
 
+import gc
 import time
 import numpy as np
 import pandas as pd
@@ -77,17 +78,35 @@ def main():
     print("Precompute Halo-Center Lensing Cache")
     print("=" * 60)
 
-    # --- Load data ---
+    # --- Load particles directly: only x,y,z, then subsample and free full array ---
+    print("\nLoading particle catalog (x,y,z only)...")
+    df_part = pd.read_parquet(PARTICLE_PATH, columns=['x', 'y', 'z'])
+    n_full = len(df_part)
+    print(f"  {n_full:,} particles loaded")
+
+    positions_part_full = df_part[['x', 'y', 'z']].to_numpy(dtype=np.float64)
+    del df_part
+    gc.collect()
+
+    positions_part_sub = subsample_array(
+        positions_part_full, PARTICLE_FRACTION, PARTICLE_SUBSAMPLE_SEED
+    )
+    # Apply periodic boundary correction (mirrors HaloOccupation's treatment)
+    positions_part_sub = (positions_part_sub + Lbox) % Lbox
+    n_sub = len(positions_part_sub)
+    del positions_part_full
+    gc.collect()
+
+    print(f"\nParticle downsampling:")
+    print(f"  Full:         {n_full:,}")
+    print(f"  Downsampled:  {n_sub:,} ({PARTICLE_FRACTION*100:.0f}%)")
+
+    # --- Load halos via HaloOccupation (no particle data) ---
     print("\nLoading halo catalog...")
     df_halo = pd.read_parquet(HALO_PATH)
     print(f"  {len(df_halo)} halos loaded")
 
-    print("Loading particle catalog...")
-    df_part = pd.read_parquet(PARTICLE_PATH)
-    print(f"  {len(df_part)} particles loaded")
-
-    # --- Initialize HaloOccupation (needed for positions, RHO_M, rsd_axis) ---
-    print("\nInitializing HaloOccupation...")
+    print("Initializing HaloOccupation (halos only)...")
     halo = HaloOccupation(
         cosmology=dict_cosmo,
         zeff=zeff,
@@ -95,42 +114,36 @@ def main():
         column_mapping=column_mapping,
         mass_definition=mass_definition,
         DataFrame=df_halo,
-        DataFrame_part=df_part,
+        DataFrame_part=None,
         assembly_bias=False,
         apply_rsd=False,
         triaxial_NFW=False,
         do_test=False,
     )
 
-    # --- Downsample particles ---
-    positions_part_full = np.array(halo.positions_part)
-    n_full = len(positions_part_full)
-
-    positions_part_sub = subsample_array(
-        positions_part_full, PARTICLE_FRACTION, PARTICLE_SUBSAMPLE_SEED
-    )
-    n_sub = len(positions_part_sub)
-
-    print(f"\nParticle downsampling:")
-    print(f"  Full:         {n_full:,}")
-    print(f"  Downsampled:  {n_sub:,} ({PARTICLE_FRACTION*100:.0f}%)")
-
-    # --- Precompute ---
     halo_positions = np.array(halo.positions)
+    RHO_M = halo.RHO_M
+    rsd_axis = halo.rsd_axis
+    del halo, df_halo
+    gc.collect()
 
+    # --- Precompute (GC disabled to avoid COW on Python object headers in workers) ---
     print(f"\nPrecomputing DeltaSigma at {len(halo_positions)} halo centers...")
     t0 = time.perf_counter()
 
+    gc.disable()
     cache = precompute_halo_center_lensing(
         halo_positions=halo_positions,
         particle_positions=positions_part_sub,
         Lbox=Lbox,
-        rsd_axis=halo.rsd_axis,
-        RHO_M=halo.RHO_M,
+        rsd_axis=rsd_axis,
+        RHO_M=RHO_M,
         rp_bins=rp_bins,
         verbose=True,
         prequery_all=False,
     )
+    gc.enable()
+    gc.collect()
 
     elapsed = time.perf_counter() - t0
     print(f"\nPrecomputation completed in {elapsed:.1f}s ({elapsed/60:.1f} min)")

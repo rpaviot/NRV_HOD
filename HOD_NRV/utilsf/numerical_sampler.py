@@ -10,9 +10,12 @@ All cases fix the galaxy number density via rescale_Ac_to_target_ngal and
 fix M1 = 13.0 by default.
 """
 
+import warnings
 import numpy as np
 from enum import IntEnum
 from typing import Dict, Optional, Tuple, Any
+
+from interpax import Interpolator1D
 
 from .emulator_utils import rescale_Ac_to_target_ngal
 from .emulator_nn_flax import load_emulator, predict_dsigma, predict_wgg
@@ -64,6 +67,11 @@ _ELG_SATELLITE_PARAMS = [
     ("Mcut", 11.0, 13.0),
     ("Mmax", 13.5, 15.5),
 ]
+
+# All recognized HOD parameter names — used by set_priors() for validation.
+_ALL_KNOWN_PARAMS = {
+    p[0] for p in _BASE_PARAMS + _EXTENDED_PARAMS + _CONFORMITY_PARAMS + _ELG_SATELLITE_PARAMS
+} | {"Ac", "As", "M1"}
 
 
 def _get_free_params(fit_case: FitCase, elg_satellite: bool = False):
@@ -196,6 +204,7 @@ class NumericalDeltaSigmaFitter:
         self.n_realizations = n_realizations
         self.galaxy_fraction = galaxy_fraction
         self.M1_fixed = M1_fixed
+        self.fixed_params_dict = {"M1": M1_fixed}
         self.base_seed = base_seed
         self.rp_min = rp_min
         self.rp_max = rp_max
@@ -315,26 +324,11 @@ class NumericalDeltaSigmaFitter:
 
         As_sampled = free_dict.pop("As")
 
-        # Build the non-Ac/As params needed for ngal rescaling
-        if self.elg_satellite:
-            params_no_AcAs = {
-                "Mmin": free_dict["Mmin"],
-                "sig_M": free_dict["sig_M"],
-                "gamma": free_dict["gamma"],
-                "M1": self.M1_fixed,
-                "alpha": free_dict["alpha"],
-                "Mcut": free_dict["Mcut"],
-                "Mmax": free_dict["Mmax"],
-            }
-        else:
-            params_no_AcAs = {
-                "Mmin": free_dict["Mmin"],
-                "sig_M": free_dict["sig_M"],
-                "gamma": free_dict["gamma"],
-                "M1": self.M1_fixed,
-                "alpha": free_dict["alpha"],
-                "kappa": free_dict["kappa"],
-            }
+        # Merge free params with fixed params (fixed take precedence, Ac/As excluded)
+        params_no_AcAs = dict(free_dict)
+        params_no_AcAs.update(
+            {k: v for k, v in self.fixed_params_dict.items() if k not in ("Ac", "As")}
+        )
 
         try:
             Ac, As = self._derive_Ac_As(As_sampled, params_no_AcAs)
@@ -344,41 +338,40 @@ class NumericalDeltaSigmaFitter:
         if Ac <= 0 or As <= 0 or not np.isfinite(Ac) or not np.isfinite(As):
             return None
 
-        # Full parameter dict
-        if self.elg_satellite:
-            full_params = {
-                "Ac": Ac,
-                "As": As,
-                "Mmin": free_dict["Mmin"],
-                "sig_M": free_dict["sig_M"],
-                "gamma": free_dict["gamma"],
-                "M1": self.M1_fixed,
-                "alpha": free_dict["alpha"],
-                "Mcut": free_dict["Mcut"],
-                "Mmax": free_dict["Mmax"],
-                "lambda_NFW": free_dict["lambda_NFW"],
-            }
-        else:
-            full_params = {
-                "Ac": Ac,
-                "As": As,
-                "Mmin": free_dict["Mmin"],
-                "sig_M": free_dict["sig_M"],
-                "gamma": free_dict["gamma"],
-                "M1": self.M1_fixed,
-                "alpha": free_dict["alpha"],
-                "kappa": free_dict["kappa"],
-                "lambda_NFW": free_dict["lambda_NFW"],
-            }
-
-        if self.fit_case >= FitCase.EXTENDED_PROFILE:
-            full_params["f_exp"] = free_dict["f_exp"]
-            full_params["tau"] = free_dict["tau"]
-
-        if self.fit_case >= FitCase.CONFORMITY:
-            full_params["kappa_EE"] = free_dict["kappa_EE"]
+        full_params = {"Ac": Ac, "As": As}
+        full_params.update(params_no_AcAs)
 
         return full_params
+
+    def set_priors(self, priors, fixed_params=()):
+        """Override free-parameter bounds and fixed values after construction.
+
+        Parameters
+        ----------
+        priors : list of (name, low, high)
+            Free parameters. Unrecognized names emit a warning; all others
+            are accepted.
+        fixed_params : list of (name, value)
+            Parameters held constant during sampling. Supersedes M1_fixed.
+        """
+        self.fixed_params_dict = dict(fixed_params)
+        if "M1" not in self.fixed_params_dict:
+            self.fixed_params_dict["M1"] = self.M1_fixed
+        else:
+            self.M1_fixed = self.fixed_params_dict["M1"]
+
+        active = []
+        for name, low, high in priors:
+            if name not in _ALL_KNOWN_PARAMS:
+                warnings.warn(
+                    f"set_priors: '{name}' is not a recognized HOD parameter; ignoring."
+                )
+            else:
+                active.append((name, low, high))
+
+        self.free_params = active
+        self.param_names = [p[0] for p in active]
+        self.n_params = len(active)
 
     def log_likelihood(self, theta: np.ndarray) -> float:
         """Compute log-likelihood for a parameter vector.
@@ -733,6 +726,7 @@ class EmulatorFitter:
     ):
         self.fit_case = FitCase(fit_case)
         self.M1_fixed = M1_fixed
+        self.fixed_params_dict = {"M1": M1_fixed}
         self.rp_min = rp_min
         self.rp_max = rp_max
 
@@ -879,8 +873,7 @@ class EmulatorFitter:
         self.n_bins = len(self.ds_obs)
 
     def _setup_interp(self):
-        """Pre-compute interpolation from emulator rp grid to obs rp grid."""
-        # We will interpolate log(DS_emulator)(log rp_emulator) onto log rp_obs
+        """Pre-compute log rp grids for interpolation from emulator grid to obs grid."""
         self._log_rp_emu = np.log(self.emulator_rp)
         self._log_rp_obs = np.log(self.rp_obs)
 
@@ -929,9 +922,52 @@ class EmulatorFitter:
         self.cov_inv_wgg = np.linalg.inv(self.cov_wgg)
 
     def _setup_interp_wgg(self):
-        """Pre-compute interpolation from wgg emulator rp grid to obs rp grid."""
+        """Pre-compute log rp grids for wgg interpolation from emulator grid to obs grid."""
         self._log_rp_emu_wgg = np.log(self.emulator_rp_wgg)
         self._log_rp_obs_wgg = np.log(self.rp_obs_wgg)
+
+    def set_priors(self, priors, fixed_params=()):
+        """Override free-parameter bounds and fixed values after construction.
+
+        Parameters
+        ----------
+        priors : list of (name, low, high)
+            Free parameters. Names absent from the emulator's parameter list
+            are silently skipped; completely unrecognized names emit a warning.
+        fixed_params : list of (name, value)
+            Parameters held constant during sampling. Supersedes M1_fixed and
+            any previously fixed value.
+        """
+        self.fixed_params_dict = dict(fixed_params)
+        if "M1" not in self.fixed_params_dict:
+            self.fixed_params_dict["M1"] = self.M1_fixed
+        else:
+            self.M1_fixed = self.fixed_params_dict["M1"]
+
+        emulator_params = set(self.emulator_param_order)
+        active = []
+        for name, low, high in priors:
+            if name not in _ALL_KNOWN_PARAMS:
+                warnings.warn(
+                    f"set_priors: '{name}' is not a recognized HOD parameter; ignoring."
+                )
+            elif name not in emulator_params:
+                pass  # valid param, not in this emulator — silently skip
+            else:
+                active.append((name, low, high))
+
+        # Warn if any emulator param is uncovered
+        covered = {p[0] for p in active} | set(self.fixed_params_dict)
+        missing = [p for p in self.emulator_param_order if p not in covered]
+        if missing:
+            warnings.warn(
+                f"set_priors: emulator params {missing} are neither free nor fixed. "
+                "Likelihood evaluation will fail for those params."
+            )
+
+        self.free_params = active
+        self.param_names = [p[0] for p in active]
+        self.n_params = len(active)
 
     def log_likelihood(self, theta) -> float:
         """Compute log-likelihood using the emulator forward pass.
@@ -955,7 +991,7 @@ class EmulatorFitter:
 
         try:
             theta_vec = np.array([
-                self.M1_fixed if p == 'M1' else free_dict[p]
+                self.fixed_params_dict[p] if p in self.fixed_params_dict else free_dict[p]
                 for p in self.emulator_param_order
             ], dtype=np.float32)
             ds_pred = predict_dsigma(self.model, self.norm_stats, theta_vec)
@@ -965,10 +1001,10 @@ class EmulatorFitter:
         if not np.all(np.isfinite(ds_pred)):
             return -1e100
 
-        # Interpolate emulator prediction onto obs rp grid (log-linear)
+        # Interpolate emulator prediction onto obs rp grid (log-cubic)
         log_ds_emu = np.log(ds_pred)
-        log_ds_at_obs = np.interp(
-            self._log_rp_obs, self._log_rp_emu, log_ds_emu
+        log_ds_at_obs = np.array(
+            Interpolator1D(self._log_rp_emu, log_ds_emu, method='cubic')(self._log_rp_obs)
         )
         ds_at_obs = np.exp(log_ds_at_obs)
 
@@ -979,7 +1015,7 @@ class EmulatorFitter:
         if self._fit_wgg:
             try:
                 theta_vec_wgg = np.array([
-                    self.M1_fixed if p == 'M1' else free_dict[p]
+                    self.fixed_params_dict[p] if p in self.fixed_params_dict else free_dict[p]
                     for p in list(self.norm_stats_wgg["param_names"])
                 ], dtype=np.float32)
                 wgg_pred = predict_wgg(self.model_wgg, self.norm_stats_wgg, theta_vec_wgg)
@@ -988,8 +1024,8 @@ class EmulatorFitter:
             if not np.all(np.isfinite(wgg_pred)):
                 return -1e100
             log_wgg_emu = np.log(wgg_pred)
-            log_wgg_at_obs = np.interp(
-                self._log_rp_obs_wgg, self._log_rp_emu_wgg, log_wgg_emu
+            log_wgg_at_obs = np.array(
+                Interpolator1D(self._log_rp_emu_wgg, log_wgg_emu, method='cubic')(self._log_rp_obs_wgg)
             )
             wgg_at_obs = np.exp(log_wgg_at_obs)
             residual_wgg = wgg_at_obs - self.wgg_obs
