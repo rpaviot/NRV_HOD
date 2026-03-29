@@ -16,7 +16,7 @@ import pandas as pd
 import numba
 from numba import njit, prange
 from pysco.mesh import TSC, invTSC
-from pysco.utils import periodic_wrap, argsort_par
+from pysco.utils import periodic_wrap, argsort_par,injection_with_indices
 from pysco.fourier import fft_3D_real, ifft_3D_real
 from pysco import morton
 import gc
@@ -91,7 +91,7 @@ def reorder_positions(positions: np.ndarray) -> np.ndarray:
         arg = np.argsort(index)
     
     index = 0  # Free memory
-    positions = morton.injection_with_indices(arg, positions)
+    positions = injection_with_indices(arg, positions)
     return positions
 
 
