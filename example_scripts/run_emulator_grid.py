@@ -202,16 +202,25 @@ def parse_args():
     parser.add_argument(
         "--ab_fI",
         type=str,
-        default="fI",
-        help="Column name in halo catalogue for intrinsic AB property (default: 'fI'). "
+        default=None,
+        help="Column name in halo catalogue for intrinsic AB property. "
+             "Omit if you only want external AB (B_cent, B_sat). "
              "Only used when --assembly_bias is set.",
     )
     parser.add_argument(
         "--ab_fE",
         type=str,
-        default="fE",
-        help="Column name in halo catalogue for external AB property (default: 'fE'). "
+        default=None,
+        help="Column name in halo catalogue for external AB property (e.g. shear). "
              "Only used when --assembly_bias is set.",
+    )
+    parser.add_argument(
+        "--fixed_params",
+        nargs="*",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Additional fixed parameters (merged into FIXED_PARAMS). "
+             "Example: --fixed_params Mmax=15 A_cent=0 A_sat=0",
     )
     parser.add_argument(
         "--elg_satellite",
@@ -234,8 +243,6 @@ LBOX = 681.0          # Mpc/h
 ZEFF = 1.0
 MASS_DEFINITION = "MassDef200m"
 TARGET_NGAL = 2e-4    # (Mpc/h)^-3
-M1_FIXED = 13.0       # log10 M_sun/h
-
 COLUMN_MAPPING = {
     "x": "x", "y": "y", "z": "z",
     "vx": "vx", "vy": "vy", "vz": "vz",
@@ -289,7 +296,7 @@ _ELG_SATELLITE_RANGES = {
     "Mmax": (13.5, 15.5),
 }
 
-FIXED_PARAMS = {"M1": M1_FIXED}
+FIXED_PARAMS = {}
 
 
 def get_param_ranges(fit_case_str: str, elg_satellite: bool = False, assembly_bias: bool = False) -> dict:
@@ -332,11 +339,23 @@ def main():
         )
     subhalo_path = args.subhalo_path if args.satellite_placement == "subhalo" else None
 
+    # --- Extra fixed params (e.g. --fixed_params Mmax=15 A_cent=0) ----------
+    fixed_params = dict(FIXED_PARAMS)
+    for kv in args.fixed_params:
+        k, v = kv.split("=", 1)
+        fixed_params[k.strip()] = float(v.strip())
+
     # --- Column mapping (with optional AB columns) -------------------------
     column_mapping = dict(COLUMN_MAPPING)
     if args.assembly_bias:
-        column_mapping["fI"] = args.ab_fI
-        column_mapping["fE"] = args.ab_fE
+        if args.ab_fI is None and args.ab_fE is None:
+            raise ValueError(
+                "--assembly_bias requires at least one of --ab_fI or --ab_fE"
+            )
+        if args.ab_fI is not None:
+            column_mapping["fI"] = args.ab_fI
+        if args.ab_fE is not None:
+            column_mapping["fE"] = args.ab_fE
 
     # -----------------------------------------------------------------------
     # Phase 1: generate grid and exit
@@ -374,7 +393,7 @@ def main():
             param_ranges=param_ranges,
             n_samples=args.n_samples,
             target_ngal=TARGET_NGAL,
-            fixed_params=FIXED_PARAMS,
+            fixed_params=fixed_params,
             random_seed=args.base_seed,
             conformity=use_conformity,
             elg_satellite=use_elg_satellite,
@@ -466,7 +485,7 @@ def main():
             param_ranges=param_ranges,
             n_samples=args.n_samples,
             target_ngal=TARGET_NGAL,
-            fixed_params=FIXED_PARAMS,
+            fixed_params=fixed_params,
             random_seed=args.base_seed,
             conformity=use_conformity_tmp,
             elg_satellite=use_elg_satellite_tmp,
