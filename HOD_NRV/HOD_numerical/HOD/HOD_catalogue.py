@@ -260,7 +260,8 @@ class HaloOccupation:
             test_satellites.run_all_tests()
 
     def set_halo_model(self, hod_type: str, conformity: bool = False,
-                       elg_satellite: bool = False):
+                       elg_satellite: bool = False, ab_method: str = "direct"
+):
         """
         Configure the Halo Occupation Distribution model.
 
@@ -302,7 +303,9 @@ class HaloOccupation:
             hod_type, self.logM_bins, self.mass_function,
             assembly_bias=self.assembly_bias, conformity=conformity,
             elg_satellite=elg_satellite,
-            fI=self.fI, fE=self.fE
+            fI=self.fI, fE=self.fE,
+            ab_method=ab_method,
+            logM_halos=self.logM if self.assembly_bias else None
         )
 
     def populate_haloes(self, dict_params: Dict[str, float],

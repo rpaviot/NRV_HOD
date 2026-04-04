@@ -174,13 +174,44 @@ def parse_args():
         help="Galaxy population backend: 'numba' (default, faster, float64) or 'jax'",
     )
     parser.add_argument(
+        "--mass_function",
+        type=str,
+        default="Despali16",
+        help="Halo mass function identifier passed to HaloOccupation (default: Despali16)",
+    )
+    parser.add_argument(
+        "--satellite_placement",
+        choices=["nfw", "subhalo"],
+        default="nfw",
+        help="Satellite placement method: 'nfw' (default) or 'subhalo' (requires --subhalo_path)",
+    )
+    parser.add_argument(
         "--subhalo_path",
         type=str,
         default=None,
         help="Path to subhalo_catalogue.npz (from precompute_subhalo_catalogue.py). "
-             "When provided, satellites are sampled from real N-body subhalos instead "
-             "of NFW profiles. Requires the halo_path parquet to be the matching "
-             "host_catalogue.parquet from the same preprocessing run.",
+             "Required when --satellite_placement=subhalo.",
+    )
+    parser.add_argument(
+        "--assembly_bias",
+        action="store_true",
+        help="Enable assembly bias. The halo catalogue must contain pre-computed AB "
+             "environment columns (see compute_assembly_bias_properties). Use --ab_fI "
+             "and --ab_fE to specify those column names.",
+    )
+    parser.add_argument(
+        "--ab_fI",
+        type=str,
+        default="fI",
+        help="Column name in halo catalogue for intrinsic AB property (default: 'fI'). "
+             "Only used when --assembly_bias is set.",
+    )
+    parser.add_argument(
+        "--ab_fE",
+        type=str,
+        default="fE",
+        help="Column name in halo catalogue for external AB property (default: 'fE'). "
+             "Only used when --assembly_bias is set.",
     )
     parser.add_argument(
         "--elg_satellite",
@@ -221,6 +252,7 @@ COSMO_PARAMS = {
 }
 
 RP_BINS = np.geomspace(0.1, 50.0, 16)  # 15 bins
+MASS_FUNCTION = "Despali16"
 
 # ---------------------------------------------------------------------------
 # Parameter ranges per fit case
@@ -245,6 +277,13 @@ _CONFORMITY_RANGES = {
     "kappa_EE": (0.5, 2.0),
 }
 
+_AB_RANGES = {
+    "A_cent": (-0.5, 0.5),
+    "B_cent": (-0.5, 0.5),
+    "A_sat":  (-0.5, 0.5),
+    "B_sat":  (-0.5, 0.5),
+}
+
 _ELG_SATELLITE_RANGES = {
     "Mcut": (11.0, 13.0),
     "Mmax": (13.5, 15.5),
@@ -253,7 +292,7 @@ _ELG_SATELLITE_RANGES = {
 FIXED_PARAMS = {"M1": M1_FIXED}
 
 
-def get_param_ranges(fit_case_str: str, elg_satellite: bool = False) -> dict:
+def get_param_ranges(fit_case_str: str, elg_satellite: bool = False, assembly_bias: bool = False) -> dict:
     if elg_satellite:
         base = {k: v for k, v in _BASE_RANGES.items() if k != "kappa"}
         base.update(_ELG_SATELLITE_RANGES)
@@ -263,6 +302,8 @@ def get_param_ranges(fit_case_str: str, elg_satellite: bool = False) -> dict:
         base.update(_EXTENDED_RANGES)
     if fit_case_str == "CONFORMITY":
         base.update(_CONFORMITY_RANGES)
+    if assembly_bias:
+        base.update(_AB_RANGES)
     return base
 
 
@@ -284,6 +325,19 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # --- Satellite placement validation ------------------------------------
+    if args.satellite_placement == "subhalo" and args.subhalo_path is None:
+        raise ValueError(
+            "--subhalo_path is required when --satellite_placement=subhalo"
+        )
+    subhalo_path = args.subhalo_path if args.satellite_placement == "subhalo" else None
+
+    # --- Column mapping (with optional AB columns) -------------------------
+    column_mapping = dict(COLUMN_MAPPING)
+    if args.assembly_bias:
+        column_mapping["fI"] = args.ab_fI
+        column_mapping["fE"] = args.ab_fE
+
     # -----------------------------------------------------------------------
     # Phase 1: generate grid and exit
     # -----------------------------------------------------------------------
@@ -293,21 +347,24 @@ def main():
             cosmology=COSMO_PARAMS,
             zeff=ZEFF,
             Lbox=LBOX,
-            column_mapping=COLUMN_MAPPING,
+            column_mapping=column_mapping,
             mass_definition=MASS_DEFINITION,
             halo_path=HALO_PATH,
             DataFrame_part=None,   # particles not needed for grid generation
             apply_rsd=False,
             do_test=False,
+            mass_function=args.mass_function,
+            assembly_bias=args.assembly_bias,
             population_backend=args.population_backend,
-            subhalo_path=args.subhalo_path,
+            subhalo_path=subhalo_path,
         )
         hod_type = "ELG_mHMQ"
         use_conformity = (args.fit_case == "CONFORMITY")
         use_elg_satellite = args.elg_satellite
         halo_gen.set_halo_model(hod_type, conformity=use_conformity, elg_satellite=use_elg_satellite)
 
-        param_ranges = get_param_ranges(args.fit_case, elg_satellite=use_elg_satellite)
+        param_ranges = get_param_ranges(args.fit_case, elg_satellite=use_elg_satellite,
+                                        assembly_bias=args.assembly_bias)
         include_nfw_extensions = (args.fit_case in ("EXTENDED_PROFILE", "CONFORMITY"))
         print(f"[Phase 1] Generating {args.n_samples} LHS grid points "
               f"for fit_case={args.fit_case}")
@@ -382,21 +439,24 @@ def main():
             cosmology=COSMO_PARAMS,
             zeff=ZEFF,
             Lbox=LBOX,
-            column_mapping=COLUMN_MAPPING,
+            column_mapping=column_mapping,
             mass_definition=MASS_DEFINITION,
             halo_path=HALO_PATH,
             DataFrame_part=None,
             apply_rsd=False,
             do_test=False,
+            mass_function=args.mass_function,
+            assembly_bias=args.assembly_bias,
             population_backend=args.population_backend,
-            subhalo_path=args.subhalo_path,
+            subhalo_path=subhalo_path,
         )
         hod_type_tmp = "ELG_mHMQ"
         use_conformity_tmp = (args.fit_case == "CONFORMITY")
         use_elg_satellite_tmp = args.elg_satellite
         halo_grid.set_halo_model(hod_type_tmp, conformity=use_conformity_tmp, elg_satellite=use_elg_satellite_tmp)
 
-        param_ranges = get_param_ranges(args.fit_case, elg_satellite=use_elg_satellite_tmp)
+        param_ranges = get_param_ranges(args.fit_case, elg_satellite=use_elg_satellite_tmp,
+                                        assembly_bias=args.assembly_bias)
         include_nfw_extensions_tmp = (args.fit_case in ("EXTENDED_PROFILE", "CONFORMITY"))
         print(f"[rank {rank}] Generating {args.n_samples} LHS grid points "
               f"for fit_case={args.fit_case}")
@@ -432,19 +492,21 @@ def main():
         cosmology=COSMO_PARAMS,
         zeff=ZEFF,
         Lbox=LBOX,
-        column_mapping=COLUMN_MAPPING,
+        column_mapping=column_mapping,
         mass_definition=MASS_DEFINITION,
         halo_path=HALO_PATH,
         DataFrame_part=pd.read_parquet(PARTICLE_PATH),
         apply_rsd=True,
         do_test=False,
+        mass_function=args.mass_function,
+        assembly_bias=args.assembly_bias,
         particle_fraction=args.particle_fraction,
         particle_subsample_seed=args.particle_seed,
         population_backend=args.population_backend,
-        subhalo_path=args.subhalo_path,
+        subhalo_path=subhalo_path,
     )
-    if args.subhalo_path is not None:
-        print(f"[job {rank}/{size}] Subhalo satellite mode: {args.subhalo_path}")
+    if subhalo_path is not None:
+        print(f"[job {rank}/{size}] Subhalo satellite mode: {subhalo_path}")
     print(f"[job {rank}/{size}] Population backend: {args.population_backend}")
     print(f"[job {rank}/{size}] Particle fraction: {args.particle_fraction} "
           f"(seed={args.particle_seed})")

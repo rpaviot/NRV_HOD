@@ -28,6 +28,11 @@ from typing import Dict, Optional, Tuple, List, Set
 from scipy.stats import qmc
 import warnings
 
+from HOD_NRV.HOD_numerical.HOD_models import (
+    compute_ngal_with_fiducial_Ac,
+    rescale_Ac_to_target_ngal,
+)
+
 
 # Default parameter ranges for extensions
 DEFAULT_PARAM_RANGES = {
@@ -49,133 +54,6 @@ DEFAULT_PARAM_RANGES = {
     'lambda_NFW': (0.5, 2.0),   # NFW rescaling factor
 }
 
-
-def compute_ngal_with_fiducial_Ac(
-    hod_model,
-    params: Dict[str, float],
-    Ac_fiducial: float = 1.0
-) -> float:
-    """
-    Compute galaxy number density with a fiducial Ac value.
-
-    This function calculates the total galaxy number density (centrals + satellites)
-    for a given set of HOD parameters with a specified fiducial central amplitude.
-
-    Parameters
-    ----------
-    hod_model : HOD_models.Occupation
-        HOD model instance with cosmology and mass function set
-    params : dict
-        HOD parameters (excluding Ac). Required keys depend on the model:
-        - All models: 'Mmin', 'sig_M', 'As', 'M1', 'alpha', 'kappa'
-        - ELG_SFR also needs: 'gamma'
-    Ac_fiducial : float, default=1.0
-        Fiducial value for the central amplitude parameter
-
-    Returns
-    -------
-    ngal : float
-        Galaxy number density [(Mpc/h)^-3] computed with the fiducial Ac
-
-    Examples
-    --------
-    >>> from HOD_NRV.HOD_numerical.HOD import HaloOccupation
-    >>> from HOD_NRV.utilsf.emulator_utils import compute_ngal_with_fiducial_Ac
-    >>>
-    >>> halo = HaloOccupation(cosmology=cosmo, zeff=1.0, Lbox=1000, ...)
-    >>> halo.set_halo_model("ELG_GHOD")
-    >>>
-    >>> params = {'Mmin': 12.0, 'sig_M': 0.4, 'As': 0.5,
-    ...           'M1': 13.5, 'alpha': 1.0, 'kappa': 1.0}
-    >>> ngal = compute_ngal_with_fiducial_Ac(halo.HOD, params, Ac_fiducial=0.5)
-    >>> print(f"Number density: {ngal:.2e} (Mpc/h)^-3")
-
-    Notes
-    -----
-    The number density is computed by integrating the HOD over the halo mass function:
-
-    .. math::
-        n_{gal} = \\int [N_{cen}(M) + N_{sat}(M)] \\frac{dn}{dM} dM
-
-    where the central occupation includes the fiducial Ac parameter.
-    """
-    # Create a copy of params and add Ac
-    params_with_Ac = params.copy()
-    params_with_Ac['Ac'] = Ac_fiducial
-
-    # Compute number density using the HOD model's method
-    ngal = hod_model.compute_ngal(params_with_Ac)
-
-    return ngal
-
-
-def rescale_Ac_to_target_ngal(
-    hod_model,
-    params: Dict[str, float],
-    target_ngal: float,
-    Ac_fiducial: float = 1.0
-) -> Tuple[float, float]:
-    """
-    Rescale Ac AND As to achieve a target galaxy number density.
-
-    This function computes the rescaling factor needed to match the target
-    number density while preserving the ratio Ac/As (which governs clustering).
-
-    Parameters
-    ----------
-    hod_model : HOD_models.Occupation
-        HOD model instance with cosmology and mass function set
-    params : dict
-        HOD parameters including 'As' but excluding 'Ac'
-    target_ngal : float
-        Target galaxy number density [(Mpc/h)^-3]
-    Ac_fiducial : float, default=1.0
-        Initial fiducial value for Ac
-
-    Returns
-    -------
-    Ac_rescaled : float
-        Rescaled central amplitude
-    As_rescaled : float
-        Rescaled satellite amplitude (preserving Ac/As ratio)
-
-    Raises
-    ------
-    ValueError
-        If ngal cannot be computed (e.g., invalid parameters)
-
-    Examples
-    --------
-    >>> Ac_new, As_new = rescale_Ac_to_target_ngal(
-    ...     halo.HOD, params, target_ngal=1e-3, Ac_fiducial=1.0
-    ... )
-    >>> # Both Ac and As are rescaled by the same factor
-    >>> print(f"Rescaled Ac: {Ac_new:.4f}, As: {As_new:.4f}")
-
-    Notes
-    -----
-    The rescaling formula is:
-
-    .. math::
-        ratio = \\frac{n_{gal}^{target}}{n_{gal}^{fiducial}}
-
-        A_c^{new} = A_c^{fid} \\times ratio
-
-        A_s^{new} = A_s^{old} \\times ratio
-
-    This preserves the ratio Ac/As which determines the clustering signal.
-    """
-    # Compute ngal with fiducial Ac
-    ngal_fiducial = compute_ngal_with_fiducial_Ac(hod_model, params, Ac_fiducial)
-
-    # Compute rescaling factor to maintain Ac/As ratio
-    rescale_factor = target_ngal / ngal_fiducial
-
-    # Rescale both Ac and As by the same factor to preserve Ac/As ratio
-    Ac_rescaled = Ac_fiducial * rescale_factor
-    As_rescaled = params['As'] * rescale_factor
-
-    return Ac_rescaled, As_rescaled
 
 def create_latin_hypercube(
     param_ranges: Dict[str, Tuple[float, float]],
@@ -362,7 +240,6 @@ def generate_hod_parameter_grid(
     param_ranges: Dict[str, Tuple[float, float]],
     n_samples: int,
     target_ngal: float,
-    Ac_fiducial=None,
     fixed_params: Optional[Dict[str, float]] = None,
     random_seed: Optional[int] = None,
     conformity: bool = False,
@@ -396,9 +273,6 @@ def generate_hod_parameter_grid(
         Number of parameter combinations to generate
     target_ngal : float
         Target galaxy number density [(Mpc/h)^-3]
-    Ac_fiducial : deprecated, ignored
-        No longer used. Ac is a derived parameter and does not appear in the
-        output grid. Passing this argument raises a DeprecationWarning.
     fixed_params : dict, optional
         Dictionary of parameters to hold fixed (not sampled in LHS).
         Example: {'M1': 13.5, 'kappa': 1.0} to fix M1 and kappa.
@@ -463,7 +337,6 @@ def generate_hod_parameter_grid(
     ...     param_ranges=param_ranges,
     ...     n_samples=1000,
     ...     target_ngal=1e-3,
-    ...     Ac_fiducial=0.5,
     ...     fixed_params=fixed_params,
     ...     random_seed=42,
     ...     save_path='hod_param_grid.parquet'
@@ -496,14 +369,6 @@ def generate_hod_parameter_grid(
     create_latin_hypercube : Generate LHS samples
     rescale_Ac_to_target_ngal : Rescale Ac for target ngal
     """
-    if Ac_fiducial is not None:
-        warnings.warn(
-            "Ac_fiducial is deprecated and ignored. Ac is now a fully derived "
-            "parameter that never appears in the output grid.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-
     if verbose:
         print(f"Generating {n_samples} HOD parameter combinations for {hod_type}")
         print(f"Target number density: {target_ngal:.2e} (Mpc/h)^-3")
@@ -609,6 +474,7 @@ def run_hod_grid(
     base_seed: int = 42,
     mpi_rank: int = 0,
     target_ngal: Optional[float] = None,
+    Ac_fiducial: float = 0.01,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Evaluate DeltaSigma on a pre-generated HOD parameter grid.
@@ -657,6 +523,9 @@ def run_hod_grid(
         the HOD forward model call; they are NOT written back into
         ``params_array``. The emulator trains on the original free params
         (including ``As`` as LHS-sampled). ``param_grid`` is never modified.
+    Ac_fiducial : float, default=0.01
+        Fiducial Ac passed to ``rescale_Ac_to_target_ngal`` when ``target_ngal``
+        is set. Only used when ``target_ngal`` is not None.
 
     Returns
     -------
@@ -720,7 +589,7 @@ def run_hod_grid(
         # params_array. The emulator trains on the original free params (row_params).
         if target_ngal is not None:
             Ac_r, As_r = rescale_Ac_to_target_ngal(
-                halo.HOD, row_params, target_ngal, Ac_fiducial=0.01
+                halo.HOD, row_params, target_ngal, Ac_fiducial=Ac_fiducial
             )
             row_params_for_hod = {**row_params, 'Ac': Ac_r, 'As': As_r}
         else:
