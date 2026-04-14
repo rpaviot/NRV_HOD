@@ -71,7 +71,7 @@ _ELG_SATELLITE_PARAMS = [
 # All recognized HOD parameter names — used by set_priors() for validation.
 _ALL_KNOWN_PARAMS = {
     p[0] for p in _BASE_PARAMS + _EXTENDED_PARAMS + _CONFORMITY_PARAMS + _ELG_SATELLITE_PARAMS
-} | {"Ac", "As", "M1"}
+} | {"Ac", "As", "M1", "A_cent", "B_cent", "A_sat", "B_sat"}
 
 
 def _get_free_params(fit_case: FitCase, elg_satellite: bool = False):
@@ -85,6 +85,27 @@ def _get_free_params(fit_case: FitCase, elg_satellite: bool = False):
     if fit_case >= FitCase.CONFORMITY:
         params.extend(_CONFORMITY_PARAMS)
     return params
+
+
+def _parse_param_config(param_config: dict):
+    """Split a {name: (low, high) | scalar} dict into (priors, fixed_params).
+
+    Values that are 2-element tuples/lists become free parameters;
+    scalar values become fixed parameters.
+
+    Returns
+    -------
+    priors : list of (name, low, high)
+    fixed_params : list of (name, value)
+    """
+    priors = []
+    fixed_params = []
+    for name, value in param_config.items():
+        if isinstance(value, (tuple, list)) and len(value) == 2:
+            priors.append((name, float(value[0]), float(value[1])))
+        else:
+            fixed_params.append((name, float(value)))
+    return priors, fixed_params
 
 
 class NumericalDeltaSigmaFitter:
@@ -187,6 +208,8 @@ class NumericalDeltaSigmaFitter:
         # --- Scale cuts ---
         rp_min: Optional[float] = None,
         rp_max: Optional[float] = None,
+        # --- Custom priors: {name: (low, high)} to sample, {name: scalar} to fix ---
+        param_config: Optional[dict] = None,
     ):
         self.halo = HaloOccupation(
             cosmology=cosmology, zeff=zeff, Lbox=Lbox,
@@ -224,6 +247,10 @@ class NumericalDeltaSigmaFitter:
         # Override rp_bins if provided
         if rp_bins is not None:
             self.rp_bins = np.asarray(rp_bins)
+
+        if param_config is not None:
+            priors, fixed = _parse_param_config(param_config)
+            self.set_priors(priors, fixed)
 
     def _load_data(self, data_path: str):
         """Load observed DeltaSigma data from .npz file.
@@ -723,6 +750,8 @@ class EmulatorFitter:
         rp_obs_wgg: Optional[np.ndarray] = None,
         rp_min_wgg: Optional[float] = None,
         rp_max_wgg: Optional[float] = None,
+        # --- Custom priors: {name: (low, high)} to sample, {name: scalar} to fix ---
+        param_config: Optional[dict] = None,
     ):
         self.fit_case = FitCase(fit_case)
         self.M1_fixed = M1_fixed
@@ -804,6 +833,10 @@ class EmulatorFitter:
 
             self._setup_interp_wgg()
             self._fit_wgg = True
+
+        if param_config is not None:
+            priors, fixed = _parse_param_config(param_config)
+            self.set_priors(priors, fixed)
 
     def _load_data(self, data_path: str):
         """Load observed DeltaSigma data from .npz file.

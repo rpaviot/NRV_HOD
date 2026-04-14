@@ -589,7 +589,7 @@ def run_hod_grid(
         # params_array. The emulator trains on the original free params (row_params).
         if target_ngal is not None:
             Ac_r, As_r = rescale_Ac_to_target_ngal(
-                halo.HOD, row_params, target_ngal, Ac_fiducial=Ac_fiducial
+                halo, row_params, target_ngal, Ac_fiducial=Ac_fiducial
             )
             row_params_for_hod = {**row_params, 'Ac': Ac_r, 'As': As_r}
         else:
