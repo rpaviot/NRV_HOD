@@ -84,25 +84,49 @@ def _get_free_params(fit_case: FitCase, elg_satellite: bool = False):
         params.extend(_EXTENDED_PARAMS)
     if fit_case >= FitCase.CONFORMITY:
         params.extend(_CONFORMITY_PARAMS)
-    return params
+    return [(n, lo, hi, "uniform") for (n, lo, hi) in params]
 
 
 def _parse_param_config(param_config: dict):
-    """Split a {name: (low, high) | scalar} dict into (priors, fixed_params).
+    """Split a {name: spec | scalar} dict into (priors, fixed_params).
 
-    Values that are 2-element tuples/lists become free parameters;
-    scalar values become fixed parameters.
+    Value formats
+    -------------
+    - ``(low, high)`` or ``[low, high]``         → uniform prior (free)
+    - ``(mean, std, 'gaussian')`` (any order)    → Gaussian prior (free)
+    - scalar                                     → fixed parameter
 
     Returns
     -------
-    priors : list of (name, low, high)
+    priors : list of (name, a, b, kind)
+        kind is 'uniform' (a=low, b=high) or 'gaussian' (a=mean, b=std).
     fixed_params : list of (name, value)
     """
     priors = []
     fixed_params = []
     for name, value in param_config.items():
-        if isinstance(value, (tuple, list)) and len(value) == 2:
-            priors.append((name, float(value[0]), float(value[1])))
+        if isinstance(value, (tuple, list)):
+            strs = [v for v in value if isinstance(v, str)]
+            nums = [v for v in value if not isinstance(v, str)]
+            if strs:
+                kind = strs[0].lower()
+                if kind != "gaussian":
+                    raise ValueError(
+                        f"Unknown prior kind '{strs[0]}' for '{name}'. "
+                        "Only 'gaussian' is supported."
+                    )
+                if len(nums) != 2:
+                    raise ValueError(
+                        f"Gaussian prior for '{name}' requires exactly "
+                        "(mean, std, 'gaussian')."
+                    )
+                priors.append((name, float(nums[0]), float(nums[1]), "gaussian"))
+            elif len(value) == 2:
+                priors.append((name, float(value[0]), float(value[1]), "uniform"))
+            else:
+                raise ValueError(
+                    f"Invalid prior spec for '{name}': {value!r}"
+                )
         else:
             fixed_params.append((name, float(value)))
     return priors, fixed_params
@@ -388,13 +412,18 @@ class NumericalDeltaSigmaFitter:
             self.M1_fixed = self.fixed_params_dict["M1"]
 
         active = []
-        for name, low, high in priors:
+        for entry in priors:
+            if len(entry) == 3:
+                name, a, b = entry
+                kind = "uniform"
+            else:
+                name, a, b, kind = entry
             if name not in _ALL_KNOWN_PARAMS:
                 warnings.warn(
                     f"set_priors: '{name}' is not a recognized HOD parameter; ignoring."
                 )
             else:
-                active.append((name, low, high))
+                active.append((name, float(a), float(b), kind))
 
         self.free_params = active
         self.param_names = [p[0] for p in active]
@@ -483,9 +512,13 @@ class NumericalDeltaSigmaFitter:
         import os
         import HOD_NRV.utilsf.numerical_sampler as _self_mod
 
+        from scipy.stats import norm as _norm
         prior = nautilus.Prior()
-        for name, low, high in self.free_params:
-            prior.add_parameter(name, dist=(low, high))
+        for name, a, b, kind in self.free_params:
+            if kind == "gaussian":
+                prior.add_parameter(name, dist=_norm(loc=a, scale=b))
+            else:
+                prior.add_parameter(name, dist=(a, b))
 
         # Expose self to forked workers via module-level global (COW, no pickling).
         _self_mod._fitter_instance = self
@@ -546,7 +579,7 @@ class NumericalDeltaSigmaFitter:
 
         # Add free parameter values for reference
         result = {}
-        for i, (name, _, _) in enumerate(self.free_params):
+        for i, name in enumerate(self.param_names):
             result[name] = theta_best[i]
         result.update(full_params)
         return result
@@ -569,7 +602,7 @@ class NumericalDeltaSigmaFitter:
             For each parameter: mean, std, median, q16, q84.
         """
         summary = {}
-        for i, (name, _, _) in enumerate(self.free_params):
+        for i, name in enumerate(self.param_names):
             vals = points[:, i]
             w = weights
 
@@ -979,7 +1012,12 @@ class EmulatorFitter:
 
         emulator_params = set(self.emulator_param_order)
         active = []
-        for name, low, high in priors:
+        for entry in priors:
+            if len(entry) == 3:
+                name, a, b = entry
+                kind = "uniform"
+            else:
+                name, a, b, kind = entry
             if name not in _ALL_KNOWN_PARAMS:
                 warnings.warn(
                     f"set_priors: '{name}' is not a recognized HOD parameter; ignoring."
@@ -987,7 +1025,7 @@ class EmulatorFitter:
             elif name not in emulator_params:
                 pass  # valid param, not in this emulator — silently skip
             else:
-                active.append((name, low, high))
+                active.append((name, float(a), float(b), kind))
 
         # Warn if any emulator param is uncovered
         covered = {p[0] for p in active} | set(self.fixed_params_dict)
@@ -1103,9 +1141,13 @@ class EmulatorFitter:
         import nautilus
         import HOD_NRV.utilsf.numerical_sampler as _self_mod
 
+        from scipy.stats import norm as _norm
         prior = nautilus.Prior()
-        for name, low, high in self.free_params:
-            prior.add_parameter(name, dist=(low, high))
+        for name, a, b, kind in self.free_params:
+            if kind == "gaussian":
+                prior.add_parameter(name, dist=_norm(loc=a, scale=b))
+            else:
+                prior.add_parameter(name, dist=(a, b))
 
         _self_mod._emulator_fitter_instance = self
 
@@ -1170,7 +1212,7 @@ class EmulatorFitter:
             For each parameter: mean, std, median, q16, q84.
         """
         summary = {}
-        for i, (name, _, _) in enumerate(self.free_params):
+        for i, name in enumerate(self.param_names):
             vals = points[:, i]
             w = weights
 

@@ -223,6 +223,22 @@ def parse_args():
              "Example: --fixed_params Mmax=15 A_cent=0 A_sat=0",
     )
     parser.add_argument(
+        "--max_fsat",
+        type=float,
+        default=None,
+        help="If set, filter LHS rows whose analytical f_sat exceeds this value "
+             "(default: no filtering). Avoids spending grid budget on satellite-"
+             "dominated forward-model evaluations that are slow under "
+             "method='optimized'.",
+    )
+    parser.add_argument(
+        "--fsat_oversample_cap",
+        type=int,
+        default=8,
+        help="Hard cap on the LHS oversample factor used by the f_sat filter "
+             "before it gives up (default: 8 = up to 8x n_samples drawn).",
+    )
+    parser.add_argument(
         "--elg_satellite",
         type=lambda x: bool(int(x)),
         default=0,
@@ -236,7 +252,7 @@ def parse_args():
 # Flamingo data paths and cosmology (edit for your cluster)
 # ---------------------------------------------------------------------------
 
-HALO_PATH = "/Users/ler13nrv/Documents/flamingo_data/parquet_halo_catalogue_L1000N1800.parquet"
+HALO_PATH = "/Users/ler13nrv/Documents/flamingo_data/parquet_halo_catalogue_L1000N1800_AB.parquet"
 PARTICLE_PATH = "/Users/ler13nrv/Documents/flamingo_data/particle_catalogue_L1000N1800_downsampled.parquet"
 
 LBOX = 681.0          # Mpc/h
@@ -399,6 +415,8 @@ def main():
             elg_satellite=use_elg_satellite,
             include_nfw_extensions=include_nfw_extensions,
             verbose=True,
+            max_fsat=args.max_fsat,
+            fsat_oversample_cap=args.fsat_oversample_cap,
         )
         grid_meta_path = os.path.join(args.output_dir, "param_grid_full.parquet")
         param_grid.to_parquet(grid_meta_path, index=False)
@@ -491,6 +509,8 @@ def main():
             elg_satellite=use_elg_satellite_tmp,
             include_nfw_extensions=include_nfw_extensions_tmp,
             verbose=True,
+            max_fsat=args.max_fsat,
+            fsat_oversample_cap=args.fsat_oversample_cap,
         )
         grid_meta_path = os.path.join(args.output_dir, "param_grid_full.parquet")
         param_grid.to_parquet(grid_meta_path, index=False)

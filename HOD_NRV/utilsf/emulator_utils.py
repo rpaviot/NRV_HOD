@@ -247,7 +247,10 @@ def generate_hod_parameter_grid(
     include_nfw_extensions: bool = False,
     auto_add_defaults: bool = True,
     save_path: Optional[str] = None,
-    verbose: bool = True
+    verbose: bool = True,
+    max_fsat: Optional[float] = None,
+    Ac_fiducial: float = 0.01,
+    fsat_oversample_cap: int = 8,
 ) -> pd.DataFrame:
     """
     Generate HOD parameter grid with fixed number density using Latin Hypercube Sampling.
@@ -430,17 +433,81 @@ def generate_hod_parameter_grid(
     # Generate LHS samples for free parameters (those in param_ranges)
     if verbose:
         print("\nCreating Latin Hypercube samples...")
-    lhs_samples = create_latin_hypercube(param_ranges_copy, n_samples, random_seed)
 
-    # Add fixed parameters as constant columns
-    if fixed_params_copy:
-        for param_name, param_value in fixed_params_copy.items():
-            lhs_samples[param_name] = param_value
+    if max_fsat is None:
+        lhs_samples = create_latin_hypercube(param_ranges_copy, n_samples, random_seed)
+        if fixed_params_copy:
+            for param_name, param_value in fixed_params_copy.items():
+                lhs_samples[param_name] = param_value
+        param_grid = lhs_samples.copy()
+    else:
+        # Oversample-and-reject: draw a larger LHS, evaluate the analytical
+        # f_sat per row via halo.HOD.compute_fsat, and keep rows with
+        # f_sat <= max_fsat. f_sat is invariant under joint (Ac, As) → k(Ac,As)
+        # rescaling, so we can use Ac_fiducial here even though Ac will be
+        # re-derived later inside run_hod_grid().
+        if verbose:
+            print(f"\nFiltering LHS by analytical f_sat <= {max_fsat} "
+                  f"(Ac_fiducial={Ac_fiducial}, oversample cap={fsat_oversample_cap})")
 
-    # Ac is fully derived — it is NOT stored in the grid.
-    # run_hod_grid() computes (Ac, As) on-the-fly to hit target_ngal, but does
-    # not write those values back into params_array.
-    param_grid = lhs_samples.copy()
+        oversample_factor = 2
+        kept_rows: List[pd.DataFrame] = []
+        kept_fsats: List[np.ndarray] = []
+        n_kept = 0
+        seed_offset = 0
+        rng_master = np.random.default_rng(random_seed)
+
+        while n_kept < n_samples:
+            seed_this = (
+                None if random_seed is None
+                else int(rng_master.integers(0, 2**31 - 1))
+            )
+            n_draw = n_samples * oversample_factor
+            lhs = create_latin_hypercube(param_ranges_copy, n_draw, seed_this)
+            if fixed_params_copy:
+                for k, v in fixed_params_copy.items():
+                    lhs[k] = v
+
+            fsats = np.empty(len(lhs), dtype=np.float64)
+            for i, row in enumerate(lhs.itertuples(index=False)):
+                p = dict(zip(lhs.columns, row))
+                p["Ac"] = Ac_fiducial
+                fsats[i] = float(halo.HOD.compute_fsat(p))
+
+            mask = fsats <= max_fsat
+            n_pass = int(mask.sum())
+            if verbose:
+                print(f"  oversample={oversample_factor}: drew {n_draw}, "
+                      f"kept {n_pass} (fsat<={max_fsat})")
+            kept_rows.append(lhs.loc[mask].reset_index(drop=True))
+            kept_fsats.append(fsats[mask])
+            n_kept = sum(len(d) for d in kept_rows)
+            if n_kept >= n_samples:
+                break
+
+            if oversample_factor >= fsat_oversample_cap:
+                raise RuntimeError(
+                    f"Could not collect {n_samples} rows with f_sat<={max_fsat} "
+                    f"after oversample_factor={oversample_factor} "
+                    f"(only {n_kept} kept). Consider relaxing max_fsat, "
+                    f"widening Mmin or shrinking the As upper bound."
+                )
+            oversample_factor *= 2
+            seed_offset += 1
+
+        all_kept = pd.concat(kept_rows, ignore_index=True)
+        all_fsats = np.concatenate(kept_fsats)
+        # Random sub-sample to exactly n_samples (deterministic given random_seed)
+        idx = np.arange(len(all_kept))
+        rng_master.shuffle(idx)
+        sel = idx[:n_samples]
+        param_grid = all_kept.iloc[sel].reset_index(drop=True)
+        sel_fsats = all_fsats[sel]
+        if verbose:
+            print(f"  final f_sat: min={sel_fsats.min():.3f} "
+                  f"median={np.median(sel_fsats):.3f} "
+                  f"max={sel_fsats.max():.3f} "
+                  f"(kept {n_samples}/{len(all_kept)} surviving rows)")
 
     if verbose:
         print(f"\nDone! Parameter grid: {n_samples} points, {len(param_grid.columns)} "

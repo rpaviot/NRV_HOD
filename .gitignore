@@ -208,3 +208,9 @@ HOD_NRV/HOD_numerical/test/output/
 HOD_NRV/utilsf/subhalo_catalogue.py 
 #common_test/precompute_subhalo_catalogue.py 
 #common_test/cross_check_nfw_vs_subhalo.py  
+example_scripts/cross_check_emulator_grid.py
+example_scripts/cross_check_emulator_grid_wgg.py
+example_scripts/run_chains_all.py
+example_scripts/run_emulator_grid_wgg.py 
+example_scripts/run_emulator_grid_wgg.sh
+param_grid_full.parquet
