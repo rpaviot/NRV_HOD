@@ -69,17 +69,30 @@ class PowerSpectrumEstimator:
         else:
             pos = positions.astype(np.float32, copy=False)
 
-        delta = TSC(pos, ncells_1d=self.Nmesh)
-        del pos
-        mean = np.mean(delta)
-        delta = (delta - mean) / mean
-
-        deltak = fft_3D_real(delta, threads=self.threads)
-        del delta
+        delta1 = TSC(pos, ncells_1d=self.Nmesh)
+        m1 = np.mean(delta1)
+        delta1 = (delta1 - m1) / m1
+        deltak1 = fft_3D_real(delta1, threads=self.threads)
+        del delta1
         gc.collect()
-        apply_interlacing(deltak)
-        compensate_mas(deltak, p=3)
-        return deltak
+
+        # Half-cell-shifted paint for Jing-2005 interlacing.
+        shift = np.float32(0.5 / self.Nmesh)
+        pos_shifted = pos + shift
+        periodic_wrap(pos_shifted)
+        del pos
+        delta2 = TSC(pos_shifted, ncells_1d=self.Nmesh)
+        del pos_shifted
+        m2 = np.mean(delta2)
+        delta2 = (delta2 - m2) / m2
+        deltak2 = fft_3D_real(delta2, threads=self.threads)
+        del delta2
+        gc.collect()
+
+        apply_interlacing(deltak1, deltak2)
+        del deltak2
+        compensate_mas(deltak1, p=3)
+        return deltak1
 
     def auto_pk(
         self,

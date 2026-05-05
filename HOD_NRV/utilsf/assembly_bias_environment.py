@@ -139,14 +139,21 @@ def compensate_mas(x: np.ndarray, p: int) -> None:
 
 
 @njit(parallel=True, fastmath=True, cache=True)
-def apply_interlacing(fourier1: np.ndarray) -> None:
+def apply_interlacing(fourier1: np.ndarray, fourier2: np.ndarray) -> None:
     """
-    Apply Fourier-space interlacing to reduce aliasing (Jing 2005).
-    
+    Combine two Fourier fields via Jing-2005 interlacing to cancel aliases.
+
+    Stores ``0.5 * (fourier1 + e^{i k·Δx} fourier2)`` in-place into ``fourier1``,
+    where ``Δx = (H/2, H/2, H/2)`` and ``H = Lbox / N``. ``fourier2`` must be
+    the FFT of the density field painted from positions shifted by ``H/2`` in
+    every dimension.
+
     Parameters
     ----------
     fourier1 : ndarray, complex64
-        Fourier transform of the unshifted density field
+        FFT of the unshifted density field. Modified in place.
+    fourier2 : ndarray, complex64
+        FFT of the half-cell-shifted density field.
     """
     N = fourier1.shape[0]
     middle = N // 2
@@ -165,10 +172,9 @@ def apply_interlacing(fourier1: np.ndarray) -> None:
 
             for k in range(middle + 1):
                 kz = k
-                # dot product k · Δx
                 phase = np.exp(1j * np.pi * (kx + ky + kz) / N)
-                # interlacing: average of unshifted and shifted contribution
-                fourier1[i, j, k] = 0.5 * (fourier1[i, j, k] + phase * fourier1[i, j, k])
+                fourier1[i, j, k] = 0.5 * (fourier1[i, j, k]
+                                           + phase * fourier2[i, j, k])
 
 
 def compute_Tij(i: int, j: int, deltak: np.ndarray, phase_axes: Tuple[np.ndarray, ...], 
@@ -327,17 +333,31 @@ class AssemblyBiasEnvironment:
         else:
             positions = particle_positions.astype(np.float32)
 
-        delta = TSC(positions, ncells_1d=self.Nmesh)
-        del positions
-        delta = (delta - np.mean(delta)) / np.mean(delta)
-
-        deltak = fft_3D_real(delta, threads=self.threads)
-        del delta
+        delta1 = TSC(positions, ncells_1d=self.Nmesh)
+        m1 = np.mean(delta1)
+        delta1 = (delta1 - m1) / m1
+        deltak1 = fft_3D_real(delta1, threads=self.threads)
+        del delta1
         gc.collect()
-        apply_interlacing(deltak)
-        compensate_mas(deltak, p=3)  # TSC compensation
 
-        return deltak
+        # Half-cell-shifted paint for Jing-2005 interlacing.
+        shift = np.float32(0.5 / self.Nmesh)
+        positions_shifted = positions + shift
+        periodic_wrap(positions_shifted)
+        del positions
+        delta2 = TSC(positions_shifted, ncells_1d=self.Nmesh)
+        del positions_shifted
+        m2 = np.mean(delta2)
+        delta2 = (delta2 - m2) / m2
+        deltak2 = fft_3D_real(delta2, threads=self.threads)
+        del delta2
+        gc.collect()
+
+        apply_interlacing(deltak1, deltak2)
+        del deltak2
+        compensate_mas(deltak1, p=3)  # TSC compensation
+
+        return deltak1
 
     def compute_density_field(self, particle_positions: np.ndarray,
                               normalize: bool = True) -> np.ndarray:
