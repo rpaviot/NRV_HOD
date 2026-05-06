@@ -213,4 +213,6 @@ example_scripts/cross_check_emulator_grid_wgg.py
 example_scripts/run_chains_all.py
 example_scripts/run_emulator_grid_wgg.py 
 example_scripts/run_emulator_grid_wgg.sh
+example_scripts/baryonify_snapshot.py
+example_scripts/baryonified_particles_*.parquet
 param_grid_full.parquet

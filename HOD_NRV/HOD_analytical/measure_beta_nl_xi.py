@@ -1,0 +1,362 @@
+"""
+Measure beta^NL(r, M1, M2) from a halo catalog in real space.
+
+Mirrors the convention used by Dark Emulator's
+`get_xiauto_mass(xs, M1, M2, z)` (de_interface.py:362), which builds
+xi_hh at delta-function masses M1, M2 from a 2D finite difference of the
+threshold-emulator output:
+
+    xi(M1, M2) = d^2 [n(>M1)*n(>M2)*xi(>M1, >M2)] / dM1 dM2
+                 / [(dn/dM1)(dn/dM2)]
+
+Discretized as a four-corner formula with M_p = (1+eps)*M, M_m = (1-eps)*M.
+We apply exactly the same combination on the simulation side, but replacing
+the emulator's threshold xi by xi measured with pycorr on threshold halo
+subsamples. This yields a fixed-mass xi_hh(r, M, M') directly comparable
+to `emu.get_xiauto_mass(xs, M, M', z)`.
+
+beta^NL is then defined in real space as
+
+    beta^NL(r, M1, M2) = xi_hh(r, M1, M2) / [b(M1) b(M2) xi_mm(r)] - 1
+
+with b(M) anchored on a large-scale window (e.g. r in [30, 80] Mpc/h)
+where xi_hh / xi_mm is approximately constant.
+
+This convention extends below 1e12 M_sun/h, where Dark Emulator fails.
+
+All masses in M_sun/h, lengths in Mpc/h.
+"""
+
+from typing import Callable, Dict, Optional, Sequence
+
+import numpy as np
+
+from ..HOD_numerical.twopoint_calculator.standard_two_point_calculator import compute_corr
+from ..utilsf.hankel_transforms import Pk_to_xi_gg
+
+
+def _select_above(halo_positions: np.ndarray,
+                  halo_log10M: np.ndarray,
+                  log10M_threshold: float) -> np.ndarray:
+    return halo_positions[halo_log10M >= log10M_threshold]
+
+
+def measure_xi_hh_thresholds(
+    halo_positions: np.ndarray,
+    halo_log10M: np.ndarray,
+    log10M_thresholds: Sequence[float],
+    Lbox: float,
+    r_bins: np.ndarray,
+    los: str = "z",
+    verbose: bool = True,
+) -> Dict[str, np.ndarray]:
+    """
+    Measure xi_hh(r) for every pair of mass-threshold halo subsamples.
+
+    Parameters
+    ----------
+    halo_positions : (N, 3) array, Mpc/h, in [0, Lbox).
+    halo_log10M    : (N,) array, log10(M) in M_sun/h.
+    log10M_thresholds : sequence of T thresholds (sorted ascending).
+        For δ-mass synthesis at K target masses with eps=0.01 the caller
+        passes 2K thresholds (one above and one below each target).
+    Lbox    : box size, Mpc/h.
+    r_bins  : (n_r+1,) edges, Mpc/h.
+    los     : line-of-sight axis, passed to pycorr.
+
+    Returns
+    -------
+    dict with:
+        r            (n_r,)             bin centers
+        log10M_th    (T,)               thresholds (echoed)
+        N_above      (T,)               halo counts above each threshold
+        xi           (T, T, n_r)        xi_hh(>M_a, >M_b, r), symmetric in (a,b)
+    """
+    halo_positions = np.asarray(halo_positions, dtype=np.float64)
+    halo_log10M = np.asarray(halo_log10M, dtype=np.float64)
+    log10M_thresholds = np.asarray(log10M_thresholds, dtype=np.float64)
+    T = len(log10M_thresholds)
+
+    subsamples = []
+    N_above = np.zeros(T, dtype=np.int64)
+    for i, lt in enumerate(log10M_thresholds):
+        sub = _select_above(halo_positions, halo_log10M, lt)
+        subsamples.append(sub)
+        N_above[i] = len(sub)
+        if verbose:
+            print(f"  threshold log10M >= {lt:.4f}: N = {N_above[i]}")
+
+    n_r = len(r_bins) - 1
+    xi = np.full((T, T, n_r), np.nan)
+    r_centers = None
+
+    # Auto and cross over all (i <= j)
+    for i in range(T):
+        if N_above[i] < 2:
+            if verbose:
+                print(f"  skipping i={i}, only {N_above[i]} halos")
+            continue
+        if verbose:
+            print(f"  pycorr auto i={i} (N={N_above[i]})")
+        r_c, xi_ii = compute_corr(
+            mode="s", catalog1=subsamples[i], bins1=r_bins,
+            boxsize=Lbox, los=los, output="auto",
+        )
+        r_centers = np.asarray(r_c)
+        xi[i, i, :] = np.asarray(xi_ii)
+
+        for j in range(i + 1, T):
+            if N_above[j] < 2:
+                continue
+            if verbose:
+                print(f"  pycorr cross i={i}, j={j} (N1={N_above[i]}, N2={N_above[j]})")
+            r_c, xi_ij = compute_corr(
+                mode="s", catalog1=subsamples[i], bins1=r_bins,
+                catalog2=subsamples[j], boxsize=Lbox, los=los, output="auto",
+            )
+            xi[i, j, :] = np.asarray(xi_ij)
+            xi[j, i, :] = xi[i, j, :]
+
+    return {
+        "r": r_centers,
+        "log10M_th": log10M_thresholds,
+        "N_above": N_above,
+        "xi": xi,
+    }
+
+
+def _pair_indices_for_target(log10M_thresholds: np.ndarray,
+                             log10M_target: float,
+                             eps: float) -> tuple:
+    """Find the (m, p) indices of (1-eps)*M and (1+eps)*M in the threshold list."""
+    log10M_m = np.log10((1.0 - eps)) + log10M_target
+    log10M_p = np.log10((1.0 + eps)) + log10M_target
+    im = int(np.argmin(np.abs(log10M_thresholds - log10M_m)))
+    ip = int(np.argmin(np.abs(log10M_thresholds - log10M_p)))
+    return im, ip
+
+
+def xi_hh_at_mass(
+    threshold_result: Dict[str, np.ndarray],
+    log10M_targets: Sequence[float],
+    eps: float = 0.01,
+) -> Dict[str, np.ndarray]:
+    """
+    Build xi_hh(r, M_i, M_j) at delta-function target masses by combining
+    threshold subsample measurements with the same four-corner formula
+    Dark Emulator uses (de_interface.py:362-394).
+
+    Requires `threshold_result` to contain thresholds at log10(M*(1±eps))
+    for every M in `log10M_targets`.
+
+    Parameters
+    ----------
+    threshold_result : output of `measure_xi_hh_thresholds`.
+    log10M_targets   : (K,) target masses in log10(M_sun/h).
+    eps              : finite-difference step (matches emulator's 0.01).
+
+    Returns
+    -------
+    dict with:
+        r        (n_r,)          bin centers
+        M_targets (K,)           10**log10M_targets, M_sun/h
+        xi_hh    (K, K, n_r)     xi at fixed (M_i, M_j)
+    """
+    log10M_th = threshold_result["log10M_th"]
+    xi_thr = threshold_result["xi"]
+    N_above = threshold_result["N_above"]
+    r_centers = threshold_result["r"]
+
+    K = len(log10M_targets)
+    n_r = xi_thr.shape[-1]
+    xi_out = np.full((K, K, n_r), np.nan)
+
+    for a, lMa in enumerate(log10M_targets):
+        ima, ipa = _pair_indices_for_target(log10M_th, lMa, eps)
+        Nma = float(N_above[ima])
+        Npa = float(N_above[ipa])
+        # number of halos in the thin shell around M_a:
+        dN_a = Nma - Npa
+        for b, lMb in enumerate(log10M_targets):
+            imb, ipb = _pair_indices_for_target(log10M_th, lMb, eps)
+            Nmb = float(N_above[imb])
+            Npb = float(N_above[ipb])
+            dN_b = Nmb - Npb
+
+            # Four-corner xi_hh combination — discrete analogue of
+            # ∂²[N(>M_a) N(>M_b) xi(>M_a, >M_b)] / ∂M_a ∂M_b
+            # with N (count) standing in for n (density) — the Lbox³ cancels.
+            num = (Nma * Nmb * xi_thr[ima, imb]
+                   - Nma * Npb * xi_thr[ima, ipb]
+                   - Npa * Nmb * xi_thr[ipa, imb]
+                   + Npa * Npb * xi_thr[ipa, ipb])
+            denom = Nma * Nmb - Nma * Npb - Npa * Nmb + Npa * Npb
+            if abs(denom) < 1e-30 or dN_a <= 0 or dN_b <= 0:
+                continue
+            xi_out[a, b, :] = num / denom
+
+    return {
+        "r": r_centers,
+        "M_targets": 10.0 ** np.asarray(log10M_targets, dtype=np.float64),
+        "xi_hh": xi_out,
+    }
+
+
+def thresholds_for_targets(log10M_targets: Sequence[float],
+                           eps: float = 0.01) -> np.ndarray:
+    """
+    Build the sorted, deduplicated threshold list needed to measure
+    xi at every target mass via four-corner finite differences.
+    """
+    out = []
+    for lM in log10M_targets:
+        out.append(lM + np.log10(1.0 - eps))
+        out.append(lM + np.log10(1.0 + eps))
+    arr = np.unique(np.round(np.asarray(out, dtype=np.float64), 8))
+    return np.sort(arr)
+
+
+def xi_mm_from_pk(P_nl_func: Callable[[np.ndarray], np.ndarray],
+                  k_min: float = 1e-4,
+                  k_max: float = 5e2,
+                  n_k: int = 1024) -> tuple:
+    """
+    Get xi_mm(r) by Hankel-transforming the nonlinear matter P(k).
+
+    Parameters
+    ----------
+    P_nl_func : callable. P_nl_func(k) -> P_nl(k, z) at the snapshot
+        redshift, in (Mpc/h)^3, with k in h/Mpc.
+    k_min, k_max, n_k : log-spaced k grid for FAST-PT.
+
+    Returns
+    -------
+    r, xi_mm : 1D arrays. r in Mpc/h.
+    """
+    k = np.logspace(np.log10(k_min), np.log10(k_max), n_k)
+    P = np.asarray(P_nl_func(k))
+    r, xi = Pk_to_xi_gg(k, P)  # standard cosmology HT (mu=0.5, alpha=1.5)
+    return np.asarray(r), np.asarray(xi)
+
+
+def fit_bias_largescale(r: np.ndarray, xi_hh: np.ndarray,
+                        xi_mm_func: Callable[[np.ndarray], np.ndarray],
+                        r_min: float = 30.0,
+                        r_max: float = 80.0) -> float:
+    """
+    Linear-bias estimate from the large-scale ratio xi_hh / xi_mm.
+
+    b^2 = < xi_hh(r) / xi_mm(r) >_{r_min < r < r_max}
+    """
+    sel = (r >= r_min) & (r <= r_max) & np.isfinite(xi_hh) & (xi_hh > 0)
+    if sel.sum() < 2:
+        return np.nan
+    xi_mm_at_r = np.asarray(xi_mm_func(r[sel]))
+    good = (xi_mm_at_r > 0) & np.isfinite(xi_mm_at_r)
+    if good.sum() < 2:
+        return np.nan
+    ratio = xi_hh[sel][good] / xi_mm_at_r[good]
+    if np.any(ratio <= 0):
+        return np.nan
+    return float(np.sqrt(np.mean(ratio)))
+
+
+def compute_beta_nl_xi(
+    halo_positions: np.ndarray,
+    halo_log10M: np.ndarray,
+    log10M_targets: Sequence[float],
+    Lbox: float,
+    P_nl_func: Callable[[np.ndarray], np.ndarray],
+    r_bins: Optional[np.ndarray] = None,
+    eps: float = 0.01,
+    bias_window: tuple = (30.0, 80.0),
+    los: str = "z",
+    verbose: bool = True,
+) -> Dict[str, np.ndarray]:
+    """
+    Top-level driver: measure beta^NL(r, M_i, M_j) from a halo catalog at
+    delta-function target masses, mirroring Dark Emulator's convention.
+
+    Returns
+    -------
+    dict with:
+        r                 (n_r,)         bin centers, Mpc/h
+        M_targets         (K,)           target masses, M_sun/h
+        xi_hh             (K, K, n_r)
+        xi_mm             (n_r,)         interpolated to r
+        b_hh              (K,)           large-scale bias per target mass
+        beta_nl           (K, K, n_r)    xi_hh / (b_i b_j xi_mm) - 1
+        thresholds        (T,)           thresholds used
+        N_above           (T,)
+    """
+    if r_bins is None:
+        # Default: 0.5 -> 100 Mpc/h, 30 log bins. Avoid below ~halo size.
+        r_bins = np.logspace(np.log10(0.5), np.log10(100.0), 31)
+
+    log10M_targets = np.asarray(log10M_targets, dtype=np.float64)
+
+    # 1. Thresholds + halo subsample xi
+    thresholds = thresholds_for_targets(log10M_targets, eps=eps)
+    if verbose:
+        print(f"[beta_nl_xi] {len(thresholds)} thresholds for {len(log10M_targets)} targets")
+    thr_res = measure_xi_hh_thresholds(
+        halo_positions, halo_log10M, thresholds, Lbox, r_bins,
+        los=los, verbose=verbose,
+    )
+
+    # 2. Four-corner combination -> delta-mass xi_hh
+    fixed = xi_hh_at_mass(thr_res, log10M_targets, eps=eps)
+    r = fixed["r"]
+    xi_hh = fixed["xi_hh"]
+
+    # 3. Matter xi from P_nl
+    r_mm, xi_mm_grid = xi_mm_from_pk(P_nl_func)
+    # Interpolate xi_mm to the r grid of the measurement (log-log linear).
+    good = (xi_mm_grid > 0) & np.isfinite(xi_mm_grid) & (r_mm > 0)
+    xi_mm = np.exp(np.interp(np.log(r), np.log(r_mm[good]),
+                              np.log(xi_mm_grid[good])))
+    xi_mm_func = lambda rr: np.exp(np.interp(np.log(rr),
+                                              np.log(r_mm[good]),
+                                              np.log(xi_mm_grid[good])))
+
+    # 4. Bias per target from large-scale ratio of the autocorrelations.
+    K = len(log10M_targets)
+    b_hh = np.full(K, np.nan)
+    for a in range(K):
+        b_hh[a] = fit_bias_largescale(r, xi_hh[a, a, :], xi_mm_func,
+                                       r_min=bias_window[0],
+                                       r_max=bias_window[1])
+
+    # 5. beta^NL(r, M_i, M_j)
+    beta = np.full_like(xi_hh, np.nan)
+    for a in range(K):
+        if not np.isfinite(b_hh[a]):
+            continue
+        for b in range(K):
+            if not np.isfinite(b_hh[b]):
+                continue
+            with np.errstate(invalid="ignore", divide="ignore"):
+                beta[a, b, :] = xi_hh[a, b, :] / (b_hh[a] * b_hh[b] * xi_mm) - 1.0
+
+    return {
+        "r": r,
+        "M_targets": fixed["M_targets"],
+        "xi_hh": xi_hh,
+        "xi_mm": xi_mm,
+        "b_hh": b_hh,
+        "beta_nl": beta,
+        "thresholds": thresholds,
+        "N_above": thr_res["N_above"],
+        "bias_window": np.asarray(bias_window),
+        "eps": eps,
+    }
+
+
+__all__ = [
+    "measure_xi_hh_thresholds",
+    "xi_hh_at_mass",
+    "thresholds_for_targets",
+    "xi_mm_from_pk",
+    "fit_bias_largescale",
+    "compute_beta_nl_xi",
+]
