@@ -301,6 +301,54 @@ def gamma_h_at_mass_shells(emu, k: np.ndarray, z: float,
     return gp, gm
 
 
+def _interpolate_xi_tree_from_grid(
+    grid_path: str,
+    r_out: np.ndarray,
+    log10M_targets: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    """
+    Load a pre-computed ξ_tree grid and interpolate to target masses and r.
+
+    The grid file (.npz) must contain: r, log10M_arr, xi_tree, used_de,
+    z, eps, gamma_min_log10M (as saved by precompute_xi_tree_grid.py).
+    """
+    from scipy.interpolate import RegularGridInterpolator
+
+    d = np.load(grid_path)
+    r_grid = d["r"]
+    log10M_grid = d["log10M_arr"]
+    xi_grid = d["xi_tree"]  # (n_mass, n_mass, n_r)
+
+    K = len(log10M_targets)
+    n_r_out = len(r_out)
+
+    log_r_grid = np.log(r_grid)
+    log_r_out = np.log(r_out)
+
+    xi_tree = np.full((K, K, n_r_out), np.nan)
+    used_de = np.ones(K, dtype=bool)
+
+    for i in range(K):
+        for j in range(i, K):
+            interp = RegularGridInterpolator(
+                (log10M_grid, log10M_grid, log_r_grid),
+                xi_grid,
+                method="linear",
+                bounds_error=False,
+                fill_value=np.nan,
+            )
+            pts = np.column_stack([
+                np.full(n_r_out, log10M_targets[i]),
+                np.full(n_r_out, log10M_targets[j]),
+                log_r_out,
+            ])
+            xi_tree[i, j, :] = interp(pts)
+            if j != i:
+                xi_tree[j, i, :] = xi_tree[i, j, :]
+
+    return {"r": r_out, "xi_tree": xi_tree, "used_de": used_de}
+
+
 def compute_xi_tree(
     emu,
     P_lin_func: Callable[[np.ndarray], np.ndarray],
@@ -312,6 +360,7 @@ def compute_xi_tree(
     gamma_min_log10M: float = 12.0,
     fallback: str = "linear_bias",
     b_hh: Optional[np.ndarray] = None,
+    grid_path: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Build the analytical large-scale ξ_tree(r, M_i, M_j) via the
@@ -343,6 +392,10 @@ def compute_xi_tree(
     b_hh            : (K,) large-scale biases — only used by the
                       linear-bias fallback. Must be supplied if the
                       fallback is to fire for any target.
+    grid_path       : optional path to a pre-computed ξ_tree grid (.npz
+                      from precompute_xi_tree_grid.py). If provided,
+                      interpolates from the grid instead of computing
+                      from scratch.
 
     Returns
     -------
@@ -353,20 +406,24 @@ def compute_xi_tree(
                                      target (False if fallback fired).
     """
     log10M_targets = np.atleast_1d(np.asarray(log10M_targets, dtype=np.float64))
-    K = len(log10M_targets)
     r_out = np.asarray(r_out, dtype=np.float64)
+
+    if grid_path is not None:
+        return _interpolate_xi_tree_from_grid(grid_path, r_out, log10M_targets)
+
+    K = len(log10M_targets)
     n_r = len(r_out)
 
     if k_grid is None:
         k_grid = np.logspace(-4.0, np.log10(5e2), 1024)
     k_grid = np.asarray(k_grid, dtype=np.float64)
-    P_lin = np.asarray(P_lin_func(k_grid), dtype=np.float64)
 
     used_de = log10M_targets >= gamma_min_log10M
 
     xi_lin_at_r = None
     if (~used_de).any() and fallback == "linear_bias":
-        r_lin, xi_lin = Pk_to_xi_gg(k_grid, P_lin)
+        P_lin_z = np.asarray(P_lin_func(k_grid), dtype=np.float64)
+        r_lin, xi_lin = Pk_to_xi_gg(k_grid, P_lin_z)
         good = (r_lin > 0) & np.isfinite(xi_lin)
         xi_lin_at_r = np.interp(np.log(r_out),
                                  np.log(np.asarray(r_lin)[good]),
@@ -376,6 +433,9 @@ def compute_xi_tree(
 
     de_idx = np.where(used_de)[0]
     if len(de_idx) > 0:
+        # DE propagator Γ_h absorbs the growth factor, so P_lin must be at z=0.
+        P_lin_z0 = np.asarray(emu.get_pklin(k_grid), dtype=np.float64).ravel()
+
         gp, gm = gamma_h_at_mass_shells(
             emu, k_grid, z, log10M_targets[de_idx], eps=eps,
         )
@@ -391,10 +451,10 @@ def compute_xi_tree(
             for jj, j in enumerate(de_idx):
                 if j < i:
                     continue
-                P_mm = gm[ii] * gm[jj] * P_lin
-                P_mp = gm[ii] * gp[jj] * P_lin
-                P_pm = gp[ii] * gm[jj] * P_lin
-                P_pp = gp[ii] * gp[jj] * P_lin
+                P_mm = gm[ii] * gm[jj] * P_lin_z0
+                P_mp = gm[ii] * gp[jj] * P_lin_z0
+                P_pm = gp[ii] * gm[jj] * P_lin_z0
+                P_pp = gp[ii] * gp[jj] * P_lin_z0
                 P_tree = _four_corner_fd(P_mm, P_mp, P_pm, P_pp,
                                           n_p[ii], n_m[ii],
                                           n_p[jj], n_m[jj])
@@ -588,6 +648,7 @@ def beta_nl_xi_from_tabulation(
     gamma_min_log10M: float = 12.0,
     gamma_fallback: str = "linear_bias",
     gamma_k_grid: Optional[np.ndarray] = None,
+    xi_tree_grid_path: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Cheap post-processing: combine a cumulative-xi tabulation
@@ -616,9 +677,10 @@ def beta_nl_xi_from_tabulation(
     xi_tree = None
     used_de = None
     if stitch_large_scale:
-        if emu is None or P_lin_func is None or z is None:
+        if xi_tree_grid_path is None and (emu is None or P_lin_func is None or z is None):
             raise ValueError(
-                "stitch_large_scale=True requires emu, P_lin_func, and z."
+                "stitch_large_scale=True requires either xi_tree_grid_path, "
+                "or (emu, P_lin_func, and z)."
             )
         # Need a provisional bias for any low-mass linear-bias fallback;
         # fit it from the un-stitched ξ_hh first, then refit after stitching.
@@ -636,11 +698,12 @@ def beta_nl_xi_from_tabulation(
             )
 
         tree_res = compute_xi_tree(
-            emu=emu, P_lin_func=P_lin_func, z=float(z),
+            emu=emu, P_lin_func=P_lin_func, z=float(z) if z is not None else None,
             r_out=r, log10M_targets=log10M_targets,
             eps=gamma_eps, k_grid=gamma_k_grid,
             gamma_min_log10M=gamma_min_log10M, fallback=gamma_fallback,
             b_hh=b_provisional,
+            grid_path=xi_tree_grid_path,
         )
         xi_tree = tree_res["xi_tree"]
         used_de = tree_res["used_de"]
@@ -714,6 +777,7 @@ def compute_beta_nl_xi(
     gamma_min_log10M: float = 12.0,
     gamma_fallback: str = "linear_bias",
     gamma_k_grid: Optional[np.ndarray] = None,
+    xi_tree_grid_path: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Top-level driver: measure beta^NL(r, M_i, M_j) from a halo catalog at
@@ -757,6 +821,7 @@ def compute_beta_nl_xi(
         P_lin_func=P_lin_func, z=z, r_switch=r_switch,
         gamma_eps=gamma_eps, gamma_min_log10M=gamma_min_log10M,
         gamma_fallback=gamma_fallback, gamma_k_grid=gamma_k_grid,
+        xi_tree_grid_path=xi_tree_grid_path,
     )
 
 

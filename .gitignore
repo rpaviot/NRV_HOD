@@ -218,4 +218,6 @@ example_scripts/baryonified_particles_*.parquet
 param_grid_full.parquet
 # Local validation scratch
 example_scripts/check_xi_tree_one_case.py
+example_scripts/test_bias.py
+example_scripts/precompute_xi_tree_grid.py
 check_xi_tree_one_case.png
