@@ -213,7 +213,7 @@ class DeltaSigmaCalculator:
         Mean matter density in units of [Msun/h / (Mpc/h)^3]
     chi_max : float, optional
         Maximum line-of-sight distance for integration [Mpc/h].
-        Default: 100
+        Default: 120
 
     Attributes
     ----------
@@ -271,7 +271,7 @@ class DeltaSigmaCalculator:
     .. [2] Cacciato et al. (2009), MNRAS 394, 929
     .. [3] Singh et al. (2017), MNRAS 471, 3827
     """
-    def __init__(self, rr, xi_gm, RHO_M, chi_max=150):
+    def __init__(self, rr, xi_gm, RHO_M, chi_max=120):
         self.rr = rr
         self.RHO_M = RHO_M
         self.chi_max = chi_max

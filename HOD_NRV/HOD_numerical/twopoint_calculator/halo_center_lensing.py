@@ -381,13 +381,12 @@ def precompute_halo_center_lensing(
     >>> cache.save('halo_center_lensing.h5')
     """
     if bins_comp is None:
-        bins_comp = np.geomspace(5e-3, 120, 151)
+        bins_comp = np.geomspace(5e-3, 120, 201)
 
     n_halos = len(halo_positions)
     n_rp_bins = len(rp_bins) - 1
     search_radius = bins_comp[-1]
     r_centers = np.sqrt(bins_comp[:-1] * bins_comp[1:])
-    chi_max = 120.0
     t_total = time.time()
 
     if verbose:

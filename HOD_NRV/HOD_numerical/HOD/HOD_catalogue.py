@@ -510,7 +510,7 @@ class HaloOccupation:
 
         # Set default for bins_comp if not provided
         if bins_comp is None:
-            bins_comp = np.geomspace(5e-3, 120, 151)
+            bins_comp = np.geomspace(5e-3, 120, 201)
 
         return compute_galaxy_lensing(
             self.positions_gal, self.positions_part, self.Lbox,
@@ -623,7 +623,7 @@ class HaloOccupation:
 
         # Set default for bins_comp if not provided
         if bins_comp is None:
-            bins_comp = np.geomspace(5e-3, 120, 151)
+            bins_comp = np.geomspace(5e-3, 120, 201)
 
         # Verify rp_bins match
         if not np.allclose(bins1, precomputed_cache.rp_bins):
@@ -781,7 +781,7 @@ class HaloOccupation:
             raise RuntimeError("Particle data not loaded. Provide DataFrame_part during initialization.")
 
         if bins_comp is None:
-            bins_comp = np.geomspace(5e-3, 120, 151)
+            bins_comp = np.geomspace(5e-3, 120, 201)
 
         results = []
 
