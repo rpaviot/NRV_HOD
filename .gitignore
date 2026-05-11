@@ -216,3 +216,6 @@ example_scripts/run_emulator_grid_wgg.sh
 example_scripts/baryonify_snapshot.py
 example_scripts/baryonified_particles_*.parquet
 param_grid_full.parquet
+# Local validation scratch
+example_scripts/check_xi_tree_one_case.py
+check_xi_tree_one_case.png

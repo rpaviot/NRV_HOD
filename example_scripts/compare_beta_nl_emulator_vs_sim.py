@@ -117,7 +117,10 @@ def emulator_beta_nl_xi(cosmo, z, r, M1, M2, bias_window=(30.0, 80.0)):
 
 def measure_one_xi(label, halo_path, log10M_targets, Lbox, P_nl_func,
                    r_bins, eps, bias_window, z, cache_dir,
-                   xi_logM_min, xi_logM_max, xi_step_dex):
+                   xi_logM_min, xi_logM_max, xi_step_dex,
+                   stitch_large_scale=False, emu=None, P_lin_func=None,
+                   r_switch=60.0, gamma_eps=0.02,
+                   gamma_min_log10M=12.0, gamma_fallback="linear_bias"):
     print(f"\n=== {label} (xi-space): {halo_path} ===")
     pos, log10M = load_halos(halo_path)
     print(f"  loaded {len(log10M)} halos, log10M in [{log10M.min():.2f}, {log10M.max():.2f}]")
@@ -146,6 +149,11 @@ def measure_one_xi(label, halo_path, log10M_targets, Lbox, P_nl_func,
     return beta_nl_xi_from_tabulation(
         thr_res, log10M_targets, P_nl_func,
         eps=eps, bias_window=bias_window,
+        stitch_large_scale=stitch_large_scale,
+        emu=emu, P_lin_func=P_lin_func, z=z,
+        r_switch=r_switch, gamma_eps=gamma_eps,
+        gamma_min_log10M=gamma_min_log10M,
+        gamma_fallback=gamma_fallback,
     )
 
 
@@ -156,18 +164,37 @@ def run_real_space(args, cosmo, P_nl):
                          args.n_rbins + 1)
     bias_window = (args.bias_rmin, args.bias_rmax)
 
+    P_lin = lambda k: cosmo.linear_power(np.asarray(k), z=args.z)
+    emu = getattr(cosmo, "emu", None) if args.stitch_large_scale else None
+    if args.stitch_large_scale and emu is None:
+        raise RuntimeError(
+            "Stitching requested but Dark Emulator is not loaded on `cosmo`. "
+            "Construct Cosmology(..., use_dark_emulator=True)."
+        )
+
+    stitch_kwargs = dict(
+        stitch_large_scale=args.stitch_large_scale,
+        emu=emu, P_lin_func=P_lin,
+        r_switch=args.r_switch,
+        gamma_eps=args.gamma_eps,
+        gamma_min_log10M=args.gamma_min_log10M,
+        gamma_fallback=args.gamma_fallback,
+    )
+
     results = {}
     if not args.skip_dmo:
         results["DMO"] = measure_one_xi(
             "DMO", args.dmo_path, log10M_targets, args.Lbox, P_nl,
             r_bins, args.eps, bias_window, args.z, args.xi_cache_dir,
             args.xi_logM_min, args.xi_logM_max, args.xi_step_dex,
+            **stitch_kwargs,
         )
     if not args.skip_hydro:
         results["Hydro"] = measure_one_xi(
             "Hydro", args.hydro_path, log10M_targets, args.Lbox, P_nl,
             r_bins, args.eps, bias_window, args.z, args.xi_cache_dir,
             args.xi_logM_min, args.xi_logM_max, args.xi_step_dex,
+            **stitch_kwargs,
         )
     if not results:
         print("Both DMO and Hydro skipped — nothing to do.")
@@ -182,6 +209,9 @@ def run_real_space(args, cosmo, P_nl):
         for key in ("r", "M_targets", "xi_hh", "xi_mm", "b_hh",
                      "beta_nl", "thresholds", "N_above"):
             save_dict[f"{label}_{key}"] = res[key]
+        for key in ("xi_hh_dir", "xi_tree", "used_de_for_gamma", "r_switch"):
+            if key in res:
+                save_dict[f"{label}_{key}"] = res[key]
     np.savez(out_npz, **save_dict)
     print(f"\nSaved xi-space measurements to {out_npz}")
 
@@ -210,9 +240,18 @@ def run_real_space(args, cosmo, P_nl):
             ax = axes[row, col]
             beta_meas = res["beta_nl"][i, j, :]
             beta_emu = emu_beta[i, j, :]
-            ax.semilogx(r, beta_meas, "o", ms=4, label="measured")
+            ax.semilogx(r, beta_meas, "o", ms=4, label="measured (stitched)")
+            if "xi_hh_dir" in res and "xi_mm" in res and "b_hh" in res:
+                b1, b2 = res["b_hh"][i], res["b_hh"][j]
+                if np.isfinite(b1) and np.isfinite(b2):
+                    with np.errstate(invalid="ignore", divide="ignore"):
+                        beta_dir = res["xi_hh_dir"][i, j, :] / (b1 * b2 * res["xi_mm"]) - 1.0
+                    ax.semilogx(r, beta_dir, "x", ms=3, color="C2",
+                                alpha=0.5, label="measured (direct)")
             if np.any(np.isfinite(beta_emu)):
                 ax.semilogx(r, beta_emu, "-", lw=1.6, label="Dark Emulator")
+            if res.get("stitched", False) and "r_switch" in res:
+                ax.axvline(res["r_switch"], color="k", lw=0.5, ls=":")
             ax.axhline(0, color="gray", lw=0.6)
             ax.set_title(f"{label}: log10(M1, M2) = "
                          f"({np.log10(M_targets[i]):.2f}, {np.log10(M_targets[j]):.2f})")
@@ -267,6 +306,29 @@ def main():
     p.add_argument("--skip_dmo", action="store_true")
     p.add_argument("--skip_hydro", action="store_true")
     p.add_argument("--output_dir", default="beta_nl_validation")
+    p.add_argument("--stitch_large_scale", dest="stitch_large_scale",
+                   action="store_true", default=True,
+                   help="Real-space mode: smoothly switch xi_hh to an "
+                        "analytical large-scale prescription (Dark Emulator-"
+                        "style, Γ_h propagator + four-corner FD) at r ≳ r_switch.")
+    p.add_argument("--no_stitch_large_scale", dest="stitch_large_scale",
+                   action="store_false",
+                   help="Disable the large-scale analytical stitch (xi_hh "
+                        "stays equal to the direct measurement everywhere).")
+    p.add_argument("--r_switch", type=float, default=60.0,
+                   help="Transition scale [Mpc/h] for the quartic taper "
+                        "exp(-(r/r_switch)^4). Default 60 (Dark Emulator).")
+    p.add_argument("--gamma_eps", type=float, default=0.02,
+                   help="DE-style FD half-width on density shells for Γ_h "
+                        "(default 0.02, matches dark_emulator).")
+    p.add_argument("--gamma_min_log10M", type=float, default=12.0,
+                   help="Minimum log10(M_sun/h) where DE's Γ_h is trusted. "
+                        "Targets below this use the fallback.")
+    p.add_argument("--gamma_fallback", choices=["linear_bias", "none"],
+                   default="linear_bias",
+                   help="What to use for ξ_tree when log10M < gamma_min_log10M: "
+                        "'linear_bias' → b1(M)·b2(M)·ξ_lin(r); "
+                        "'none' → skip stitching for that target.")
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)

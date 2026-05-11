@@ -238,6 +238,220 @@ def thresholds_for_targets(log10M_targets: Sequence[float],
     return np.sort(arr)
 
 
+def _four_corner_fd(v_mm: np.ndarray, v_mp: np.ndarray,
+                    v_pm: np.ndarray, v_pp: np.ndarray,
+                    n_1p: float, n_1m: float,
+                    n_2p: float, n_2m: float) -> np.ndarray:
+    """
+    Four-corner finite difference (Dark Emulator convention) converting
+    threshold-evaluated quantities v(>M, >M') at the four shell corners
+    (mm, mp, pm, pp) into a fixed-mass value at (M_1, M_2).
+
+    numer = v_mm n_1m n_2m - v_mp n_1m n_2p - v_pm n_1p n_2m + v_pp n_1p n_2p
+    denom = n_1m n_2m - n_1m n_2p - n_1p n_2m + n_1p n_2p
+
+    Mirrors xi_hh_at_mass (counts replaced by densities; the conversion factor
+    Lbox^3 cancels) and DE's hod_interface.py:345-349 / :391-393.
+    """
+    num = (v_mm * n_1m * n_2m
+           - v_mp * n_1m * n_2p
+           - v_pm * n_1p * n_2m
+           + v_pp * n_1p * n_2p)
+    denom = n_1m * n_2m - n_1m * n_2p - n_1p * n_2m + n_1p * n_2p
+    return num / denom
+
+
+def gamma_h_at_mass_shells(emu, k: np.ndarray, z: float,
+                           log10M_targets: Sequence[float],
+                           eps: float = 0.02) -> tuple:
+    """
+    Evaluate Dark Emulator's halo propagator Γ_h(k) at the upper/lower
+    density shells corresponding to each target mass.
+
+    Mirrors hod_interface.py:355-367 / 463-467 in dark_emulator_public.
+
+    Parameters
+    ----------
+    emu : dark_emulator.darkemu.de_interface instance.
+    k   : (n_k,) wavenumbers in h/Mpc.
+    z   : redshift.
+    log10M_targets : (K,) target masses in log10(M_sun/h).
+    eps : mass-shell half-width (DE uses 0.02).
+
+    Returns
+    -------
+    gp, gm : (K, n_k) arrays. gp = Γ_h at (1+eps)·M, gm at (1-eps)·M.
+
+    Note: DE's g1 emulator is trained on log10(n) in [-8.5, -2.5]. For
+    masses where the density falls outside this range the underlying
+    spline extrapolates and the result should be treated as unreliable
+    (typically below ~1e12 M_sun/h).
+    """
+    log10M_targets = np.atleast_1d(np.asarray(log10M_targets, dtype=np.float64))
+    K = len(log10M_targets)
+    n_k = len(k)
+    gp = np.zeros((K, n_k))
+    gm = np.zeros((K, n_k))
+    for i, lM in enumerate(log10M_targets):
+        M = 10.0 ** lM
+        logdens_p = np.log10(emu.mass_to_dens((1.0 + eps) * M, z))
+        logdens_m = np.log10(emu.mass_to_dens((1.0 - eps) * M, z))
+        gp[i] = emu.g1.get(k, z, logdens_p).ravel()
+        gm[i] = emu.g1.get(k, z, logdens_m).ravel()
+    return gp, gm
+
+
+def compute_xi_tree(
+    emu,
+    P_lin_func: Callable[[np.ndarray], np.ndarray],
+    z: float,
+    r_out: np.ndarray,
+    log10M_targets: Sequence[float],
+    eps: float = 0.02,
+    k_grid: Optional[np.ndarray] = None,
+    gamma_min_log10M: float = 12.0,
+    fallback: str = "linear_bias",
+    b_hh: Optional[np.ndarray] = None,
+) -> Dict[str, np.ndarray]:
+    """
+    Build the analytical large-scale ξ_tree(r, M_i, M_j) via the
+    Dark Emulator prescription:
+
+        ξ_tree = IFT[ Γ_h(k, M_1) · Γ_h(k, M_2) · P_lin(k) ]
+
+    using a four-corner FD in (1±eps)·M shells to land at fixed mass.
+
+    For target masses below `gamma_min_log10M` the DE propagator is
+    unreliable; we fall back to a linear-bias model
+        ξ_tree(r, M_i, M_j) ≈ b(M_i) b(M_j) ξ_lin(r)
+    if `fallback == "linear_bias"` and `b_hh` is supplied; otherwise the
+    target is left as NaN and a warning is printed.
+
+    Parameters
+    ----------
+    emu             : Dark Emulator instance (cosmo.emu).
+    P_lin_func      : callable, k (h/Mpc) -> P_lin(k, z) in (Mpc/h)^3.
+    z               : redshift.
+    r_out           : (n_r,) output r grid (Mpc/h).
+    log10M_targets  : (K,) target masses.
+    eps             : DE-style FD half-width (default 0.02).
+    k_grid          : optional (n_k,) wavenumbers in h/Mpc.
+                      Default: log-spaced 1e-4 to 5e2, 1024 points
+                      (matches `xi_mm_from_pk`).
+    gamma_min_log10M: below this log10M, use the fallback.
+    fallback        : "linear_bias" or "none".
+    b_hh            : (K,) large-scale biases — only used by the
+                      linear-bias fallback. Must be supplied if the
+                      fallback is to fire for any target.
+
+    Returns
+    -------
+    dict with:
+        r          (n_r,)            echoed r_out
+        xi_tree    (K, K, n_r)       ξ_tree at fixed (M_i, M_j)
+        used_de    (K,)              bool, True if Γ_h was used for that
+                                     target (False if fallback fired).
+    """
+    log10M_targets = np.atleast_1d(np.asarray(log10M_targets, dtype=np.float64))
+    K = len(log10M_targets)
+    r_out = np.asarray(r_out, dtype=np.float64)
+    n_r = len(r_out)
+
+    if k_grid is None:
+        k_grid = np.logspace(-4.0, np.log10(5e2), 1024)
+    k_grid = np.asarray(k_grid, dtype=np.float64)
+    P_lin = np.asarray(P_lin_func(k_grid), dtype=np.float64)
+
+    used_de = log10M_targets >= gamma_min_log10M
+
+    xi_lin_at_r = None
+    if (~used_de).any() and fallback == "linear_bias":
+        r_lin, xi_lin = Pk_to_xi_gg(k_grid, P_lin)
+        good = (r_lin > 0) & np.isfinite(xi_lin)
+        xi_lin_at_r = np.interp(np.log(r_out),
+                                 np.log(np.asarray(r_lin)[good]),
+                                 np.asarray(xi_lin)[good])
+
+    xi_tree = np.full((K, K, n_r), np.nan)
+
+    de_idx = np.where(used_de)[0]
+    if len(de_idx) > 0:
+        gp, gm = gamma_h_at_mass_shells(
+            emu, k_grid, z, log10M_targets[de_idx], eps=eps,
+        )
+
+        n_p = np.zeros(len(de_idx))
+        n_m = np.zeros(len(de_idx))
+        for ii, i in enumerate(de_idx):
+            M = 10.0 ** log10M_targets[i]
+            n_p[ii] = emu.mass_to_dens((1.0 + eps) * M, z)
+            n_m[ii] = emu.mass_to_dens((1.0 - eps) * M, z)
+
+        for ii, i in enumerate(de_idx):
+            for jj, j in enumerate(de_idx):
+                if j < i:
+                    continue
+                P_mm = gm[ii] * gm[jj] * P_lin
+                P_mp = gm[ii] * gp[jj] * P_lin
+                P_pm = gp[ii] * gm[jj] * P_lin
+                P_pp = gp[ii] * gp[jj] * P_lin
+                P_tree = _four_corner_fd(P_mm, P_mp, P_pm, P_pp,
+                                          n_p[ii], n_m[ii],
+                                          n_p[jj], n_m[jj])
+                r_t, xi_t = Pk_to_xi_gg(k_grid, P_tree)
+                r_t = np.asarray(r_t); xi_t = np.asarray(xi_t)
+                good = (r_t > 0) & np.isfinite(xi_t)
+                xi_interp = np.interp(np.log(r_out),
+                                       np.log(r_t[good]), xi_t[good])
+                xi_tree[i, j, :] = xi_interp
+                if j != i:
+                    xi_tree[j, i, :] = xi_interp
+
+    if (~used_de).any():
+        if fallback == "linear_bias":
+            if b_hh is None:
+                print("[compute_xi_tree] warning: gamma fallback requested but "
+                      "b_hh not provided; leaving low-mass targets as NaN.")
+            else:
+                b_hh = np.asarray(b_hh, dtype=np.float64)
+                for i in range(K):
+                    for j in range(K):
+                        if used_de[i] and used_de[j]:
+                            continue
+                        if not (np.isfinite(b_hh[i]) and np.isfinite(b_hh[j])):
+                            continue
+                        xi_tree[i, j, :] = b_hh[i] * b_hh[j] * xi_lin_at_r
+        elif fallback == "none":
+            for i in np.where(~used_de)[0]:
+                print(f"[compute_xi_tree] log10M={log10M_targets[i]:.3f} below "
+                      f"gamma_min_log10M={gamma_min_log10M}; skipping stitch.")
+        else:
+            raise ValueError(f"unknown fallback: {fallback!r}")
+
+    return {"r": r_out, "xi_tree": xi_tree, "used_de": used_de}
+
+
+def stitch_xi_hh(r: np.ndarray, xi_dir: np.ndarray, xi_tree: np.ndarray,
+                 r_switch: float = 60.0) -> np.ndarray:
+    """
+    Smoothly switch between direct and analytical ξ_hh with a quartic
+    exponential taper centered at r_switch.
+
+        ξ_hh = ξ_dir · w(r) + ξ_tree · (1 − w(r)),    w(r) = exp[-(r/r_switch)^4]
+
+    Mirrors hod_interface.py:419-423 in dark_emulator_public.
+
+    Where ξ_tree is NaN the direct measurement is returned unchanged.
+    Shapes: r is (n_r,), xi_dir / xi_tree broadcast over any leading axes.
+    """
+    r = np.asarray(r, dtype=np.float64)
+    w = np.exp(-(r / float(r_switch)) ** 4)
+    tree_nan = ~np.isfinite(xi_tree)
+    xi_tree_safe = np.where(tree_nan, 0.0, xi_tree)
+    w_eff = np.where(tree_nan, np.ones_like(xi_tree), w)
+    return xi_dir * w_eff + xi_tree_safe * (1.0 - w_eff)
+
+
 def xi_mm_from_pk(P_nl_func: Callable[[np.ndarray], np.ndarray],
                   k_min: float = 1e-4,
                   k_max: float = 5e2,
@@ -365,6 +579,15 @@ def beta_nl_xi_from_tabulation(
     P_nl_func: Callable[[np.ndarray], np.ndarray],
     eps: float = 0.01,
     bias_window: tuple = (30.0, 80.0),
+    stitch_large_scale: bool = False,
+    emu=None,
+    P_lin_func: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    z: Optional[float] = None,
+    r_switch: float = 60.0,
+    gamma_eps: float = 0.02,
+    gamma_min_log10M: float = 12.0,
+    gamma_fallback: str = "linear_bias",
+    gamma_k_grid: Optional[np.ndarray] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Cheap post-processing: combine a cumulative-xi tabulation
@@ -387,7 +610,41 @@ def beta_nl_xi_from_tabulation(
 
     fixed = xi_hh_at_mass(threshold_result, log10M_targets, eps=eps)
     r = fixed["r"]
-    xi_hh = fixed["xi_hh"]
+    xi_hh_dir = fixed["xi_hh"]
+    xi_hh = xi_hh_dir.copy()
+
+    xi_tree = None
+    used_de = None
+    if stitch_large_scale:
+        if emu is None or P_lin_func is None or z is None:
+            raise ValueError(
+                "stitch_large_scale=True requires emu, P_lin_func, and z."
+            )
+        # Need a provisional bias for any low-mass linear-bias fallback;
+        # fit it from the un-stitched ξ_hh first, then refit after stitching.
+        r_mm_tmp, xi_mm_tmp = xi_mm_from_pk(P_nl_func)
+        good_tmp = (xi_mm_tmp > 0) & np.isfinite(xi_mm_tmp) & (r_mm_tmp > 0)
+        xi_mm_func_tmp = lambda rr: np.exp(np.interp(np.log(rr),
+                                                      np.log(r_mm_tmp[good_tmp]),
+                                                      np.log(xi_mm_tmp[good_tmp])))
+        K = len(log10M_targets)
+        b_provisional = np.full(K, np.nan)
+        for a in range(K):
+            b_provisional[a] = fit_bias_largescale(
+                r, xi_hh_dir[a, a, :], xi_mm_func_tmp,
+                r_min=bias_window[0], r_max=bias_window[1],
+            )
+
+        tree_res = compute_xi_tree(
+            emu=emu, P_lin_func=P_lin_func, z=float(z),
+            r_out=r, log10M_targets=log10M_targets,
+            eps=gamma_eps, k_grid=gamma_k_grid,
+            gamma_min_log10M=gamma_min_log10M, fallback=gamma_fallback,
+            b_hh=b_provisional,
+        )
+        xi_tree = tree_res["xi_tree"]
+        used_de = tree_res["used_de"]
+        xi_hh = stitch_xi_hh(r, xi_hh_dir, xi_tree, r_switch=r_switch)
 
     r_mm, xi_mm_grid = xi_mm_from_pk(P_nl_func)
     good = (xi_mm_grid > 0) & np.isfinite(xi_mm_grid) & (r_mm > 0)
@@ -414,10 +671,11 @@ def beta_nl_xi_from_tabulation(
             with np.errstate(invalid="ignore", divide="ignore"):
                 beta[a, b, :] = xi_hh[a, b, :] / (b_hh[a] * b_hh[b] * xi_mm) - 1.0
 
-    return {
+    out = {
         "r": r,
         "M_targets": fixed["M_targets"],
         "xi_hh": xi_hh,
+        "xi_hh_dir": xi_hh_dir,
         "xi_mm": xi_mm,
         "b_hh": b_hh,
         "beta_nl": beta,
@@ -425,7 +683,13 @@ def beta_nl_xi_from_tabulation(
         "N_above": np.asarray(threshold_result["N_above"]),
         "bias_window": np.asarray(bias_window),
         "eps": eps,
+        "stitched": bool(stitch_large_scale),
     }
+    if stitch_large_scale:
+        out["xi_tree"] = xi_tree
+        out["used_de_for_gamma"] = used_de
+        out["r_switch"] = float(r_switch)
+    return out
 
 
 def compute_beta_nl_xi(
@@ -441,6 +705,15 @@ def compute_beta_nl_xi(
     cache_path: Optional[str] = None,
     log10M_thresholds: Optional[Sequence[float]] = None,
     verbose: bool = True,
+    stitch_large_scale: bool = False,
+    emu=None,
+    P_lin_func: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+    z: Optional[float] = None,
+    r_switch: float = 60.0,
+    gamma_eps: float = 0.02,
+    gamma_min_log10M: float = 12.0,
+    gamma_fallback: str = "linear_bias",
+    gamma_k_grid: Optional[np.ndarray] = None,
 ) -> Dict[str, np.ndarray]:
     """
     Top-level driver: measure beta^NL(r, M_i, M_j) from a halo catalog at
@@ -480,6 +753,10 @@ def compute_beta_nl_xi(
     return beta_nl_xi_from_tabulation(
         thr_res, log10M_targets, P_nl_func,
         eps=eps, bias_window=bias_window,
+        stitch_large_scale=stitch_large_scale, emu=emu,
+        P_lin_func=P_lin_func, z=z, r_switch=r_switch,
+        gamma_eps=gamma_eps, gamma_min_log10M=gamma_min_log10M,
+        gamma_fallback=gamma_fallback, gamma_k_grid=gamma_k_grid,
     )
 
 
@@ -489,6 +766,9 @@ __all__ = [
     "thresholds_for_targets",
     "dense_thresholds",
     "tabulate_xi_hh_thresholds",
+    "gamma_h_at_mass_shells",
+    "compute_xi_tree",
+    "stitch_xi_hh",
     "beta_nl_xi_from_tabulation",
     "xi_mm_from_pk",
     "fit_bias_largescale",
