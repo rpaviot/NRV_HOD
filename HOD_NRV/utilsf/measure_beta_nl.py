@@ -16,7 +16,7 @@ from typing import Dict, Optional, Sequence
 
 import numpy as np
 
-from ..utilsf.measure_pk import PowerSpectrumEstimator
+from .measure_pk import PowerSpectrumEstimator
 
 
 FORCE_TO_ZERO_METHODS = ("none", "additive", "multiplicative", "exponential")
@@ -93,7 +93,7 @@ def measure_beta_nl_from_catalog(
 
     estimator = PowerSpectrumEstimator(Nmesh=Nmesh, Lbox=Lbox, threads=threads)
     if kbins is None:
-        from ..utilsf.measure_pk import log_kbins
+        from .measure_pk import log_kbins
         kbins = log_kbins(Lbox, Nmesh, n_bins=20)
 
     # Build delta_k per mass bin

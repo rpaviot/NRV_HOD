@@ -23,8 +23,13 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from HOD_NRV.HOD_analytical.pycosmo import Cosmology
-from HOD_NRV.HOD_analytical.measure_beta_nl import measure_beta_nl_from_catalog
-from HOD_NRV.HOD_analytical.measure_beta_nl_xi import compute_beta_nl_xi
+from HOD_NRV.utilsf.measure_beta_nl import measure_beta_nl_from_catalog
+from HOD_NRV.utilsf.measure_beta_nl_xi import (
+    beta_nl_xi_from_tabulation,
+    dense_thresholds,
+    tabulate_xi_hh_thresholds,
+    xi_mm_from_pk,
+)
 from HOD_NRV.utilsf.measure_pk import log_kbins
 from HOD_NRV.utilsf.data_reader import read_halo_catalog
 
@@ -93,7 +98,6 @@ def emulator_beta_nl_xi(cosmo, z, r, M1, M2, bias_window=(30.0, 80.0)):
     """beta^NL_xi(r, M1, M2, z) from emulator, same convention as the sim helper."""
     xi_hh = emulator_xi_hh_mass(cosmo, z, r, M1, M2)
     P_nl = lambda k: cosmo.nonlinear_power(np.asarray(k), z=z)
-    from HOD_NRV.HOD_analytical.measure_beta_nl_xi import xi_mm_from_pk
     r_grid, xi_mm_grid = xi_mm_from_pk(P_nl)
     good = (xi_mm_grid > 0) & np.isfinite(xi_mm_grid) & (r_grid > 0)
     xi_mm_at_r = np.exp(np.interp(np.log(r), np.log(r_grid[good]), np.log(xi_mm_grid[good])))
@@ -112,15 +116,36 @@ def emulator_beta_nl_xi(cosmo, z, r, M1, M2, bias_window=(30.0, 80.0)):
 
 
 def measure_one_xi(label, halo_path, log10M_targets, Lbox, P_nl_func,
-                   r_bins, eps, bias_window):
+                   r_bins, eps, bias_window, z, cache_dir,
+                   xi_logM_min, xi_logM_max, xi_step_dex):
     print(f"\n=== {label} (xi-space): {halo_path} ===")
     pos, log10M = load_halos(halo_path)
     print(f"  loaded {len(log10M)} halos, log10M in [{log10M.min():.2f}, {log10M.max():.2f}]")
-    return compute_beta_nl_xi(
+
+    log10M_thresholds = dense_thresholds(
+        log10M_min=xi_logM_min, log10M_max=xi_logM_max,
+        step_dex=xi_step_dex, eps=eps,
+    )
+
+    cache_path = None
+    if cache_dir is not None:
+        os.makedirs(cache_dir, exist_ok=True)
+        halo_basename = os.path.splitext(os.path.basename(halo_path))[0]
+        cache_path = os.path.join(
+            cache_dir,
+            f"xi_thr_{halo_basename}_z{z:.3f}_step{xi_step_dex:.3f}_eps{eps:.3f}.npz",
+        )
+
+    thr_res = tabulate_xi_hh_thresholds(
         halo_positions=pos, halo_log10M=log10M,
-        log10M_targets=log10M_targets, Lbox=Lbox,
-        P_nl_func=P_nl_func, r_bins=r_bins, eps=eps,
-        bias_window=bias_window, verbose=True,
+        log10M_thresholds=log10M_thresholds,
+        Lbox=Lbox, r_bins=r_bins,
+        cache_path=cache_path, verbose=True,
+    )
+
+    return beta_nl_xi_from_tabulation(
+        thr_res, log10M_targets, P_nl_func,
+        eps=eps, bias_window=bias_window,
     )
 
 
@@ -135,12 +160,14 @@ def run_real_space(args, cosmo, P_nl):
     if not args.skip_dmo:
         results["DMO"] = measure_one_xi(
             "DMO", args.dmo_path, log10M_targets, args.Lbox, P_nl,
-            r_bins, args.eps, bias_window,
+            r_bins, args.eps, bias_window, args.z, args.xi_cache_dir,
+            args.xi_logM_min, args.xi_logM_max, args.xi_step_dex,
         )
     if not args.skip_hydro:
         results["Hydro"] = measure_one_xi(
             "Hydro", args.hydro_path, log10M_targets, args.Lbox, P_nl,
-            r_bins, args.eps, bias_window,
+            r_bins, args.eps, bias_window, args.z, args.xi_cache_dir,
+            args.xi_logM_min, args.xi_logM_max, args.xi_step_dex,
         )
     if not results:
         print("Both DMO and Hydro skipped — nothing to do.")
@@ -225,6 +252,16 @@ def main():
     p.add_argument("--rbins_min", type=float, default=0.5)
     p.add_argument("--rbins_max", type=float, default=100.0)
     p.add_argument("--n_rbins", type=int, default=30)
+    p.add_argument("--xi_cache_dir", default=None,
+                   help="Real-space mode: directory to cache cumulative-xi "
+                        "tabulation. Re-runs with the same halo catalogue, "
+                        "z, step_dex and eps reuse it (cheap post-processing).")
+    p.add_argument("--xi_logM_min", type=float, default=11.0,
+                   help="Real-space mode: low edge of the dense log10M ladder.")
+    p.add_argument("--xi_logM_max", type=float, default=15.0,
+                   help="Real-space mode: high edge of the dense log10M ladder.")
+    p.add_argument("--xi_step_dex", type=float, default=0.05,
+                   help="Real-space mode: log10M ladder spacing (dex).")
     p.add_argument("--dmo_path", default=DEFAULT_DMO_HALO)
     p.add_argument("--hydro_path", default=DEFAULT_HYDRO_HALO)
     p.add_argument("--skip_dmo", action="store_true")

@@ -31,8 +31,11 @@ from typing import Callable, Dict, Optional, Sequence
 
 import numpy as np
 
+import hashlib
+import os
+
 from ..HOD_numerical.twopoint_calculator.standard_two_point_calculator import compute_corr
-from ..utilsf.hankel_transforms import Pk_to_xi_gg
+from .hankel_transforms import Pk_to_xi_gg
 
 
 def _select_above(halo_positions: np.ndarray,
@@ -202,6 +205,25 @@ def xi_hh_at_mass(
     }
 
 
+def dense_thresholds(log10M_min: float = 11.0,
+                     log10M_max: float = 15.0,
+                     step_dex: float = 0.05,
+                     eps: float = 0.01) -> np.ndarray:
+    """
+    Build a fixed log10M ladder over [log10M_min, log10M_max] at step_dex
+    spacing, with ±log10(1±eps) shells around each rung. Sorted/deduped.
+    Once tabulated, any target mass on the ladder reuses the cache.
+    """
+    n_rungs = int(np.round((log10M_max - log10M_min) / step_dex)) + 1
+    rungs = np.linspace(log10M_min, log10M_max, n_rungs)
+    out = []
+    for lM in rungs:
+        out.append(lM + np.log10(1.0 - eps))
+        out.append(lM + np.log10(1.0 + eps))
+    arr = np.unique(np.round(np.asarray(out, dtype=np.float64), 8))
+    return np.sort(arr)
+
+
 def thresholds_for_targets(log10M_targets: Sequence[float],
                            eps: float = 0.01) -> np.ndarray:
     """
@@ -261,6 +283,151 @@ def fit_bias_largescale(r: np.ndarray, xi_hh: np.ndarray,
     return float(np.sqrt(np.mean(ratio)))
 
 
+def tabulate_xi_hh_thresholds(
+    halo_positions: np.ndarray,
+    halo_log10M: np.ndarray,
+    log10M_thresholds: Sequence[float],
+    Lbox: float,
+    r_bins: np.ndarray,
+    cache_path: Optional[str] = None,
+    los: str = "z",
+    verbose: bool = True,
+) -> Dict[str, np.ndarray]:
+    """
+    Compute (or load from disk) the cumulative-xi tabulation
+    xi_hh(>M_a, >M_b, r) for every pair of mass thresholds.
+
+    The pycorr stage is the dominant cost in the xi-space pipeline.
+    Caching this output lets subsequent target-mass / eps / bias-window
+    sweeps reuse it for free.
+
+    Cache key: (Lbox, r_bins, log10M_thresholds, los, sha1 of halo
+    positions+log10M). If the NPZ at `cache_path` already exists with
+    matching metadata, it is loaded; else it is computed and saved.
+    """
+    log10M_thresholds = np.asarray(log10M_thresholds, dtype=np.float64)
+    r_bins = np.asarray(r_bins, dtype=np.float64)
+
+    h = hashlib.sha1()
+    h.update(np.ascontiguousarray(halo_positions, dtype=np.float64).tobytes())
+    h.update(np.ascontiguousarray(halo_log10M, dtype=np.float64).tobytes())
+    catalog_sha = h.hexdigest()
+
+    if cache_path is not None and os.path.exists(cache_path):
+        try:
+            d = np.load(cache_path, allow_pickle=False)
+            ok = (
+                float(d["Lbox"]) == float(Lbox)
+                and str(d["los"]) == str(los)
+                and d["log10M_th"].shape == log10M_thresholds.shape
+                and np.allclose(d["log10M_th"], log10M_thresholds)
+                and d["r_bins"].shape == r_bins.shape
+                and np.allclose(d["r_bins"], r_bins)
+                and str(d["catalog_sha"]) == catalog_sha
+            )
+            if ok:
+                if verbose:
+                    print(f"[tabulate_xi_hh_thresholds] cache hit: {cache_path}")
+                return {
+                    "r": d["r"],
+                    "log10M_th": d["log10M_th"],
+                    "N_above": d["N_above"],
+                    "xi": d["xi"],
+                }
+            if verbose:
+                print(f"[tabulate_xi_hh_thresholds] cache mismatch, recomputing: {cache_path}")
+        except Exception as e:
+            if verbose:
+                print(f"[tabulate_xi_hh_thresholds] cache load failed ({e}), recomputing")
+
+    res = measure_xi_hh_thresholds(
+        halo_positions, halo_log10M, log10M_thresholds, Lbox, r_bins,
+        los=los, verbose=verbose,
+    )
+
+    if cache_path is not None:
+        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+        np.savez(
+            cache_path,
+            r=res["r"], log10M_th=res["log10M_th"],
+            N_above=res["N_above"], xi=res["xi"],
+            r_bins=r_bins, Lbox=float(Lbox), los=str(los),
+            catalog_sha=catalog_sha,
+        )
+        if verbose:
+            print(f"[tabulate_xi_hh_thresholds] saved cache: {cache_path}")
+    return res
+
+
+def beta_nl_xi_from_tabulation(
+    threshold_result: Dict[str, np.ndarray],
+    log10M_targets: Sequence[float],
+    P_nl_func: Callable[[np.ndarray], np.ndarray],
+    eps: float = 0.01,
+    bias_window: tuple = (30.0, 80.0),
+) -> Dict[str, np.ndarray]:
+    """
+    Cheap post-processing: combine a cumulative-xi tabulation
+    (output of `tabulate_xi_hh_thresholds`) with a target mass set,
+    eps, and a P_nl callable to produce beta^NL(r, M_i, M_j).
+
+    Returns the same dict shape as `compute_beta_nl_xi`.
+    """
+    log10M_targets = np.asarray(log10M_targets, dtype=np.float64)
+    log10M_th = threshold_result["log10M_th"]
+
+    # Sanity: target masses should lie close to the tabulated ladder.
+    for lM in log10M_targets:
+        nearest = log10M_th[np.argmin(np.abs(log10M_th - (lM + np.log10(1.0 - eps))))]
+        if abs(nearest - (lM + np.log10(1.0 - eps))) > 0.5 * (
+            np.diff(log10M_th).min() if len(log10M_th) > 1 else 0.0
+        ) + 1e-6:
+            print(f"[beta_nl_xi_from_tabulation] warning: target log10M={lM:.3f} "
+                  f"not on tabulated ladder; snapping to nearest threshold.")
+
+    fixed = xi_hh_at_mass(threshold_result, log10M_targets, eps=eps)
+    r = fixed["r"]
+    xi_hh = fixed["xi_hh"]
+
+    r_mm, xi_mm_grid = xi_mm_from_pk(P_nl_func)
+    good = (xi_mm_grid > 0) & np.isfinite(xi_mm_grid) & (r_mm > 0)
+    xi_mm = np.exp(np.interp(np.log(r), np.log(r_mm[good]),
+                              np.log(xi_mm_grid[good])))
+    xi_mm_func = lambda rr: np.exp(np.interp(np.log(rr),
+                                              np.log(r_mm[good]),
+                                              np.log(xi_mm_grid[good])))
+
+    K = len(log10M_targets)
+    b_hh = np.full(K, np.nan)
+    for a in range(K):
+        b_hh[a] = fit_bias_largescale(r, xi_hh[a, a, :], xi_mm_func,
+                                       r_min=bias_window[0],
+                                       r_max=bias_window[1])
+
+    beta = np.full_like(xi_hh, np.nan)
+    for a in range(K):
+        if not np.isfinite(b_hh[a]):
+            continue
+        for b in range(K):
+            if not np.isfinite(b_hh[b]):
+                continue
+            with np.errstate(invalid="ignore", divide="ignore"):
+                beta[a, b, :] = xi_hh[a, b, :] / (b_hh[a] * b_hh[b] * xi_mm) - 1.0
+
+    return {
+        "r": r,
+        "M_targets": fixed["M_targets"],
+        "xi_hh": xi_hh,
+        "xi_mm": xi_mm,
+        "b_hh": b_hh,
+        "beta_nl": beta,
+        "thresholds": np.asarray(log10M_th),
+        "N_above": np.asarray(threshold_result["N_above"]),
+        "bias_window": np.asarray(bias_window),
+        "eps": eps,
+    }
+
+
 def compute_beta_nl_xi(
     halo_positions: np.ndarray,
     halo_log10M: np.ndarray,
@@ -271,6 +438,8 @@ def compute_beta_nl_xi(
     eps: float = 0.01,
     bias_window: tuple = (30.0, 80.0),
     los: str = "z",
+    cache_path: Optional[str] = None,
+    log10M_thresholds: Optional[Sequence[float]] = None,
     verbose: bool = True,
 ) -> Dict[str, np.ndarray]:
     """
@@ -295,67 +464,32 @@ def compute_beta_nl_xi(
 
     log10M_targets = np.asarray(log10M_targets, dtype=np.float64)
 
-    # 1. Thresholds + halo subsample xi
-    thresholds = thresholds_for_targets(log10M_targets, eps=eps)
+    if log10M_thresholds is None:
+        log10M_thresholds = thresholds_for_targets(log10M_targets, eps=eps)
+    log10M_thresholds = np.asarray(log10M_thresholds, dtype=np.float64)
+
     if verbose:
-        print(f"[beta_nl_xi] {len(thresholds)} thresholds for {len(log10M_targets)} targets")
-    thr_res = measure_xi_hh_thresholds(
-        halo_positions, halo_log10M, thresholds, Lbox, r_bins,
-        los=los, verbose=verbose,
+        print(f"[beta_nl_xi] {len(log10M_thresholds)} thresholds "
+              f"for {len(log10M_targets)} targets")
+
+    thr_res = tabulate_xi_hh_thresholds(
+        halo_positions, halo_log10M, log10M_thresholds, Lbox, r_bins,
+        cache_path=cache_path, los=los, verbose=verbose,
     )
 
-    # 2. Four-corner combination -> delta-mass xi_hh
-    fixed = xi_hh_at_mass(thr_res, log10M_targets, eps=eps)
-    r = fixed["r"]
-    xi_hh = fixed["xi_hh"]
-
-    # 3. Matter xi from P_nl
-    r_mm, xi_mm_grid = xi_mm_from_pk(P_nl_func)
-    # Interpolate xi_mm to the r grid of the measurement (log-log linear).
-    good = (xi_mm_grid > 0) & np.isfinite(xi_mm_grid) & (r_mm > 0)
-    xi_mm = np.exp(np.interp(np.log(r), np.log(r_mm[good]),
-                              np.log(xi_mm_grid[good])))
-    xi_mm_func = lambda rr: np.exp(np.interp(np.log(rr),
-                                              np.log(r_mm[good]),
-                                              np.log(xi_mm_grid[good])))
-
-    # 4. Bias per target from large-scale ratio of the autocorrelations.
-    K = len(log10M_targets)
-    b_hh = np.full(K, np.nan)
-    for a in range(K):
-        b_hh[a] = fit_bias_largescale(r, xi_hh[a, a, :], xi_mm_func,
-                                       r_min=bias_window[0],
-                                       r_max=bias_window[1])
-
-    # 5. beta^NL(r, M_i, M_j)
-    beta = np.full_like(xi_hh, np.nan)
-    for a in range(K):
-        if not np.isfinite(b_hh[a]):
-            continue
-        for b in range(K):
-            if not np.isfinite(b_hh[b]):
-                continue
-            with np.errstate(invalid="ignore", divide="ignore"):
-                beta[a, b, :] = xi_hh[a, b, :] / (b_hh[a] * b_hh[b] * xi_mm) - 1.0
-
-    return {
-        "r": r,
-        "M_targets": fixed["M_targets"],
-        "xi_hh": xi_hh,
-        "xi_mm": xi_mm,
-        "b_hh": b_hh,
-        "beta_nl": beta,
-        "thresholds": thresholds,
-        "N_above": thr_res["N_above"],
-        "bias_window": np.asarray(bias_window),
-        "eps": eps,
-    }
+    return beta_nl_xi_from_tabulation(
+        thr_res, log10M_targets, P_nl_func,
+        eps=eps, bias_window=bias_window,
+    )
 
 
 __all__ = [
     "measure_xi_hh_thresholds",
     "xi_hh_at_mass",
     "thresholds_for_targets",
+    "dense_thresholds",
+    "tabulate_xi_hh_thresholds",
+    "beta_nl_xi_from_tabulation",
     "xi_mm_from_pk",
     "fit_bias_largescale",
     "compute_beta_nl_xi",
