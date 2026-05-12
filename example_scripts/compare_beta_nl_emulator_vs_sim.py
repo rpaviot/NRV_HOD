@@ -1,31 +1,31 @@
 """
-Compare Dark Emulator beta^NL against beta^NL measured directly from
-Flamingo DMO and Hydro halo catalogs.
+Compare Dark Emulator beta^NL against beta^NL measured from Flamingo DMO
+and Hydro halo catalogs.
 
-The measured curves use the same conventions as
-`HOD_NRV.HOD_analytical.emu.BetaNLInterpolator`:
-  - halo-halo bias at k_lin = 0.02 h/Mpc
-  - additive force-to-zero correction
-so the two are directly comparable in (k, M1, M2, z).
+Two measurement paths, both directly comparable to
+`HOD_NRV.HOD_analytical.emu.BetaNLInterpolator` (halo-halo bias at
+k_lin = 0.02 h/Mpc, additive force-to-zero):
+
+  fourier : direct P-space measurement via `measure_beta_nl_from_catalog`
+            (TSC grid + interlacing). Wide log10M bins.
+  xi2k    : stitched threshold ξ_hh from precompute_xi_tree_grid.py →
+            four-corner FD → DE-style fftlog xi2pk → P_hh(k, M_i, M_j) →
+            β^NL(k). Delta-mass; extends below 1e12 M_sun/h.
 
 Usage
 -----
-Fourier (legacy P-space):
+Fourier:
     python compare_beta_nl_emulator_vs_sim.py \
-        --z 1.0 --Lbox 681 --Nmesh 512 \
+        --space fourier --z 1.0 --Lbox 681 --Nmesh 512 \
         --logM_edges 12.5 13.0 13.5 14.0 14.5 \
         --output_dir beta_nl_validation
 
-Real-space, consuming a precomputed threshold ξ grid (recommended):
+xi2k (consumes a stitched threshold ξ grid):
     python compare_beta_nl_emulator_vs_sim.py \
-        --space real --z 1.0 --Lbox 681 \
+        --space xi2k --z 1.0 \
         --xi_grid_path_dmo /sps/.../xihh_threshold.npz \
         --logM_targets 11.5 12.0 12.5 13.0 13.5 14.0 \
         --eps 0.02 --skip_hydro --output_dir beta_nl_validation
-
-Stitching (small-scale pycorr + large-scale Γ_h) lives in
-`precompute_xi_tree_grid.py`. This script only does the four-corner FD
-and the β^NL math.
 """
 
 import argparse
@@ -37,11 +37,8 @@ import matplotlib.pyplot as plt
 from HOD_NRV.HOD_analytical.pycosmo import Cosmology
 from HOD_NRV.utilsf.measure_beta_nl import measure_beta_nl_from_catalog
 from HOD_NRV.utilsf.measure_beta_nl_xi import (
-    beta_nl_xi_from_tabulation,
-    dense_thresholds,
+    beta_nl_k_from_tabulation,
     load_xi_threshold_grid,
-    tabulate_xi_hh_thresholds,
-    xi_mm_from_pk,
 )
 from HOD_NRV.utilsf.measure_pk import log_kbins
 from HOD_NRV.utilsf.data_reader import read_halo_catalog
@@ -102,155 +99,113 @@ def emulator_beta_nl(cosmo, z, k, M1, M2):
     return np.asarray(interp(np.asarray(k), float(M1), float(M2), z=float(z)))
 
 
-def emulator_xi_hh_mass(cosmo, z, r, M1, M2):
-    """xi_hh(r, M1, M2, z) from Dark Emulator (delta-mass, four-corner FD)."""
-    return np.asarray(cosmo.emu.get_xiauto_mass(np.asarray(r), float(M1), float(M2), float(z)))
+def emulator_phh_mass(cosmo, z, k, M1, M2):
+    """P_hh(k, M1, M2, z) from Dark Emulator (delta-mass, four-corner FD)."""
+    return np.asarray(cosmo.emu.get_phh_mass(np.asarray(k), float(M1), float(M2), float(z)))
 
 
-def emulator_beta_nl_xi(cosmo, z, r, M1, M2, bias_window=(30.0, 80.0)):
-    """beta^NL_xi(r, M1, M2, z) from emulator, same convention as the sim helper."""
-    xi_hh = emulator_xi_hh_mass(cosmo, z, r, M1, M2)
-    P_nl = lambda k: cosmo.nonlinear_power(np.asarray(k), z=z)
-    r_grid, xi_mm_grid = xi_mm_from_pk(P_nl)
-    good = (xi_mm_grid > 0) & np.isfinite(xi_mm_grid) & (r_grid > 0)
-    xi_mm_at_r = np.exp(np.interp(np.log(r), np.log(r_grid[good]), np.log(xi_mm_grid[good])))
-    # bias for each mass via large-scale auto
-    def b_for(M):
-        xi_aa = emulator_xi_hh_mass(cosmo, z, r, M, M)
-        sel = (r >= bias_window[0]) & (r <= bias_window[1]) & (xi_aa > 0) & np.isfinite(xi_aa)
-        if sel.sum() < 2:
-            return np.nan
-        ratio = xi_aa[sel] / xi_mm_at_r[sel]
-        if np.any(ratio <= 0):
-            return np.nan
-        return float(np.sqrt(np.mean(ratio)))
-    b1, b2 = b_for(M1), b_for(M2)
-    return xi_hh / (b1 * b2 * xi_mm_at_r) - 1.0
-
-
-def measure_one_xi(label, halo_path, log10M_targets, Lbox, P_nl_func,
-                   r_bins, eps, bias_window, z, cache_dir,
-                   xi_logM_min, xi_logM_max, xi_step_dex,
-                   xi_grid_path=None):
-    """β^NL_ξ from a pre-stitched threshold grid (xi_grid_path) when
-    available, else from a fresh pycorr tabulation. Stitching is owned
-    by precompute_xi_tree_grid.py — this function only does the FD."""
-    if xi_grid_path is not None:
-        print(f"\n=== {label} (xi-space, from grid): {xi_grid_path} ===")
-        thr_res = load_xi_threshold_grid(xi_grid_path)
-    else:
-        print(f"\n=== {label} (xi-space): {halo_path} ===")
-        pos, log10M = load_halos(halo_path)
-        print(f"  loaded {len(log10M)} halos, log10M in "
-              f"[{log10M.min():.2f}, {log10M.max():.2f}]")
-
-        log10M_thresholds = dense_thresholds(
-            log10M_min=xi_logM_min, log10M_max=xi_logM_max,
-            step_dex=xi_step_dex, eps=eps,
-        )
-
-        cache_path = None
-        if cache_dir is not None:
-            os.makedirs(cache_dir, exist_ok=True)
-            halo_basename = os.path.splitext(os.path.basename(halo_path))[0]
-            cache_path = os.path.join(
-                cache_dir,
-                f"xi_thr_{halo_basename}_z{z:.3f}_"
-                f"step{xi_step_dex:.3f}_eps{eps:.3f}.npz",
-            )
-
-        thr_res = tabulate_xi_hh_thresholds(
-            halo_positions=pos, halo_log10M=log10M,
-            log10M_thresholds=log10M_thresholds,
-            Lbox=Lbox, r_bins=r_bins,
-            cache_path=cache_path, verbose=True,
-        )
-
-    return beta_nl_xi_from_tabulation(
-        thr_res, log10M_targets, P_nl_func,
-        eps=eps, bias_window=bias_window,
-    )
-
-
-def run_real_space(args, cosmo, P_nl):
-    """xi-space comparison: emulator and sim both at delta-mass via four-corner FD."""
+def run_xi2k_space(args, cosmo, P_lin):
+    """
+    Stitched threshold ξ_hh → FD → fftlog xi2pk → β^NL(k) and P_hh(k),
+    compared against `BetaNLInterpolator` and `emu.get_phh_mass`.
+    """
     log10M_targets = np.asarray(args.logM_targets, dtype=np.float64)
-    r_bins = np.logspace(np.log10(args.rbins_min), np.log10(args.rbins_max),
-                         args.n_rbins + 1)
-    bias_window = (args.bias_rmin, args.bias_rmax)
+    k_out = np.logspace(np.log10(args.k_min), np.log10(args.k_max), args.n_k)
 
     results = {}
     if not args.skip_dmo:
-        results["DMO"] = measure_one_xi(
-            "DMO", args.dmo_path, log10M_targets, args.Lbox, P_nl,
-            r_bins, args.eps, bias_window, args.z, args.xi_cache_dir,
-            args.xi_logM_min, args.xi_logM_max, args.xi_step_dex,
-            xi_grid_path=args.xi_grid_path_dmo,
+        print(f"\n=== DMO (xi2k, from grid): {args.xi_grid_path_dmo} ===")
+        thr_res = load_xi_threshold_grid(args.xi_grid_path_dmo)
+        results["DMO"] = beta_nl_k_from_tabulation(
+            thr_res, log10M_targets, P_lin,
+            k_out=k_out, eps=args.eps,
+            k_lin=args.k_lin, force_to_zero="additive",
         )
     if not args.skip_hydro:
-        results["Hydro"] = measure_one_xi(
-            "Hydro", args.hydro_path, log10M_targets, args.Lbox, P_nl,
-            r_bins, args.eps, bias_window, args.z, args.xi_cache_dir,
-            args.xi_logM_min, args.xi_logM_max, args.xi_step_dex,
-            xi_grid_path=args.xi_grid_path_hydro,
+        print(f"\n=== Hydro (xi2k, from grid): {args.xi_grid_path_hydro} ===")
+        thr_res = load_xi_threshold_grid(args.xi_grid_path_hydro)
+        results["Hydro"] = beta_nl_k_from_tabulation(
+            thr_res, log10M_targets, P_lin,
+            k_out=k_out, eps=args.eps,
+            k_lin=args.k_lin, force_to_zero="additive",
         )
     if not results:
         print("Both DMO and Hydro skipped — nothing to do.")
         return
 
-    # Save raw arrays
-    out_npz = os.path.join(args.output_dir, "beta_nl_xi_measured.npz")
+    out_npz = os.path.join(args.output_dir, "beta_nl_xi2k_measured.npz")
     save_dict = {"logM_targets": log10M_targets, "z": args.z,
-                 "Lbox": args.Lbox, "eps": args.eps,
-                 "bias_window": np.asarray(bias_window)}
+                 "Lbox": args.Lbox, "eps": args.eps, "k_lin": args.k_lin}
     for label, res in results.items():
-        for key in ("r", "M_targets", "xi_hh", "xi_mm", "b_hh",
-                     "beta_nl", "thresholds", "N_above"):
+        for key in ("k", "M_targets", "P_hh", "P_lin", "b_hh", "beta_nl"):
             save_dict[f"{label}_{key}"] = res[key]
     np.savez(out_npz, **save_dict)
-    print(f"\nSaved xi-space measurements to {out_npz}")
+    print(f"\nSaved xi2k measurements to {out_npz}")
 
-    # Emulator beta^NL_xi at the same r and target masses (only above 1e12)
-    r = next(iter(results.values()))["r"]
+    # Emulator predictions at the same (k, M_targets); only above 1e12 M_sun/h
     M_targets = next(iter(results.values()))["M_targets"]
+    k_meas = next(iter(results.values()))["k"]
     K = len(M_targets)
-    emu_beta = np.full((K, K, len(r)), np.nan)
+    cosmo.compute_beta_nl([args.z])
+    emu_beta = np.full((K, K, len(k_meas)), np.nan)
+    emu_phh = np.full((K, K, len(k_meas)), np.nan)
     for i, M1 in enumerate(M_targets):
         for j, M2 in enumerate(M_targets):
             if M1 < 1e12 or M2 < 1e12:
-                continue  # emulator unreliable below 1e12
+                continue
             try:
-                emu_beta[i, j, :] = emulator_beta_nl_xi(cosmo, args.z, r, M1, M2,
-                                                        bias_window=bias_window)
+                emu_beta[i, j, :] = emulator_beta_nl(cosmo, args.z, k_meas, M1, M2)
+                emu_phh[i, j, :] = emulator_phh_mass(cosmo, args.z, k_meas, M1, M2)
             except Exception as e:
-                print(f"  emu beta_nl_xi failed at log10(M1,M2)="
+                print(f"  emu failed at log10(M1,M2)="
                       f"({np.log10(M1):.2f}, {np.log10(M2):.2f}): {e}")
 
     pair_idx = [(0, 0), (0, K - 1), (K - 1, K - 1)]
+
+    # β^NL(k) figure
     fig, axes = plt.subplots(len(pair_idx), len(results),
                              figsize=(5 * len(results), 3.5 * len(pair_idx)),
                              sharex=True, squeeze=False)
     for col, (label, res) in enumerate(results.items()):
         for row, (i, j) in enumerate(pair_idx):
             ax = axes[row, col]
-            beta_meas = res["beta_nl"][i, j, :]
-            beta_emu = emu_beta[i, j, :]
-            ax.semilogx(r, beta_meas, "o", ms=4, label="measured")
-            if np.any(np.isfinite(beta_emu)):
-                ax.semilogx(r, beta_emu, "-", lw=1.6, label="Dark Emulator")
+            ax.semilogx(k_meas, res["beta_nl"][i, j, :], "o", ms=4, label="measured")
+            if np.any(np.isfinite(emu_beta[i, j, :])):
+                ax.semilogx(k_meas, emu_beta[i, j, :], "-", lw=1.6, label="Dark Emulator")
             ax.axhline(0, color="gray", lw=0.6)
             ax.set_title(f"{label}: log10(M1, M2) = "
                          f"({np.log10(M_targets[i]):.2f}, {np.log10(M_targets[j]):.2f})")
-            ax.set_ylabel(r"$\beta^{\rm NL}_\xi$")
+            ax.set_ylabel(r"$\beta^{\rm NL}(k)$")
             if row == len(pair_idx) - 1:
-                ax.set_xlabel(r"$r$ [Mpc/$h$]")
+                ax.set_xlabel(r"$k$ [$h$/Mpc]")
             if row == 0 and col == 0:
                 ax.legend(fontsize=8)
-
     fig.tight_layout()
-    out_png = os.path.join(args.output_dir, "beta_nl_xi_emulator_vs_sim.png")
+    out_png = os.path.join(args.output_dir, "beta_nl_xi2k_emulator_vs_sim.png")
     fig.savefig(out_png, dpi=140)
-    print(f"Saved figure to {out_png}")
+    print(f"Saved β^NL figure to {out_png}")
+
+    # P_hh(k) figure (log-log)
+    fig, axes = plt.subplots(len(pair_idx), len(results),
+                             figsize=(5 * len(results), 3.5 * len(pair_idx)),
+                             sharex=True, squeeze=False)
+    for col, (label, res) in enumerate(results.items()):
+        for row, (i, j) in enumerate(pair_idx):
+            ax = axes[row, col]
+            ax.loglog(k_meas, res["P_hh"][i, j, :], "o", ms=4, label="measured")
+            if np.any(np.isfinite(emu_phh[i, j, :])):
+                ax.loglog(k_meas, emu_phh[i, j, :], "-", lw=1.6, label="Dark Emulator")
+            ax.set_title(f"{label}: log10(M1, M2) = "
+                         f"({np.log10(M_targets[i]):.2f}, {np.log10(M_targets[j]):.2f})")
+            ax.set_ylabel(r"$P_{hh}(k)$ [(Mpc/$h$)$^3$]")
+            if row == len(pair_idx) - 1:
+                ax.set_xlabel(r"$k$ [$h$/Mpc]")
+            if row == 0 and col == 0:
+                ax.legend(fontsize=8)
+    fig.tight_layout()
+    out_png = os.path.join(args.output_dir, "P_hh_xi2k_emulator_vs_sim.png")
+    fig.savefig(out_png, dpi=140)
+    print(f"Saved P_hh figure to {out_png}")
 
 
 def main():
@@ -263,36 +218,27 @@ def main():
     p.add_argument("--n_kbins", type=int, default=20)
     p.add_argument("--logM_edges", type=float, nargs="+",
                    default=[12.5, 13.0, 13.5, 14.0, 14.5])
-    p.add_argument("--space", choices=["fourier", "real"], default="fourier",
-                   help="fourier: legacy P-space comparison with wide log10M bins. "
-                        "real: xi-space comparison using delta-mass four-corner FD "
-                        "(matches Dark Emulator convention; required for M < 1e12).")
+    p.add_argument("--space", choices=["fourier", "xi2k"], default="fourier",
+                   help="fourier: direct P-space measurement with wide log10M bins. "
+                        "xi2k: stitched threshold ξ_hh → FD → fftlog xi2pk → β^NL(k) "
+                        "(matches Dark Emulator convention; extends below 1e12 M_sun/h).")
     p.add_argument("--logM_targets", type=float, nargs="+",
-                   default=[12.5, 13.0, 13.5, 14.0],
-                   help="Real-space mode: target masses for xi_hh(M1, M2).")
-    p.add_argument("--eps", type=float, default=0.01,
-                   help="Real-space mode: finite-difference step (matches DE's 0.01).")
-    p.add_argument("--bias_rmin", type=float, default=30.0)
-    p.add_argument("--bias_rmax", type=float, default=80.0)
-    p.add_argument("--rbins_min", type=float, default=0.5)
-    p.add_argument("--rbins_max", type=float, default=100.0)
-    p.add_argument("--n_rbins", type=int, default=30)
+                   default=[12.0, 12.5, 13.0, 13.5, 14.0],
+                   help="xi2k mode: delta-mass targets for xi_hh(M1, M2).")
+    p.add_argument("--eps", type=float, default=0.02,
+                   help="xi2k mode: four-corner FD step. Must match the "
+                        "--eps used by precompute_xi_tree_grid.py.")
+    p.add_argument("--k_min", type=float, default=1e-2,
+                   help="xi2k mode: minimum k for output (h/Mpc).")
+    p.add_argument("--k_max", type=float, default=10.0,
+                   help="xi2k mode: maximum k for output (h/Mpc).")
+    p.add_argument("--n_k", type=int, default=100,
+                   help="xi2k mode: number of k samples (log-spaced).")
     p.add_argument("--xi_grid_path_dmo", default=None,
-                   help="Real-space mode: path to a pre-stitched threshold "
-                        "ξ_hh .npz (from precompute_xi_tree_grid.py) for "
-                        "DMO. If given, skips pair-counting entirely.")
+                   help="xi2k mode: path to a pre-stitched threshold ξ_hh "
+                        ".npz (from precompute_xi_tree_grid.py) for DMO.")
     p.add_argument("--xi_grid_path_hydro", default=None,
                    help="Same as --xi_grid_path_dmo but for the Hydro run.")
-    p.add_argument("--xi_cache_dir", default=None,
-                   help="Real-space mode (legacy fresh-tabulation path only): "
-                        "directory to cache the pycorr threshold tabulation. "
-                        "Ignored when --xi_grid_path_* is set.")
-    p.add_argument("--xi_logM_min", type=float, default=11.0,
-                   help="Legacy path: low edge of the dense log10M ladder.")
-    p.add_argument("--xi_logM_max", type=float, default=15.0,
-                   help="Legacy path: high edge of the dense log10M ladder.")
-    p.add_argument("--xi_step_dex", type=float, default=0.05,
-                   help="Legacy path: log10M ladder spacing (dex).")
     p.add_argument("--dmo_path", default=DEFAULT_DMO_HALO)
     p.add_argument("--hydro_path", default=DEFAULT_HYDRO_HALO)
     p.add_argument("--skip_dmo", action="store_true")
@@ -311,10 +257,9 @@ def main():
         verbose=True,
     )
     P_lin = lambda k: cosmo.linear_power(np.asarray(k), z=args.z)
-    P_nl = lambda k: cosmo.nonlinear_power(np.asarray(k), z=args.z)
 
-    if args.space == "real":
-        run_real_space(args, cosmo, P_nl)
+    if args.space == "xi2k":
+        run_xi2k_space(args, cosmo, P_lin)
         return
 
     kbins = log_kbins(args.Lbox, args.Nmesh, n_bins=args.n_kbins)

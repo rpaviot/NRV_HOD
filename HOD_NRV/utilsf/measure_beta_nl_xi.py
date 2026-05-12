@@ -858,8 +858,6 @@ def xi_hh_to_Pk_hh(
     xi_hh = np.asarray(xi_hh, dtype=np.float64)
     assert xi_hh.shape[-1] == r.size, "trailing axis of xi_hh must match r"
 
-    r_int = np.logspace(np.log10(r.min()), np.log10(r.max()), n_int)
-
     lead_shape = xi_hh.shape[:-1]
     xi_flat = xi_hh.reshape(-1, r.size)
     n_slices = xi_flat.shape[0]
@@ -869,13 +867,22 @@ def xi_hh_to_Pk_hh(
 
     for s in range(n_slices):
         xi_s = xi_flat[s]
-        if not np.all(np.isfinite(xi_s)):
+        finite = np.isfinite(xi_s)
+        # Skip slices where the FD produced no usable values (e.g. dN=0 rows
+        # because the target log10M isn't on the threshold ladder).
+        if finite.sum() < 4:
             Pk_list.append(None)
             continue
 
-        # cubic spline in log r; ξ can be negative around BAO, so spline on
-        # the value (not log(xi)).
-        cs = CubicSpline(np.log(r), xi_s, extrapolate=False)
+        # Build a uniform log-r grid that lies *inside* the finite support of
+        # this slice. fftlog then handles all extension to small/large r
+        # via its log-linear N_extrap_* padding (DE convention). ξ can be
+        # negative around BAO so spline on the value (not log ξ); isolated
+        # NaN bins inside the finite range are bridged by the spline.
+        r_fin = r[finite]
+        xi_fin = xi_s[finite]
+        r_int = np.logspace(np.log10(r_fin.min()), np.log10(r_fin.max()), n_int)
+        cs = CubicSpline(np.log(r_fin), xi_fin, extrapolate=False)
         xi_int = cs(np.log(r_int))
 
         k_s, Pk_s = _fftlog.xi2pk(
@@ -883,10 +890,31 @@ def xi_hh_to_Pk_hh(
             N_extrap_low=N_extrap_low,
             N_extrap_high=N_extrap_high,
         )
+        # Each slice has its own native k grid (different r support → different
+        # k extent). To keep a single (k, P) array across slices, interpolate
+        # each onto a common grid built from the first valid slice.
         if k_out_native is None:
             k_out_native = np.asarray(k_s)
-        Pk_list.append(np.asarray(Pk_s))
+            Pk_list.append(np.asarray(Pk_s))
+        else:
+            k_s = np.asarray(k_s); Pk_s = np.asarray(Pk_s)
+            log_k0 = np.log(k_out_native)
+            log_ks = np.log(k_s)
+            good = np.isfinite(Pk_s) & (Pk_s > 0)
+            if good.sum() < 4:
+                Pk_list.append(np.interp(log_k0, log_ks, Pk_s))
+            else:
+                Pk_list.append(np.exp(np.interp(log_k0, log_ks[good],
+                                                 np.log(Pk_s[good]))))
 
+    if k_out_native is None:
+        raise ValueError(
+            "xi_hh_to_Pk_hh: every (M_i, M_j) slice of xi_hh is non-finite. "
+            "The four-corner FD upstream produced no valid output — typically "
+            "because the target log10M values don't lie on the threshold "
+            "ladder of the precomputed grid (so (1±eps)·M snaps to the same "
+            "ladder rung and dN = 0)."
+        )
     n_k_native = k_out_native.size
     Pk_arr = np.full((n_slices, n_k_native), np.nan)
     for s, Pk in enumerate(Pk_list):
@@ -1001,7 +1029,7 @@ def beta_nl_k_from_tabulation(
         # resample P_hh onto k_out (positive log-log when feasible)
         _, P_hh = xi_hh_to_Pk_hh(
             r, xi_hh, k_out=k,
-            r_pad=r_pad, n_pad=n_pad,
+            n_int=n_int,
             N_extrap_low=N_extrap_low, N_extrap_high=N_extrap_high,
             fftlog_nu=fftlog_nu,
         )
@@ -1017,7 +1045,7 @@ def beta_nl_k_from_tabulation(
         # need P_hh exactly at k_lin (independent of user k grid)
         _, P_hh_at_klin = xi_hh_to_Pk_hh(
             r, xi_hh, k_out=np.array([k_lin]),
-            r_pad=r_pad, n_pad=n_pad,
+            n_int=n_int,
             N_extrap_low=N_extrap_low, N_extrap_high=N_extrap_high,
             fftlog_nu=fftlog_nu,
         )
