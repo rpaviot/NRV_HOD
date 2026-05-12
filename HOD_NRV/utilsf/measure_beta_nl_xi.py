@@ -657,23 +657,21 @@ def beta_nl_xi_from_tabulation(
     P_nl_func: Callable[[np.ndarray], np.ndarray],
     eps: float = 0.01,
     bias_window: tuple = (30.0, 80.0),
-    stitch_large_scale: bool = False,
-    emu=None,
-    P_lin_func: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-    z: Optional[float] = None,
-    r_switch: float = 60.0,
-    gamma_eps: float = 0.02,
-    gamma_min_log10M: float = 12.0,
-    gamma_fallback: str = "linear_bias",
-    gamma_k_grid: Optional[np.ndarray] = None,
-    xi_tree_grid_path: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     """
-    Cheap post-processing: combine a cumulative-xi tabulation
-    (output of `tabulate_xi_hh_thresholds`) with a target mass set,
-    eps, and a P_nl callable to produce beta^NL(r, M_i, M_j).
+    Cheap post-processing: combine a threshold ξ_hh tabulation with a
+    target mass set, eps, and a P_nl callable to produce β^NL(r, M_i, M_j).
 
-    Returns the same dict shape as `compute_beta_nl_xi`.
+    `threshold_result` is either:
+      - the output of `tabulate_xi_hh_thresholds` (raw pycorr threshold ξ), or
+      - the output of `load_xi_threshold_grid` (precomputed + already-stitched
+        threshold ξ from `precompute_xi_tree_grid.py`).
+
+    Both must carry the same keys: `r`, `log10M_th`, `N_above`, `xi`.
+
+    Stitching (small + large scales) is the responsibility of whoever
+    produced `threshold_result` — this function only does the four-corner
+    FD and the β^NL math.
     """
     log10M_targets = np.asarray(log10M_targets, dtype=np.float64)
     log10M_th = threshold_result["log10M_th"]
@@ -689,43 +687,7 @@ def beta_nl_xi_from_tabulation(
 
     fixed = xi_hh_at_mass(threshold_result, log10M_targets, eps=eps)
     r = fixed["r"]
-    xi_hh_dir = fixed["xi_hh"]
-    xi_hh = xi_hh_dir.copy()
-
-    xi_tree = None
-    used_de = None
-    if stitch_large_scale:
-        if xi_tree_grid_path is None and (emu is None or P_lin_func is None or z is None):
-            raise ValueError(
-                "stitch_large_scale=True requires either xi_tree_grid_path, "
-                "or (emu, P_lin_func, and z)."
-            )
-        # Need a provisional bias for any low-mass linear-bias fallback;
-        # fit it from the un-stitched ξ_hh first, then refit after stitching.
-        r_mm_tmp, xi_mm_tmp = xi_mm_from_pk(P_nl_func)
-        good_tmp = (xi_mm_tmp > 0) & np.isfinite(xi_mm_tmp) & (r_mm_tmp > 0)
-        xi_mm_func_tmp = lambda rr: np.exp(np.interp(np.log(rr),
-                                                      np.log(r_mm_tmp[good_tmp]),
-                                                      np.log(xi_mm_tmp[good_tmp])))
-        K = len(log10M_targets)
-        b_provisional = np.full(K, np.nan)
-        for a in range(K):
-            b_provisional[a] = fit_bias_largescale(
-                r, xi_hh_dir[a, a, :], xi_mm_func_tmp,
-                r_min=bias_window[0], r_max=bias_window[1],
-            )
-
-        tree_res = compute_xi_tree(
-            emu=emu, P_lin_func=P_lin_func, z=float(z) if z is not None else None,
-            r_out=r, log10M_targets=log10M_targets,
-            eps=gamma_eps, k_grid=gamma_k_grid,
-            gamma_min_log10M=gamma_min_log10M, fallback=gamma_fallback,
-            b_hh=b_provisional,
-            grid_path=xi_tree_grid_path,
-        )
-        xi_tree = tree_res["xi_tree"]
-        used_de = tree_res["used_de"]
-        xi_hh = stitch_xi_hh(r, xi_hh_dir, xi_tree, r_switch=r_switch)
+    xi_hh = fixed["xi_hh"]
 
     r_mm, xi_mm_grid = xi_mm_from_pk(P_nl_func)
     good = (xi_mm_grid > 0) & np.isfinite(xi_mm_grid) & (r_mm > 0)
@@ -752,11 +714,10 @@ def beta_nl_xi_from_tabulation(
             with np.errstate(invalid="ignore", divide="ignore"):
                 beta[a, b, :] = xi_hh[a, b, :] / (b_hh[a] * b_hh[b] * xi_mm) - 1.0
 
-    out = {
+    return {
         "r": r,
         "M_targets": fixed["M_targets"],
         "xi_hh": xi_hh,
-        "xi_hh_dir": xi_hh_dir,
         "xi_mm": xi_mm,
         "b_hh": b_hh,
         "beta_nl": beta,
@@ -764,13 +725,34 @@ def beta_nl_xi_from_tabulation(
         "N_above": np.asarray(threshold_result["N_above"]),
         "bias_window": np.asarray(bias_window),
         "eps": eps,
-        "stitched": bool(stitch_large_scale),
     }
-    if stitch_large_scale:
-        out["xi_tree"] = xi_tree
-        out["used_de_for_gamma"] = used_de
-        out["r_switch"] = float(r_switch)
-    return out
+
+
+def load_xi_threshold_grid(path: str) -> Dict[str, np.ndarray]:
+    """
+    Load a precomputed threshold ξ_hh grid (output of
+    `precompute_xi_tree_grid.py`) and reshape it into the dict form
+    expected by `beta_nl_xi_from_tabulation` and `xi_hh_at_mass`:
+
+        {"r": (n_r,), "log10M_th": (T,), "N_above": (T,), "xi": (T, T, n_r)}
+
+    Picks the stitched curve (`xi_threshold`) if present, falling back
+    to `xi_pycorr`. Raises if `N_above` was not saved (older runs).
+    """
+    d = np.load(path, allow_pickle=False)
+    xi = d["xi_threshold"] if "xi_threshold" in d.files else d["xi_pycorr"]
+    if "N_above" not in d.files:
+        raise KeyError(
+            f"{path} has no N_above array — regenerate with the current "
+            "precompute_xi_tree_grid.py (N_above is required by the "
+            "four-corner FD in xi_hh_at_mass)."
+        )
+    return {
+        "r": np.asarray(d["r"]),
+        "log10M_th": np.asarray(d["log10M_arr"]),
+        "N_above": np.asarray(d["N_above"]),
+        "xi": np.asarray(xi),
+    }
 
 
 def compute_beta_nl_xi(
@@ -786,35 +768,17 @@ def compute_beta_nl_xi(
     cache_path: Optional[str] = None,
     log10M_thresholds: Optional[Sequence[float]] = None,
     verbose: bool = True,
-    stitch_large_scale: bool = False,
-    emu=None,
-    P_lin_func: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-    z: Optional[float] = None,
-    r_switch: float = 60.0,
-    gamma_eps: float = 0.02,
-    gamma_min_log10M: float = 12.0,
-    gamma_fallback: str = "linear_bias",
-    gamma_k_grid: Optional[np.ndarray] = None,
-    xi_tree_grid_path: Optional[str] = None,
 ) -> Dict[str, np.ndarray]:
     """
-    Top-level driver: measure beta^NL(r, M_i, M_j) from a halo catalog at
+    Top-level driver: measure β^NL(r, M_i, M_j) from a halo catalog at
     delta-function target masses, mirroring Dark Emulator's convention.
 
-    Returns
-    -------
-    dict with:
-        r                 (n_r,)         bin centers, Mpc/h
-        M_targets         (K,)           target masses, M_sun/h
-        xi_hh             (K, K, n_r)
-        xi_mm             (n_r,)         interpolated to r
-        b_hh              (K,)           large-scale bias per target mass
-        beta_nl           (K, K, n_r)    xi_hh / (b_i b_j xi_mm) - 1
-        thresholds        (T,)           thresholds used
-        N_above           (T,)
+    Stitching (small + large scales) is now owned by
+    `precompute_xi_tree_grid.py`. Use that script if you want a
+    pre-stitched threshold ξ; otherwise this driver returns β^NL built
+    from the raw pycorr threshold tabulation.
     """
     if r_bins is None:
-        # Default: 0.5 -> 100 Mpc/h, 30 log bins. Avoid below ~halo size.
         r_bins = np.logspace(np.log10(0.5), np.log10(100.0), 31)
 
     log10M_targets = np.asarray(log10M_targets, dtype=np.float64)
@@ -835,12 +799,287 @@ def compute_beta_nl_xi(
     return beta_nl_xi_from_tabulation(
         thr_res, log10M_targets, P_nl_func,
         eps=eps, bias_window=bias_window,
-        stitch_large_scale=stitch_large_scale, emu=emu,
-        P_lin_func=P_lin_func, z=z, r_switch=r_switch,
-        gamma_eps=gamma_eps, gamma_min_log10M=gamma_min_log10M,
-        gamma_fallback=gamma_fallback, gamma_k_grid=gamma_k_grid,
-        xi_tree_grid_path=xi_tree_grid_path,
     )
+
+
+def xi_hh_to_Pk_hh(
+    r: np.ndarray,
+    xi_hh: np.ndarray,
+    k_out: Optional[np.ndarray] = None,
+    n_int: int = 2048,
+    N_extrap_low: int = 1024,
+    N_extrap_high: int = 1024,
+    fftlog_nu: float = 1.01,
+) -> tuple:
+    """
+    Inverse Hankel transform ξ_hh(r, M_i, M_j) → P_hh(k, M_i, M_j) using
+    Dark Emulator's `fftlog.xi2pk` (ν=1.01), matching the convention DE
+    uses internally for `get_pknl` (de_interface.py:228-231).
+
+    Each (M_i, M_j) slice is cubic-spline interpolated onto a uniform
+    log-r grid spanning the measured range; FFTlog's `N_extrap_*`
+    log-linear extension (default 1024 each side, matching DE's
+    `xs = logspace(-3, 3, 2000)` + `N_extrap_low=1024` convention) then
+    pads the transform to the asymptotic support required.
+
+    The input ξ_hh **must already be stitched** (small-scale direct +
+    large-scale tree) — i.e. produced by `precompute_xi_tree_grid.py`
+    and loaded via `load_xi_threshold_grid`, then collapsed to fixed
+    mass with `xi_hh_at_mass`. Stitching at fixed mass would corrupt
+    the four-corner FD, so it must happen at threshold level.
+
+    Parameters
+    ----------
+    r       : (n_r,) measured separations, Mpc/h. Need not be log-spaced.
+    xi_hh   : (..., n_r). Trailing axis is r; leading axes broadcast.
+    k_out   : optional output wavenumbers, h/Mpc. If None, the native
+              FFTlog k grid is returned.
+    n_int   : number of points on the uniform log-r grid fed to fftlog.
+    N_extrap_low, N_extrap_high : FFTlog log-linear extrapolation widths
+              (DE default 1024). These extend the integral support far
+              enough that the answer over the native k window converges.
+    fftlog_nu : FFTlog bias parameter (DE uses 1.01).
+
+    Returns
+    -------
+    k       : 1D array of wavenumbers, h/Mpc.
+    P_hh    : array with same leading shape as xi_hh, trailing axis k.
+    """
+    try:
+        from dark_emulator import fftlog as _fftlog
+    except ImportError as e:
+        raise ImportError(
+            "dark_emulator is required for xi_hh_to_Pk_hh — its fftlog module "
+            "implements the same ξ↔P convention used by the emulator."
+        ) from e
+    from scipy.interpolate import CubicSpline
+
+    r = np.asarray(r, dtype=np.float64)
+    xi_hh = np.asarray(xi_hh, dtype=np.float64)
+    assert xi_hh.shape[-1] == r.size, "trailing axis of xi_hh must match r"
+
+    r_int = np.logspace(np.log10(r.min()), np.log10(r.max()), n_int)
+
+    lead_shape = xi_hh.shape[:-1]
+    xi_flat = xi_hh.reshape(-1, r.size)
+    n_slices = xi_flat.shape[0]
+
+    k_out_native = None
+    Pk_list = []
+
+    for s in range(n_slices):
+        xi_s = xi_flat[s]
+        if not np.all(np.isfinite(xi_s)):
+            Pk_list.append(None)
+            continue
+
+        # cubic spline in log r; ξ can be negative around BAO, so spline on
+        # the value (not log(xi)).
+        cs = CubicSpline(np.log(r), xi_s, extrapolate=False)
+        xi_int = cs(np.log(r_int))
+
+        k_s, Pk_s = _fftlog.xi2pk(
+            r_int, xi_int, fftlog_nu,
+            N_extrap_low=N_extrap_low,
+            N_extrap_high=N_extrap_high,
+        )
+        if k_out_native is None:
+            k_out_native = np.asarray(k_s)
+        Pk_list.append(np.asarray(Pk_s))
+
+    n_k_native = k_out_native.size
+    Pk_arr = np.full((n_slices, n_k_native), np.nan)
+    for s, Pk in enumerate(Pk_list):
+        if Pk is not None:
+            Pk_arr[s] = Pk
+    Pk_arr = Pk_arr.reshape(*lead_shape, n_k_native)
+
+    if k_out is None:
+        return k_out_native, Pk_arr
+
+    k_out = np.asarray(k_out, dtype=np.float64)
+    Pk_at_kout = np.full(lead_shape + (k_out.size,), np.nan)
+    log_k_native = np.log(k_out_native)
+    log_k_out = np.log(k_out)
+    flat_kout = Pk_arr.reshape(-1, n_k_native)
+    out_flat = Pk_at_kout.reshape(-1, k_out.size)
+    for s in range(flat_kout.shape[0]):
+        Pk_s = flat_kout[s]
+        if not np.all(np.isfinite(Pk_s)):
+            continue
+        # interpolate |P| in log-log when positive; fall back to linear in P
+        # for negative-P excursions (numerical ringing at very small/large k).
+        good = np.isfinite(Pk_s)
+        if Pk_s[good].min() > 0:
+            out_flat[s] = np.exp(np.interp(log_k_out,
+                                             log_k_native[good],
+                                             np.log(Pk_s[good])))
+        else:
+            out_flat[s] = np.interp(log_k_out, log_k_native[good], Pk_s[good])
+    return k_out, Pk_at_kout
+
+
+def beta_nl_k_from_tabulation(
+    threshold_result: Dict[str, np.ndarray],
+    log10M_targets: Sequence[float],
+    P_lin_func: Callable[[np.ndarray], np.ndarray],
+    k_out: Optional[np.ndarray] = None,
+    eps: float = 0.01,
+    k_lin: float = 0.02,
+    force_to_zero: str = "additive",
+    n_int: int = 2048,
+    N_extrap_low: int = 1024,
+    N_extrap_high: int = 1024,
+    fftlog_nu: float = 1.01,
+) -> Dict[str, np.ndarray]:
+    """
+    Build β^NL(k, M_i, M_j) from a **stitched** threshold ξ_hh tabulation,
+    mirroring `HOD_analytical.emu.BetaNLInterpolator` but with the
+    emulator's `get_phh_mass` replaced by the simulation measurement.
+
+    Pipeline:
+        threshold ξ_hh(>M_a,>M_b,r)   (already stitched dir + tree)
+          ──FD (xi_hh_at_mass)──▶     ξ_hh(r, M_i, M_j)
+          ──xi2pk (DE fftlog)──▶      P_hh(k, M_i, M_j)
+          ──halo-halo bias──▶         b(M) = √[P_hh(k_lin, M, M)/P_lin(k_lin)]
+          ──force-to-zero──▶          β^NL = P_hh/(b_i b_j P_lin) - 1
+
+    `threshold_result` must come from `load_xi_threshold_grid` (which loads
+    the stitched grid built by `precompute_xi_tree_grid.py`) or otherwise
+    carry pre-stitched threshold ξ. Stitching at fixed mass would corrupt
+    the four-corner FD, so it must happen at threshold level.
+
+    Parameters
+    ----------
+    threshold_result : dict with keys r, log10M_th, N_above, xi.
+    log10M_targets   : (K,) target log10(M / [M_sun/h]).
+    P_lin_func       : callable, k (h/Mpc) → P_lin(k, z) in (Mpc/h)^3,
+                       at the snapshot redshift.
+    k_out            : optional output wavenumbers in h/Mpc. If None,
+                       returns on the native FFTlog k grid.
+    eps              : four-corner FD half-step (matches emulator's 0.01).
+    k_lin            : "linear" pivot for bias / force-to-zero (DE: 0.02).
+    force_to_zero    : 'additive' (default), 'multiplicative',
+                       'exponential', or 'none'. Same definitions as
+                       `BetaNLInterpolator._apply_force_to_zero`.
+    n_int, N_extrap_*, fftlog_nu : see `xi_hh_to_Pk_hh`.
+
+    Returns
+    -------
+    dict with:
+        k         (n_k,)              wavenumbers, h/Mpc
+        M_targets (K,)                M_sun/h
+        xi_hh     (K, K, n_r)         fixed-mass ξ from the FD (echoed)
+        r         (n_r,)              r grid of xi_hh (echoed)
+        P_hh      (K, K, n_k)         halo-halo P(k, M_i, M_j)
+        P_lin     (n_k,)              linear P(k) at the output k
+        b_hh      (K,)                halo-halo bias b(M_i)
+        beta_nl   (K, K, n_k)         β^NL after force-to-zero
+        eps, k_lin, force_to_zero     echoed
+    """
+    if force_to_zero not in ("none", "additive", "multiplicative", "exponential"):
+        raise ValueError(f"unknown force_to_zero: {force_to_zero!r}")
+
+    # 1. fixed-mass ξ_hh(r, M_i, M_j) from stitched threshold FD
+    fixed = xi_hh_at_mass(threshold_result, log10M_targets, eps=eps)
+    r = fixed["r"]
+    xi_hh = fixed["xi_hh"]
+    M_targets = fixed["M_targets"]
+    K = len(M_targets)
+
+    # 2. inverse HT slice-by-slice → P_hh(k, M_i, M_j)
+    k_native, P_hh_native = xi_hh_to_Pk_hh(
+        r, xi_hh,
+        k_out=None,
+        n_int=n_int,
+        N_extrap_low=N_extrap_low, N_extrap_high=N_extrap_high,
+        fftlog_nu=fftlog_nu,
+    )
+
+    k = k_native if k_out is None else np.asarray(k_out, dtype=np.float64)
+    if k_out is not None:
+        # resample P_hh onto k_out (positive log-log when feasible)
+        _, P_hh = xi_hh_to_Pk_hh(
+            r, xi_hh, k_out=k,
+            r_pad=r_pad, n_pad=n_pad,
+            N_extrap_low=N_extrap_low, N_extrap_high=N_extrap_high,
+            fftlog_nu=fftlog_nu,
+        )
+    else:
+        P_hh = P_hh_native
+
+    # 3. linear power on the output grid
+    P_lin = np.asarray(P_lin_func(k), dtype=np.float64).ravel()
+    P_lin_klin = float(np.asarray(P_lin_func(np.array([k_lin]))).ravel()[0])
+
+    # 4. halo-halo bias from the diagonal P_hh at k_lin
+    if k_out is not None:
+        # need P_hh exactly at k_lin (independent of user k grid)
+        _, P_hh_at_klin = xi_hh_to_Pk_hh(
+            r, xi_hh, k_out=np.array([k_lin]),
+            r_pad=r_pad, n_pad=n_pad,
+            N_extrap_low=N_extrap_low, N_extrap_high=N_extrap_high,
+            fftlog_nu=fftlog_nu,
+        )
+        P_hh_klin_diag = np.array([P_hh_at_klin[a, a, 0] for a in range(K)])
+    else:
+        # k_native grid: interpolate diagonal to k_lin
+        log_k_native = np.log(k_native)
+        log_klin = np.log(k_lin)
+        P_hh_klin_diag = np.array([
+            np.interp(log_klin, log_k_native, P_hh_native[a, a, :])
+            for a in range(K)
+        ])
+
+    with np.errstate(invalid="ignore"):
+        b_hh = np.sqrt(P_hh_klin_diag / P_lin_klin)
+
+    # 5. β^NL = P_hh / (b_i b_j P_lin) - 1, then force-to-zero
+    beta = np.full_like(P_hh, np.nan)
+    for i in range(K):
+        if not np.isfinite(b_hh[i]):
+            continue
+        for j in range(K):
+            if not np.isfinite(b_hh[j]):
+                continue
+            with np.errstate(invalid="ignore", divide="ignore"):
+                beta_ij = P_hh[i, j, :] / (b_hh[i] * b_hh[j] * P_lin) - 1.0
+
+            if force_to_zero == "additive":
+                if k_out is None:
+                    P_hh_ij_klin = np.interp(np.log(k_lin), log_k_native,
+                                              P_hh_native[i, j, :])
+                else:
+                    P_hh_ij_klin = float(P_hh_at_klin[i, j, 0])
+                offset = P_hh_ij_klin / (b_hh[i] * b_hh[j] * P_lin_klin) - 1.0
+                beta_ij = beta_ij - offset
+            elif force_to_zero == "multiplicative":
+                if k_out is None:
+                    P_hh_ij_klin = np.interp(np.log(k_lin), log_k_native,
+                                              P_hh_native[i, j, :])
+                else:
+                    P_hh_ij_klin = float(P_hh_at_klin[i, j, 0])
+                offset = P_hh_ij_klin / (b_hh[i] * b_hh[j] * P_lin_klin) - 1.0
+                beta_ij = (beta_ij + 1.0) / (offset + 1.0) - 1.0
+            elif force_to_zero == "exponential":
+                beta_ij = beta_ij * (1.0 - np.exp(-(k / k_lin) ** 2))
+            # 'none' → leave as is
+
+            beta[i, j, :] = beta_ij
+
+    return {
+        "k": k,
+        "M_targets": M_targets,
+        "r": r,
+        "xi_hh": xi_hh,
+        "P_hh": P_hh,
+        "P_lin": P_lin,
+        "b_hh": b_hh,
+        "beta_nl": beta,
+        "eps": eps,
+        "k_lin": k_lin,
+        "force_to_zero": force_to_zero,
+    }
 
 
 __all__ = [
@@ -853,7 +1092,10 @@ __all__ = [
     "compute_xi_tree",
     "stitch_xi_hh",
     "beta_nl_xi_from_tabulation",
+    "load_xi_threshold_grid",
     "xi_mm_from_pk",
     "fit_bias_largescale",
     "compute_beta_nl_xi",
+    "xi_hh_to_Pk_hh",
+    "beta_nl_k_from_tabulation",
 ]

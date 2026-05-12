@@ -10,10 +10,22 @@ so the two are directly comparable in (k, M1, M2, z).
 
 Usage
 -----
+Fourier (legacy P-space):
     python compare_beta_nl_emulator_vs_sim.py \
         --z 1.0 --Lbox 681 --Nmesh 512 \
         --logM_edges 12.5 13.0 13.5 14.0 14.5 \
         --output_dir beta_nl_validation
+
+Real-space, consuming a precomputed threshold ξ grid (recommended):
+    python compare_beta_nl_emulator_vs_sim.py \
+        --space real --z 1.0 --Lbox 681 \
+        --xi_grid_path_dmo /sps/.../xihh_threshold.npz \
+        --logM_targets 11.5 12.0 12.5 13.0 13.5 14.0 \
+        --eps 0.02 --skip_hydro --output_dir beta_nl_validation
+
+Stitching (small-scale pycorr + large-scale Γ_h) lives in
+`precompute_xi_tree_grid.py`. This script only does the four-corner FD
+and the β^NL math.
 """
 
 import argparse
@@ -27,6 +39,7 @@ from HOD_NRV.utilsf.measure_beta_nl import measure_beta_nl_from_catalog
 from HOD_NRV.utilsf.measure_beta_nl_xi import (
     beta_nl_xi_from_tabulation,
     dense_thresholds,
+    load_xi_threshold_grid,
     tabulate_xi_hh_thresholds,
     xi_mm_from_pk,
 )
@@ -118,42 +131,44 @@ def emulator_beta_nl_xi(cosmo, z, r, M1, M2, bias_window=(30.0, 80.0)):
 def measure_one_xi(label, halo_path, log10M_targets, Lbox, P_nl_func,
                    r_bins, eps, bias_window, z, cache_dir,
                    xi_logM_min, xi_logM_max, xi_step_dex,
-                   stitch_large_scale=False, emu=None, P_lin_func=None,
-                   r_switch=60.0, gamma_eps=0.02,
-                   gamma_min_log10M=12.0, gamma_fallback="linear_bias"):
-    print(f"\n=== {label} (xi-space): {halo_path} ===")
-    pos, log10M = load_halos(halo_path)
-    print(f"  loaded {len(log10M)} halos, log10M in [{log10M.min():.2f}, {log10M.max():.2f}]")
+                   xi_grid_path=None):
+    """β^NL_ξ from a pre-stitched threshold grid (xi_grid_path) when
+    available, else from a fresh pycorr tabulation. Stitching is owned
+    by precompute_xi_tree_grid.py — this function only does the FD."""
+    if xi_grid_path is not None:
+        print(f"\n=== {label} (xi-space, from grid): {xi_grid_path} ===")
+        thr_res = load_xi_threshold_grid(xi_grid_path)
+    else:
+        print(f"\n=== {label} (xi-space): {halo_path} ===")
+        pos, log10M = load_halos(halo_path)
+        print(f"  loaded {len(log10M)} halos, log10M in "
+              f"[{log10M.min():.2f}, {log10M.max():.2f}]")
 
-    log10M_thresholds = dense_thresholds(
-        log10M_min=xi_logM_min, log10M_max=xi_logM_max,
-        step_dex=xi_step_dex, eps=eps,
-    )
-
-    cache_path = None
-    if cache_dir is not None:
-        os.makedirs(cache_dir, exist_ok=True)
-        halo_basename = os.path.splitext(os.path.basename(halo_path))[0]
-        cache_path = os.path.join(
-            cache_dir,
-            f"xi_thr_{halo_basename}_z{z:.3f}_step{xi_step_dex:.3f}_eps{eps:.3f}.npz",
+        log10M_thresholds = dense_thresholds(
+            log10M_min=xi_logM_min, log10M_max=xi_logM_max,
+            step_dex=xi_step_dex, eps=eps,
         )
 
-    thr_res = tabulate_xi_hh_thresholds(
-        halo_positions=pos, halo_log10M=log10M,
-        log10M_thresholds=log10M_thresholds,
-        Lbox=Lbox, r_bins=r_bins,
-        cache_path=cache_path, verbose=True,
-    )
+        cache_path = None
+        if cache_dir is not None:
+            os.makedirs(cache_dir, exist_ok=True)
+            halo_basename = os.path.splitext(os.path.basename(halo_path))[0]
+            cache_path = os.path.join(
+                cache_dir,
+                f"xi_thr_{halo_basename}_z{z:.3f}_"
+                f"step{xi_step_dex:.3f}_eps{eps:.3f}.npz",
+            )
+
+        thr_res = tabulate_xi_hh_thresholds(
+            halo_positions=pos, halo_log10M=log10M,
+            log10M_thresholds=log10M_thresholds,
+            Lbox=Lbox, r_bins=r_bins,
+            cache_path=cache_path, verbose=True,
+        )
 
     return beta_nl_xi_from_tabulation(
         thr_res, log10M_targets, P_nl_func,
         eps=eps, bias_window=bias_window,
-        stitch_large_scale=stitch_large_scale,
-        emu=emu, P_lin_func=P_lin_func, z=z,
-        r_switch=r_switch, gamma_eps=gamma_eps,
-        gamma_min_log10M=gamma_min_log10M,
-        gamma_fallback=gamma_fallback,
     )
 
 
@@ -164,37 +179,20 @@ def run_real_space(args, cosmo, P_nl):
                          args.n_rbins + 1)
     bias_window = (args.bias_rmin, args.bias_rmax)
 
-    P_lin = lambda k: cosmo.linear_power(np.asarray(k), z=args.z)
-    emu = getattr(cosmo, "emu", None) if args.stitch_large_scale else None
-    if args.stitch_large_scale and emu is None:
-        raise RuntimeError(
-            "Stitching requested but Dark Emulator is not loaded on `cosmo`. "
-            "Construct Cosmology(..., use_dark_emulator=True)."
-        )
-
-    stitch_kwargs = dict(
-        stitch_large_scale=args.stitch_large_scale,
-        emu=emu, P_lin_func=P_lin,
-        r_switch=args.r_switch,
-        gamma_eps=args.gamma_eps,
-        gamma_min_log10M=args.gamma_min_log10M,
-        gamma_fallback=args.gamma_fallback,
-    )
-
     results = {}
     if not args.skip_dmo:
         results["DMO"] = measure_one_xi(
             "DMO", args.dmo_path, log10M_targets, args.Lbox, P_nl,
             r_bins, args.eps, bias_window, args.z, args.xi_cache_dir,
             args.xi_logM_min, args.xi_logM_max, args.xi_step_dex,
-            **stitch_kwargs,
+            xi_grid_path=args.xi_grid_path_dmo,
         )
     if not args.skip_hydro:
         results["Hydro"] = measure_one_xi(
             "Hydro", args.hydro_path, log10M_targets, args.Lbox, P_nl,
             r_bins, args.eps, bias_window, args.z, args.xi_cache_dir,
             args.xi_logM_min, args.xi_logM_max, args.xi_step_dex,
-            **stitch_kwargs,
+            xi_grid_path=args.xi_grid_path_hydro,
         )
     if not results:
         print("Both DMO and Hydro skipped — nothing to do.")
@@ -209,9 +207,6 @@ def run_real_space(args, cosmo, P_nl):
         for key in ("r", "M_targets", "xi_hh", "xi_mm", "b_hh",
                      "beta_nl", "thresholds", "N_above"):
             save_dict[f"{label}_{key}"] = res[key]
-        for key in ("xi_hh_dir", "xi_tree", "used_de_for_gamma", "r_switch"):
-            if key in res:
-                save_dict[f"{label}_{key}"] = res[key]
     np.savez(out_npz, **save_dict)
     print(f"\nSaved xi-space measurements to {out_npz}")
 
@@ -240,18 +235,9 @@ def run_real_space(args, cosmo, P_nl):
             ax = axes[row, col]
             beta_meas = res["beta_nl"][i, j, :]
             beta_emu = emu_beta[i, j, :]
-            ax.semilogx(r, beta_meas, "o", ms=4, label="measured (stitched)")
-            if "xi_hh_dir" in res and "xi_mm" in res and "b_hh" in res:
-                b1, b2 = res["b_hh"][i], res["b_hh"][j]
-                if np.isfinite(b1) and np.isfinite(b2):
-                    with np.errstate(invalid="ignore", divide="ignore"):
-                        beta_dir = res["xi_hh_dir"][i, j, :] / (b1 * b2 * res["xi_mm"]) - 1.0
-                    ax.semilogx(r, beta_dir, "x", ms=3, color="C2",
-                                alpha=0.5, label="measured (direct)")
+            ax.semilogx(r, beta_meas, "o", ms=4, label="measured")
             if np.any(np.isfinite(beta_emu)):
                 ax.semilogx(r, beta_emu, "-", lw=1.6, label="Dark Emulator")
-            if res.get("stitched", False) and "r_switch" in res:
-                ax.axvline(res["r_switch"], color="k", lw=0.5, ls=":")
             ax.axhline(0, color="gray", lw=0.6)
             ax.set_title(f"{label}: log10(M1, M2) = "
                          f"({np.log10(M_targets[i]):.2f}, {np.log10(M_targets[j]):.2f})")
@@ -291,44 +277,27 @@ def main():
     p.add_argument("--rbins_min", type=float, default=0.5)
     p.add_argument("--rbins_max", type=float, default=100.0)
     p.add_argument("--n_rbins", type=int, default=30)
+    p.add_argument("--xi_grid_path_dmo", default=None,
+                   help="Real-space mode: path to a pre-stitched threshold "
+                        "ξ_hh .npz (from precompute_xi_tree_grid.py) for "
+                        "DMO. If given, skips pair-counting entirely.")
+    p.add_argument("--xi_grid_path_hydro", default=None,
+                   help="Same as --xi_grid_path_dmo but for the Hydro run.")
     p.add_argument("--xi_cache_dir", default=None,
-                   help="Real-space mode: directory to cache cumulative-xi "
-                        "tabulation. Re-runs with the same halo catalogue, "
-                        "z, step_dex and eps reuse it (cheap post-processing).")
+                   help="Real-space mode (legacy fresh-tabulation path only): "
+                        "directory to cache the pycorr threshold tabulation. "
+                        "Ignored when --xi_grid_path_* is set.")
     p.add_argument("--xi_logM_min", type=float, default=11.0,
-                   help="Real-space mode: low edge of the dense log10M ladder.")
+                   help="Legacy path: low edge of the dense log10M ladder.")
     p.add_argument("--xi_logM_max", type=float, default=15.0,
-                   help="Real-space mode: high edge of the dense log10M ladder.")
+                   help="Legacy path: high edge of the dense log10M ladder.")
     p.add_argument("--xi_step_dex", type=float, default=0.05,
-                   help="Real-space mode: log10M ladder spacing (dex).")
+                   help="Legacy path: log10M ladder spacing (dex).")
     p.add_argument("--dmo_path", default=DEFAULT_DMO_HALO)
     p.add_argument("--hydro_path", default=DEFAULT_HYDRO_HALO)
     p.add_argument("--skip_dmo", action="store_true")
     p.add_argument("--skip_hydro", action="store_true")
     p.add_argument("--output_dir", default="beta_nl_validation")
-    p.add_argument("--stitch_large_scale", dest="stitch_large_scale",
-                   action="store_true", default=True,
-                   help="Real-space mode: smoothly switch xi_hh to an "
-                        "analytical large-scale prescription (Dark Emulator-"
-                        "style, Γ_h propagator + four-corner FD) at r ≳ r_switch.")
-    p.add_argument("--no_stitch_large_scale", dest="stitch_large_scale",
-                   action="store_false",
-                   help="Disable the large-scale analytical stitch (xi_hh "
-                        "stays equal to the direct measurement everywhere).")
-    p.add_argument("--r_switch", type=float, default=60.0,
-                   help="Transition scale [Mpc/h] for the quartic taper "
-                        "exp(-(r/r_switch)^4). Default 60 (Dark Emulator).")
-    p.add_argument("--gamma_eps", type=float, default=0.02,
-                   help="DE-style FD half-width on density shells for Γ_h "
-                        "(default 0.02, matches dark_emulator).")
-    p.add_argument("--gamma_min_log10M", type=float, default=12.0,
-                   help="Minimum log10(M_sun/h) where DE's Γ_h is trusted. "
-                        "Targets below this use the fallback.")
-    p.add_argument("--gamma_fallback", choices=["linear_bias", "none"],
-                   default="linear_bias",
-                   help="What to use for ξ_tree when log10M < gamma_min_log10M: "
-                        "'linear_bias' → b1(M)·b2(M)·ξ_lin(r); "
-                        "'none' → skip stitching for that target.")
     args = p.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
