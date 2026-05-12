@@ -51,6 +51,7 @@ def measure_xi_hh_thresholds(
     Lbox: float,
     r_bins: np.ndarray,
     los: str = "z",
+    max_per_sample: Optional[int] = None,
     verbose: bool = True,
 ) -> Dict[str, np.ndarray]:
     """
@@ -84,6 +85,18 @@ def measure_xi_hh_thresholds(
     N_above = np.zeros(T, dtype=np.int64)
     for i, lt in enumerate(log10M_thresholds):
         sub = _select_above(halo_positions, halo_log10M, lt)
+        N_orig = len(sub)
+        if max_per_sample is not None and N_orig > int(max_per_sample):
+            # Deterministic per-threshold seed so independent thresholds
+            # get independent realisations but reruns are reproducible.
+            seed = (0xC0FFEE
+                    ^ (hash((float(lt), int(max_per_sample))) & 0xFFFFFFFF))
+            rng = np.random.default_rng(seed)
+            idx = rng.choice(N_orig, size=int(max_per_sample), replace=False)
+            sub = sub[idx]
+            if verbose:
+                print(f"  downsampled threshold log10M >= {lt:.4f}: "
+                      f"{N_orig} -> {len(sub)}")
         subsamples.append(sub)
         N_above[i] = len(sub)
         if verbose:
@@ -565,6 +578,7 @@ def tabulate_xi_hh_thresholds(
     r_bins: np.ndarray,
     cache_path: Optional[str] = None,
     los: str = "z",
+    max_per_sample: Optional[int] = None,
     verbose: bool = True,
 ) -> Dict[str, np.ndarray]:
     """
@@ -587,6 +601,8 @@ def tabulate_xi_hh_thresholds(
     h.update(np.ascontiguousarray(halo_log10M, dtype=np.float64).tobytes())
     catalog_sha = h.hexdigest()
 
+    cache_max = -1 if max_per_sample is None else int(max_per_sample)
+
     if cache_path is not None and os.path.exists(cache_path):
         try:
             d = np.load(cache_path, allow_pickle=False)
@@ -598,6 +614,7 @@ def tabulate_xi_hh_thresholds(
                 and d["r_bins"].shape == r_bins.shape
                 and np.allclose(d["r_bins"], r_bins)
                 and str(d["catalog_sha"]) == catalog_sha
+                and int(d["max_per_sample"]) == cache_max
             )
             if ok:
                 if verbose:
@@ -616,7 +633,7 @@ def tabulate_xi_hh_thresholds(
 
     res = measure_xi_hh_thresholds(
         halo_positions, halo_log10M, log10M_thresholds, Lbox, r_bins,
-        los=los, verbose=verbose,
+        los=los, max_per_sample=max_per_sample, verbose=verbose,
     )
 
     if cache_path is not None:
@@ -627,6 +644,7 @@ def tabulate_xi_hh_thresholds(
             N_above=res["N_above"], xi=res["xi"],
             r_bins=r_bins, Lbox=float(Lbox), los=str(los),
             catalog_sha=catalog_sha,
+            max_per_sample=cache_max,
         )
         if verbose:
             print(f"[tabulate_xi_hh_thresholds] saved cache: {cache_path}")
