@@ -514,15 +514,25 @@ def stitch_xi_hh(r: np.ndarray, xi_dir: np.ndarray, xi_tree: np.ndarray,
 
     Mirrors hod_interface.py:419-423 in dark_emulator_public.
 
-    Where ξ_tree is NaN the direct measurement is returned unchanged.
+    NaN handling: where ξ_dir is NaN (e.g. r > r_max_pycorr) the result is
+    pure ξ_tree; where ξ_tree is NaN the result is pure ξ_dir; where both
+    are NaN the result is NaN. Without this, `xi_dir * w_eff` is NaN even
+    at r ≫ r_switch where `w_eff` is essentially zero, which silently
+    truncates the stitched grid at r_max_pycorr.
+
     Shapes: r is (n_r,), xi_dir / xi_tree broadcast over any leading axes.
     """
     r = np.asarray(r, dtype=np.float64)
     w = np.exp(-(r / float(r_switch)) ** 4)
+    dir_nan = ~np.isfinite(xi_dir)
     tree_nan = ~np.isfinite(xi_tree)
+    xi_dir_safe = np.where(dir_nan, 0.0, xi_dir)
     xi_tree_safe = np.where(tree_nan, 0.0, xi_tree)
-    w_eff = np.where(tree_nan, np.ones_like(xi_tree), w)
-    return xi_dir * w_eff + xi_tree_safe * (1.0 - w_eff)
+    # All weight to the surviving side when the other is NaN.
+    w_dir = np.where(dir_nan, 0.0, np.where(tree_nan, 1.0, w))
+    w_tree = np.where(tree_nan, 0.0, np.where(dir_nan, 1.0, 1.0 - w))
+    out = xi_dir_safe * w_dir + xi_tree_safe * w_tree
+    return np.where(dir_nan & tree_nan, np.nan, out)
 
 
 def xi_mm_from_pk(P_nl_func: Callable[[np.ndarray], np.ndarray],
@@ -952,6 +962,7 @@ def _xi_threshold_to_pk_threshold(
     k_out: Optional[np.ndarray] = None,
     r_excl: float = 0.01,
     r_far: float = 2000.0,
+    xi_far: float = 1e-12,
     n_int: int = 4000,
     N_extrap_low: int = 1024,
     N_extrap_high: int = 1024,
@@ -1005,10 +1016,20 @@ def _xi_threshold_to_pk_threshold(
             xi_fin = np.clip(xi_s[finite], -1.0, None)
 
             r_anc = np.concatenate(([r_excl], r_fin, [r_far]))
-            xi_anc = np.concatenate(([-1.0], xi_fin, [0.0]))
+            xi_anc = np.concatenate(([-1.0], xi_fin, [xi_far]))
             cs = CubicSpline(np.log(r_anc), xi_anc, extrapolate=False)
             xi_int = cs(log_r_int)
+            # Floor: physical exclusion limit at small r.
             xi_int = np.clip(xi_int, -1.0, None)
+            # Ceiling near the far anchor: cubic spline can overshoot
+            # below the anchor (positive→0 transition). fftlog's
+            # log_extrap(fx, N_extrap_high>0) then computes
+            # log(fx[-1]/fx[-2]); if fx[-2] ≤ 0 the ratio is non-positive
+            # and the extension fills with NaN that propagates to the
+            # whole P(k) slice. Clamp the trailing region to xi_far so
+            # fx stays strictly positive on the upper tail.
+            n_tail = max(2, n_int // 20)
+            xi_int[-n_tail:] = np.clip(xi_int[-n_tail:], xi_far, None)
 
             k_s, Pk_s = _fftlog.xi2pk(
                 r_int, xi_int, fftlog_nu,
