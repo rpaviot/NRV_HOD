@@ -947,6 +947,138 @@ def xi_hh_to_Pk_hh(
     return k_out, Pk_at_kout
 
 
+def _xi_threshold_to_pk_threshold(
+    threshold_result: Dict[str, np.ndarray],
+    k_out: Optional[np.ndarray] = None,
+    r_excl: float = 0.01,
+    r_far: float = 2000.0,
+    n_int: int = 4000,
+    N_extrap_low: int = 1024,
+    N_extrap_high: int = 1024,
+    fftlog_nu: float = 1.01,
+) -> tuple:
+    """
+    Inverse Hankel each cumulative-threshold ξ_hh(>M_a, >M_b, r) slice to
+    P_hh(k, >M_a, >M_b). Mirrors DE's `_get_phh_direct` (de_interface.py:403-409):
+    fftlog is fed ξ over a wide r grid (DE uses logspace(-3, 3, 4000)) so
+    the transform converges with the physical small/large-r asymptotics.
+
+    Two anchors enforce those asymptotics before the cubic spline + fftlog:
+
+      * Exclusion anchor: ξ(r=r_excl) = -1. Halos cannot get closer than a
+        couple of virial radii; below the smallest pycorr bin ξ → -1.
+      * Far-field anchor:  ξ(r=r_far)  =  0. Beyond the box the correlation
+        is zero.
+
+    Without these anchors, `fftlog.N_extrap_low` does log-linear extension
+    from r_min, locking in whatever value/noise sits in the smallest bin —
+    which under the IHT becomes a constant P(k) tail at high k.
+    """
+    from scipy.interpolate import CubicSpline
+    try:
+        from dark_emulator import fftlog as _fftlog
+    except ImportError as e:
+        raise ImportError(
+            "dark_emulator is required for the fftlog convention used by DE."
+        ) from e
+
+    r = np.asarray(threshold_result["r"], dtype=np.float64)
+    xi_thr = np.asarray(threshold_result["xi"], dtype=np.float64)
+    T = xi_thr.shape[0]
+
+    r_int = np.logspace(np.log10(r_excl), np.log10(r_far), n_int)
+    log_r_int = np.log(r_int)
+
+    k_out_native = None
+    P_thr_native = None
+
+    for i in range(T):
+        for j in range(T):
+            xi_s = xi_thr[i, j]
+            finite = np.isfinite(xi_s)
+            if finite.sum() < 4:
+                continue
+
+            r_fin = r[finite]
+            # Physical floor at -1 (clip residual numerical undershoot
+            # from the four-corner stitch or pycorr noise).
+            xi_fin = np.clip(xi_s[finite], -1.0, None)
+
+            r_anc = np.concatenate(([r_excl], r_fin, [r_far]))
+            xi_anc = np.concatenate(([-1.0], xi_fin, [0.0]))
+            cs = CubicSpline(np.log(r_anc), xi_anc, extrapolate=False)
+            xi_int = cs(log_r_int)
+            xi_int = np.clip(xi_int, -1.0, None)
+
+            k_s, Pk_s = _fftlog.xi2pk(
+                r_int, xi_int, fftlog_nu,
+                N_extrap_low=N_extrap_low,
+                N_extrap_high=N_extrap_high,
+            )
+            if k_out_native is None:
+                k_out_native = np.asarray(k_s)
+                P_thr_native = np.full((T, T, k_out_native.size), np.nan)
+            P_thr_native[i, j] = np.asarray(Pk_s)
+
+    if k_out_native is None:
+        raise ValueError(
+            "_xi_threshold_to_pk_threshold: every threshold ξ slice is "
+            "non-finite — nothing to transform."
+        )
+
+    if k_out is None:
+        return k_out_native, P_thr_native
+
+    k_out = np.asarray(k_out, dtype=np.float64)
+    P_thr_kout = np.full((T, T, k_out.size), np.nan)
+    log_kn = np.log(k_out_native)
+    log_ko = np.log(k_out)
+    for i in range(T):
+        for j in range(T):
+            Ps = P_thr_native[i, j]
+            if not np.all(np.isfinite(Ps)):
+                continue
+            if (Ps > 0).all():
+                P_thr_kout[i, j] = np.exp(np.interp(log_ko, log_kn, np.log(Ps)))
+            else:
+                P_thr_kout[i, j] = np.interp(log_ko, log_kn, Ps)
+    return k_out, P_thr_kout
+
+
+def _pk_mass_from_pk_threshold(
+    P_thr: np.ndarray,
+    log10M_th: np.ndarray,
+    N_above: np.ndarray,
+    log10M_targets: np.ndarray,
+    eps: float,
+) -> np.ndarray:
+    """
+    Four-corner FD in k-space (DE's `get_phh_mass`, de_interface.py:502-519).
+    Combines threshold P_hh(k, >M_a, >M_b) into fixed-mass P_hh(k, M_i, M_j).
+    Returns array of shape (K, K, n_k).
+    """
+    K = len(log10M_targets)
+    n_k = P_thr.shape[-1]
+    P_hh = np.full((K, K, n_k), np.nan)
+
+    for a, lMa in enumerate(log10M_targets):
+        ima, ipa = _pair_indices_for_target(log10M_th, lMa, eps)
+        Nma = float(N_above[ima]); Npa = float(N_above[ipa])
+        for b, lMb in enumerate(log10M_targets):
+            imb, ipb = _pair_indices_for_target(log10M_th, lMb, eps)
+            Nmb = float(N_above[imb]); Npb = float(N_above[ipb])
+
+            num = (Nma * Nmb * P_thr[ima, imb]
+                   - Nma * Npb * P_thr[ima, ipb]
+                   - Npa * Nmb * P_thr[ipa, imb]
+                   + Npa * Npb * P_thr[ipa, ipb])
+            denom = Nma * Nmb - Nma * Npb - Npa * Nmb + Npa * Npb
+            if abs(denom) < 1e-30:
+                continue
+            P_hh[a, b, :] = num / denom
+    return P_hh
+
+
 def beta_nl_k_from_tabulation(
     threshold_result: Dict[str, np.ndarray],
     log10M_targets: Sequence[float],
@@ -955,10 +1087,12 @@ def beta_nl_k_from_tabulation(
     eps: float = 0.01,
     k_lin: float = 0.02,
     force_to_zero: str = "additive",
-    n_int: int = 2048,
+    n_int: int = 4000,
     N_extrap_low: int = 1024,
     N_extrap_high: int = 1024,
     fftlog_nu: float = 1.01,
+    r_excl: float = 0.01,
+    r_far: float = 2000.0,
 ) -> Dict[str, np.ndarray]:
     """
     Build β^NL(k, M_i, M_j) from a **stitched** threshold ξ_hh tabulation,
@@ -1008,57 +1142,55 @@ def beta_nl_k_from_tabulation(
     if force_to_zero not in ("none", "additive", "multiplicative", "exponential"):
         raise ValueError(f"unknown force_to_zero: {force_to_zero!r}")
 
-    # 1. fixed-mass ξ_hh(r, M_i, M_j) from stitched threshold FD
-    fixed = xi_hh_at_mass(threshold_result, log10M_targets, eps=eps)
-    r = fixed["r"]
-    xi_hh = fixed["xi_hh"]
-    M_targets = fixed["M_targets"]
-    K = len(M_targets)
+    log10M_targets = np.atleast_1d(np.asarray(log10M_targets, dtype=np.float64))
+    log10M_th = np.asarray(threshold_result["log10M_th"], dtype=np.float64)
+    N_above = np.asarray(threshold_result["N_above"], dtype=np.float64)
+    K = len(log10M_targets)
+    M_targets = 10.0 ** log10M_targets
 
-    # 2. inverse HT slice-by-slice → P_hh(k, M_i, M_j)
-    k_native, P_hh_native = xi_hh_to_Pk_hh(
-        r, xi_hh,
-        k_out=None,
+    # 1. HT each cumulative-threshold ξ slice (DE convention:
+    #    de_interface.py:411-442). Wide r grid + exclusion/zero anchors
+    #    so the inverse HT converges to P→0 at high k.
+    k_native, P_thr_native = _xi_threshold_to_pk_threshold(
+        threshold_result, k_out=None,
+        r_excl=r_excl, r_far=r_far,
         n_int=n_int,
         N_extrap_low=N_extrap_low, N_extrap_high=N_extrap_high,
         fftlog_nu=fftlog_nu,
     )
 
-    k = k_native if k_out is None else np.asarray(k_out, dtype=np.float64)
-    if k_out is not None:
-        # resample P_hh onto k_out (positive log-log when feasible)
-        _, P_hh = xi_hh_to_Pk_hh(
-            r, xi_hh, k_out=k,
-            n_int=n_int,
-            N_extrap_low=N_extrap_low, N_extrap_high=N_extrap_high,
-            fftlog_nu=fftlog_nu,
-        )
-    else:
-        P_hh = P_hh_native
+    # 2. Four-corner FD in k-space → fixed-mass P_hh(k, M_i, M_j)
+    P_hh_native = _pk_mass_from_pk_threshold(
+        P_thr_native, log10M_th, N_above, log10M_targets, eps,
+    )
 
-    # 3. linear power on the output grid
+    if k_out is None:
+        k = k_native
+        P_hh = P_hh_native
+    else:
+        k = np.asarray(k_out, dtype=np.float64)
+        log_kn = np.log(k_native); log_ko = np.log(k)
+        P_hh = np.full((K, K, k.size), np.nan)
+        for i in range(K):
+            for j in range(K):
+                Ps = P_hh_native[i, j]
+                if not np.all(np.isfinite(Ps)):
+                    continue
+                if (Ps > 0).all():
+                    P_hh[i, j] = np.exp(np.interp(log_ko, log_kn, np.log(Ps)))
+                else:
+                    P_hh[i, j] = np.interp(log_ko, log_kn, Ps)
+
+    # 3. linear power on the output grid + at k_lin
     P_lin = np.asarray(P_lin_func(k), dtype=np.float64).ravel()
     P_lin_klin = float(np.asarray(P_lin_func(np.array([k_lin]))).ravel()[0])
 
     # 4. halo-halo bias from the diagonal P_hh at k_lin
-    if k_out is not None:
-        # need P_hh exactly at k_lin (independent of user k grid)
-        _, P_hh_at_klin = xi_hh_to_Pk_hh(
-            r, xi_hh, k_out=np.array([k_lin]),
-            n_int=n_int,
-            N_extrap_low=N_extrap_low, N_extrap_high=N_extrap_high,
-            fftlog_nu=fftlog_nu,
-        )
-        P_hh_klin_diag = np.array([P_hh_at_klin[a, a, 0] for a in range(K)])
-    else:
-        # k_native grid: interpolate diagonal to k_lin
-        log_k_native = np.log(k_native)
-        log_klin = np.log(k_lin)
-        P_hh_klin_diag = np.array([
-            np.interp(log_klin, log_k_native, P_hh_native[a, a, :])
-            for a in range(K)
-        ])
-
+    log_kn = np.log(k_native)
+    log_klin = np.log(k_lin)
+    P_hh_klin_diag = np.array([
+        np.interp(log_klin, log_kn, P_hh_native[a, a, :]) for a in range(K)
+    ])
     with np.errstate(invalid="ignore"):
         b_hh = np.sqrt(P_hh_klin_diag / P_lin_klin)
 
@@ -1073,33 +1205,28 @@ def beta_nl_k_from_tabulation(
             with np.errstate(invalid="ignore", divide="ignore"):
                 beta_ij = P_hh[i, j, :] / (b_hh[i] * b_hh[j] * P_lin) - 1.0
 
-            if force_to_zero == "additive":
-                if k_out is None:
-                    P_hh_ij_klin = np.interp(np.log(k_lin), log_k_native,
-                                              P_hh_native[i, j, :])
-                else:
-                    P_hh_ij_klin = float(P_hh_at_klin[i, j, 0])
+            if force_to_zero in ("additive", "multiplicative"):
+                P_hh_ij_klin = np.interp(log_klin, log_kn, P_hh_native[i, j, :])
                 offset = P_hh_ij_klin / (b_hh[i] * b_hh[j] * P_lin_klin) - 1.0
-                beta_ij = beta_ij - offset
-            elif force_to_zero == "multiplicative":
-                if k_out is None:
-                    P_hh_ij_klin = np.interp(np.log(k_lin), log_k_native,
-                                              P_hh_native[i, j, :])
+                if force_to_zero == "additive":
+                    beta_ij = beta_ij - offset
                 else:
-                    P_hh_ij_klin = float(P_hh_at_klin[i, j, 0])
-                offset = P_hh_ij_klin / (b_hh[i] * b_hh[j] * P_lin_klin) - 1.0
-                beta_ij = (beta_ij + 1.0) / (offset + 1.0) - 1.0
+                    beta_ij = (beta_ij + 1.0) / (offset + 1.0) - 1.0
             elif force_to_zero == "exponential":
                 beta_ij = beta_ij * (1.0 - np.exp(-(k / k_lin) ** 2))
             # 'none' → leave as is
 
             beta[i, j, :] = beta_ij
 
+    # Echo fixed-mass ξ for backward-compat consumers (built via the FD-in-r
+    # path; same operator as before, just kept for reporting/plotting).
+    fixed = xi_hh_at_mass(threshold_result, log10M_targets, eps=eps)
+
     return {
         "k": k,
         "M_targets": M_targets,
-        "r": r,
-        "xi_hh": xi_hh,
+        "r": fixed["r"],
+        "xi_hh": fixed["xi_hh"],
         "P_hh": P_hh,
         "P_lin": P_lin,
         "b_hh": b_hh,
