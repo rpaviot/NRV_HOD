@@ -468,11 +468,8 @@ def generate_hod_parameter_grid(
                 for k, v in fixed_params_copy.items():
                     lhs[k] = v
 
-            fsats = np.empty(len(lhs), dtype=np.float64)
-            for i, row in enumerate(lhs.itertuples(index=False)):
-                p = dict(zip(lhs.columns, row))
-                p["Ac"] = Ac_fiducial
-                fsats[i] = float(halo.HOD.compute_fsat(p))
+            params_arrays = {col: lhs[col].to_numpy() for col in lhs.columns}
+            fsats = halo.HOD.compute_fsat_batched(params_arrays, Ac_fiducial)
 
             mask = fsats <= max_fsat
             n_pass = int(mask.sum())

@@ -1,7 +1,9 @@
+import warnings
+import numpy as np
 import jax.numpy as jnp
 import jax.random as jrandom
 import jax.scipy.special as jsp
-from jax import jit
+from jax import jit, vmap
 from scipy.interpolate import CubicSpline as CS
 from HOD_NRV.utilsf.utils_functions import gauss_legendre_integration
 
@@ -375,6 +377,74 @@ class Occupation:
             return float(jnp.sum(probS) / jnp.sum(probC + probS))
         probC, probS = self._compute_prob_bins(dict_params)
         return compute_fsat_(self.logM_bins, self.mass_function, probC, probS)
+
+    def compute_fsat_batched(self, params_dict_of_arrays, Ac_fiducial):
+        """Vectorized f_sat over N HOD parameter rows.
+
+        Evaluates probC/probS on `self.logM_bins` for all rows in one fused JAX
+        kernel (vmap over params), then integrates with the trapezoidal rule.
+        Intended for the `max_fsat` rejection filter in
+        `generate_hod_parameter_grid` — orders of magnitude faster than the
+        scalar `compute_fsat` loop.
+
+        For models with conformity or assembly bias, the no-extension f_sat
+        baseline is used (conformity / AB are second-order corrections to the
+        integrated satellite fraction, and `max_fsat` is a soft user threshold).
+        A warning is issued in those cases. The full HOD with all extensions
+        is still used downstream during grid evaluation.
+
+        Parameters
+        ----------
+        params_dict_of_arrays : dict[str, ndarray]
+            Mapping from free param name to (N,) array of values.
+        Ac_fiducial : float
+            Fiducial Ac value injected into the batch (f_sat is invariant
+            under (Ac, As) joint rescaling, so this matches the convention
+            used in the per-row path).
+
+        Returns
+        -------
+        np.ndarray, shape (N,)
+            f_sat for each row.
+        """
+        if self.conformity or self.assembly_bias:
+            warnings.warn(
+                "compute_fsat_batched ignores conformity/assembly-bias "
+                "corrections; valid only for the max_fsat rejection filter.",
+                stacklevel=2,
+            )
+
+        if self.elg_satellite:
+            sat_fn = ELG_satellite_cutoff
+            sat_names = ["As", "M1", "alpha", "Mcut", "Mmax"]
+        else:
+            sat_fn = HOD_satellite
+            sat_names = ["As", "Mmin", "M1", "alpha", "kappa"]
+
+        n = len(next(iter(params_dict_of_arrays.values())))
+
+        def _col(name):
+            if name == "Ac":
+                return jnp.full((n,), Ac_fiducial)
+            if name in params_dict_of_arrays:
+                return jnp.asarray(params_dict_of_arrays[name])
+            raise KeyError(
+                f"compute_fsat_batched: missing required column '{name}' "
+                f"in params_dict_of_arrays"
+            )
+
+        central_args = [_col(k) for k in self.central_params]
+        sat_args = [_col(k) for k in sat_names]
+
+        in_axes_cen = (None,) + (0,) * len(central_args)
+        in_axes_sat = (None,) + (0,) * len(sat_args)
+        probC = vmap(self.HOD_central, in_axes=in_axes_cen)(self.logM_bins, *central_args)
+        probS = vmap(sat_fn, in_axes=in_axes_sat)(self.logM_bins, *sat_args)
+
+        mf = self.mass_function[None, :]
+        num = jnp.trapezoid(mf * probS, self.logM_bins, axis=-1)
+        den = jnp.trapezoid(mf * (probC + probS), self.logM_bins, axis=-1)
+        return np.asarray(num / den)
 
     def compute_Meff(self, dict_params):
         if self.logM_halos is not None:
