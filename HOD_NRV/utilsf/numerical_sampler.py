@@ -785,12 +785,29 @@ class EmulatorFitter:
         rp_max_wgg: Optional[float] = None,
         # --- Custom priors: {name: (low, high)} to sample, {name: scalar} to fix ---
         param_config: Optional[dict] = None,
+        # --- f_sat truncation prior (mirrors grid-time rejection) ---
+        max_fsat: Optional[float] = None,
+        Ac_fiducial: float = 0.01,
+        hod_occupation=None,
     ):
         self.fit_case = FitCase(fit_case)
         self.M1_fixed = M1_fixed
         self.fixed_params_dict = {"M1": M1_fixed}
         self.rp_min = rp_min
         self.rp_max = rp_max
+
+        # f_sat hard prior: matches the rejection rule applied in
+        # generate_hod_parameter_grid() when the training grid was built with
+        # --max_fsat. compute_fsat_batched is invariant under (Ac, As) joint
+        # rescaling, so Ac_fiducial here is the same convention used at grid time.
+        self.max_fsat = max_fsat
+        self.Ac_fiducial = Ac_fiducial
+        self.hod_occupation = hod_occupation
+        if max_fsat is not None and hod_occupation is None:
+            raise ValueError(
+                "max_fsat requires hod_occupation (pass halo.HOD, an Occupation "
+                "instance) so f_sat can be evaluated via compute_fsat_batched."
+            )
 
         # Load emulator
         self.model, self.norm_stats = load_emulator(emulator_path)
@@ -1059,6 +1076,22 @@ class EmulatorFitter:
             free_dict = dict(theta)
         else:
             free_dict = dict(zip(self.param_names, theta))
+
+        # f_sat truncation prior — identical rejection criterion to the one
+        # used in generate_hod_parameter_grid() at grid build time.
+        if self.max_fsat is not None:
+            try:
+                params_arrays = {
+                    name: np.array([value])
+                    for name, value in {**self.fixed_params_dict, **free_dict}.items()
+                }
+                fsat = float(self.hod_occupation.compute_fsat_batched(
+                    params_arrays, self.Ac_fiducial
+                )[0])
+            except Exception:
+                return -1e100
+            if not np.isfinite(fsat) or fsat > self.max_fsat:
+                return -1e100
 
         try:
             theta_vec = np.array([
