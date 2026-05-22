@@ -18,7 +18,7 @@ Output: host_catalogue_ab.parquet — original catalog + 4 new columns:
 
 import numpy as np
 import pandas as pd
-from HOD_NRV.utilsf.assembly_bias_environment import compute_assembly_bias_properties
+from HOD_NRV.utilsf.fieldmesh import compute_assembly_bias_properties
 
 # ---------------------------------------------------------------------------
 # Paths and parameters (consistent with run_emulator_grid_subhalo.py)

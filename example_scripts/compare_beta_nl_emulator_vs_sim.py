@@ -40,7 +40,7 @@ from HOD_NRV.utilsf.measure_beta_nl_xi import (
     beta_nl_k_from_tabulation,
     load_xi_threshold_grid,
 )
-from HOD_NRV.utilsf.measure_pk import log_kbins
+from HOD_NRV.utilsf.fieldmesh import log_kbins
 from HOD_NRV.utilsf.data_reader import read_halo_catalog
 
 

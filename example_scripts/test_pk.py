@@ -22,7 +22,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from HOD_NRV.HOD_analytical.pycosmo import Cosmology
-from HOD_NRV.utilsf.measure_pk import PowerSpectrumEstimator, log_kbins
+from HOD_NRV.utilsf.fieldmesh import PowerSpectrumEstimator, log_kbins
 
 
 _DEFAULT_PARTICLE_PATH = (
