@@ -50,7 +50,7 @@ _CONFORMITY_PARAMS = [
 # All recognized HOD parameter names — used by set_priors() for validation.
 _ALL_KNOWN_PARAMS = (
     {p[0] for p in _BASE_PARAMS + _EXTENDED_PARAMS + _CONFORMITY_PARAMS}
-    | {"Ac", "As", "M1", "A_cent", "B_cent", "A_sat", "B_sat"}
+    | {"Ac", "As", "M1", "Mmax", "Mcut", "A_cent", "B_cent", "A_sat", "B_sat"}
 )
 
 

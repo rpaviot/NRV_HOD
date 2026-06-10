@@ -69,6 +69,10 @@ HOD_PARAM_DEFINITIONS = {
         'central_params': ['Ac', 'log10Mmin', 'sig_M', 'gamma'],
         'satellite_params': ['As', 'log10Mmin', 'log10M1', 'alpha', 'kappa'],
     },
+    'ELG_MHMQ': {
+        'central_params': ['Ac', 'log10Mmin', 'sig_M', 'gamma'],
+        'satellite_params': ['As', 'log10Mmin', 'log10M1', 'alpha', 'kappa'],
+    },
 }
 
 # Legacy parameter names (for CSMF)
@@ -182,6 +186,40 @@ def elg_sfr_N_central(logM: jnp.ndarray, Ac: float, log10Mmin: float,
     exp_part = elg_ghod_N_central(logM, Ac, log10Mmin, sig_M)
     power_part = Ac / (SQRT_2PI * sig_M) * jnp.power(logM / log10Mmin, gamma)
     return jnp.where(logM < log10Mmin, exp_part, power_part)
+
+
+@jit
+def elg_mhmq_N_central(logM: jnp.ndarray, Ac: float, log10Mmin: float,
+                       sig_M: float, gamma: float) -> jnp.ndarray:
+    """
+    ELG modified High-Mass Quenched (mHMQ) central occupation.
+
+    Gaussian peak multiplied by an asymmetric quenching factor:
+        N_cen = ELG_GHOD(logM) * (1 + erf(gamma * (logM - log10Mmin) / (sqrt(2) * sig_M)))
+
+    Matches HOD_models.ELG_mHMQ from the numerical pipeline.
+
+    Parameters
+    ----------
+    logM : array
+        log10 of halo mass
+    Ac : float
+        Central amplitude
+    log10Mmin : float
+        log10 of peak mass
+    sig_M : float
+        Gaussian width in dex
+    gamma : float
+        Skewness / quenching asymmetry parameter
+
+    Returns
+    -------
+    N_cen : array
+        Mean central occupation
+    """
+    exp_part = elg_ghod_N_central(logM, Ac, log10Mmin, sig_M)
+    quench = 1.0 + erf_jax(gamma * (logM - log10Mmin) / (jnp.sqrt(2.0) * sig_M))
+    return exp_part * quench
 
 
 # ============================================================================
@@ -322,13 +360,14 @@ class AnalyticalHOD:
     >>> N_s = hod.N_satellite(logM)
     """
 
-    SUPPORTED_TYPES = ['LRG', 'ELG_GHOD', 'ELG_SFR']
+    SUPPORTED_TYPES = ['LRG', 'ELG_GHOD', 'ELG_SFR', 'ELG_MHMQ']
 
     # Central function dispatch
     _central_funcs = {
         'LRG': lrg_N_central,
         'ELG_GHOD': elg_ghod_N_central,
         'ELG_SFR': elg_sfr_N_central,
+        'ELG_MHMQ': elg_mhmq_N_central,
     }
 
     def __init__(self, hod_type: str = 'LRG'):
@@ -393,6 +432,8 @@ class AnalyticalHOD:
             return elg_ghod_N_central(logM, self.Ac, self.log10Mmin, self.sig_M)
         elif self.hod_type == 'ELG_SFR':
             return elg_sfr_N_central(logM, self.Ac, self.log10Mmin, self.sig_M, self.gamma)
+        elif self.hod_type == 'ELG_MHMQ':
+            return elg_mhmq_N_central(logM, self.Ac, self.log10Mmin, self.sig_M, self.gamma)
 
     def N_satellite(self, logM: jnp.ndarray) -> jnp.ndarray:
         """
