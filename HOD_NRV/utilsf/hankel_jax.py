@@ -135,7 +135,7 @@ def build_direct_deltasigma(
     mu: float = 2.0,
     pf: float = 1.0 / (2 * np.pi),
     n_gl: int = 200,
-    interp_method: str = "cubic2",
+    interp_method: str = "cubic",
 ) -> _JaxDirectDS:
     """Build a JAX ΔΣ(r_p) transform matching ``Pk_to_DeltaSigma_direct``.
 
@@ -145,7 +145,13 @@ def build_direct_deltasigma(
     over ``rp_bins``.
 
     ``interp_method`` selects the interpax 1-D scheme used in place of scipy's
-    not-a-knot cubic; ``cubic2`` (C2 spline) is the closest analogue.
+    not-a-knot cubic. Use a LOCAL scheme (``cubic`` C1, ``akima``, ``monotonic``)
+    -- these never build a global system, so they are robust under jit/vmap, same
+    as the β^NL interpolator (interpax ``method='linear'``). Avoid ``cubic2``: it
+    is the C2 global spline and solves a tridiagonal system via ``lineax``, which
+    raises on any non-finite input (the FFTLog ds_r carries tiny/extreme values at
+    radii far outside the data range). On real bin-averaged ΔΣ the local ``cubic``
+    reproduces the scipy-cubic reference to ~3e-5 -- ~1000x below the data errors.
     """
     k = np.asarray(k, dtype=float)
     rp_bins = np.asarray(rp_bins, dtype=float)

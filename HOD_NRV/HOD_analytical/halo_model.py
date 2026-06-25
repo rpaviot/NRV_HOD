@@ -22,6 +22,7 @@ from .hod_analytical import (
     HOD_PARAM_DEFINITIONS, CSMF_HOD_PARAMS,
     get_required_params, validate_hod_params,
     AnalyticalHOD, StandardHOD, CSMF_HOD, create_hod,
+    csmf_N_central, csmf_N_satellite,
 )
 
 from .power_spectrum import (
@@ -617,6 +618,94 @@ class HaloModel(Cosmology):
             result.append(ds_iz)
 
         return rp_out, self._squeeze(np.array(result))
+
+    # ------------------------------------------------------------------
+    # Pure / vmap-able CSMF ΔΣ forward pass
+    # ------------------------------------------------------------------
+    def make_deltasigma_jax(self, ds_builder, rp_centers):
+        """Return a pure, ``jax.vmap``-able function ``theta -> ΔΣ[n_z, nbin]``.
+
+        This is a stateless twin of ``set_hod_params``+``DeltaSigma``: instead of
+        mutating ``self.hod.params``/``self.f_c`` and round-tripping through numpy,
+        it threads the HOD parameter vector
+
+            theta = [M0, M1, gamma1, gamma2, sigma_c, alpha_s, b0, b1, f_c, f_s]
+
+        as explicit traced arguments and keeps everything in jnp, so the whole
+        forward pass can be ``jax.vmap``'d over a batch of theta (nautilus
+        ``vectorized=True``). All cosmology / halo-structure / β^NL quantities are
+        fixed at init and captured here as constants; only the HOD params vary.
+
+        Parameters
+        ----------
+        ds_builder : hankel_jax._JaxDirectDS
+            Pure-jnp P_gm -> bin-averaged ΔΣ transform (built for this k-grid and
+            the data's ``rp_bins``); reproduces ``Pk_to_DeltaSigma_direct``.
+        rp_centers : array (nbin,)
+            Data ``r_p`` bin centres, used for the 1-halo stellar point term
+            exactly as the stateful ``DeltaSigma`` adds it (at ``rp_out``).
+
+        Returns
+        -------
+        callable : theta[10] -> jnp.ndarray of shape (n_z, nbin)
+        """
+        if not isinstance(self.hod, CSMF_HOD):
+            raise TypeError("make_deltasigma_jax supports the CSMF HOD only "
+                            f"(got {type(self.hod).__name__}).")
+
+        use_beta_nl = self.include_beta_nl and len(self._beta_nl_gl_cache) > 0
+        n_z = self.n_z
+        M = self._M_jax
+        rho_m = self.RHO_M
+        log10M_min, log10M_max = self.log10M_min, self.log10M_max
+        # CSMF_HOD.set_params converts M0,M1 from log10 to linear mass when
+        # masses_are_log10 (the rest pass through). The de-stated path calls
+        # csmf_N_central/satellite directly, so we must apply the SAME transform.
+        masses_are_log10 = self.hod.masses_are_log10
+
+        # Stellar 1-halo point term, added at the data rp centres (matches the
+        # stateful DeltaSigma: median_Mstar/(π rp²)/1e12, *h if units_per_h).
+        stellar = None
+        if self.median_Mstar is not None:
+            h_fac = self.h if self.units_per_h else 1.0
+            rp_c = jnp.asarray(rp_centers)
+            stellar = (jnp.asarray(self.median_Mstar) * h_fac / 1e12)[:, None] \
+                / (jnp.pi * rp_c[None, :] ** 2)
+
+        def _predict(theta):
+            M0, M1, g1, g2, sig, al, b0, b1, f_c, f_s = (theta[i] for i in range(10))
+            if masses_are_log10:
+                M0 = 10.0 ** M0
+                M1 = 10.0 ** M1
+            rows = []
+            for iz in range(n_z):
+                ms_lo = self._Mstar_min_jax[iz]
+                ms_hi = self._Mstar_max_jax[iz]
+                N_c = csmf_N_central(M, ms_lo, ms_hi, M0, M1, g1, g2, sig)
+                N_s = csmf_N_satellite(M, ms_lo, ms_hi, M0, M1, g1, g2, al, b0, b1)
+                if use_beta_nl:
+                    Pgm = _compute_Pgm_with_beta_nl(
+                        N_c, N_s, self._n_M_jax[iz], self._b_h_jax[iz],
+                        self._R_s_jax[iz], self._c_jax[iz],
+                        self._Pk_lin_jax[iz], self._k_jax, M, rho_m,
+                        log10M_min, log10M_max, f_c, f_s,
+                        self._beta_nl_gl_cache[iz], self._beta_nl_Mmin_col_cache[iz],
+                        self._R_s_Mmin_jax[iz], self._c_Mmin_jax[iz],
+                    )
+                else:
+                    Pgm = _compute_Pgm(
+                        N_c, N_s, self._n_M_jax[iz], self._b_h_jax[iz],
+                        self._R_s_jax[iz], self._c_jax[iz],
+                        self._Pk_lin_jax[iz], self._k_jax, M, rho_m,
+                        log10M_min, log10M_max, f_c, f_s,
+                    )
+                rows.append(ds_builder.transform(Pgm, rho_m))   # (nbin,)
+            ds_all = jnp.stack(rows)                            # (n_z, nbin)
+            if stellar is not None:
+                ds_all = ds_all + stellar
+            return ds_all
+
+        return jax.jit(_predict)
 
 
 __all__ = [
