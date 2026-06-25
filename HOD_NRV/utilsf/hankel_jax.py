@@ -31,6 +31,11 @@ import numpy as np
 from scipy.special import gamma as _cgamma, roots_legendre
 
 import jax
+# This transform is designed to reproduce FAST-PT's float64 FFTLog to machine
+# precision; in float32 the rfft/irfft and the cubic spline solve lose ~6-7
+# digits. Enable x64 at import so correctness does not depend on some other
+# module (e.g. halo_model) happening to switch it on first.
+jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import interpax
 

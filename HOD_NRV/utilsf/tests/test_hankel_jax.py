@@ -13,9 +13,15 @@ from HOD_NRV.utilsf.hankel_transforms import Pk_to_DeltaSigma_direct
 from HOD_NRV.utilsf.hankel_jax import build_direct_deltasigma
 
 
-def _mock_pgm(k, knl=0.3, amp=2.0e4):
-    """A smooth, P_gm-like spectrum: small-k power law with a soft cut."""
-    return amp * (k / 0.1) ** (-1.5) / (1.0 + (k / knl) ** 2)
+def _mock_pgm(k, knl=0.3, amp=2.0e4, wiggle=0.0):
+    """A P_gm-like spectrum: small-k power law, soft cut, optional BAO-like wiggle.
+
+    ``wiggle`` adds an oscillation in log k to mimic the features (BAO, β^NL) a
+    real halo-model P_gm carries, stressing the spline interpolation harder than
+    a perfectly smooth curve.
+    """
+    osc = 1.0 + wiggle * np.sin(40.0 * np.log(k))
+    return amp * (k / 0.1) ** (-1.5) * osc / (1.0 + (k / knl) ** 2)
 
 
 def _run(method="cubic2"):
@@ -30,7 +36,10 @@ def _run(method="cubic2"):
     rng = np.random.default_rng(0)
     max_rel = 0.0
     for i in range(n_curves):
-        Pk = _mock_pgm(k, knl=0.2 + 0.3 * rng.random(), amp=(1 + rng.random()) * 1e4)
+        # half the curves carry a BAO-like wiggle to stress the interpolation
+        Pk = _mock_pgm(k, knl=0.2 + 0.3 * rng.random(),
+                       amp=(1 + rng.random()) * 1e4,
+                       wiggle=0.05 if i % 2 else 0.0)
         _, ds_ref = Pk_to_DeltaSigma_direct(k, Pk, rho_m, None, rp_bins=rp_bins)
         ds_jax = np.asarray(builder(Pk, rho_m))
         rel = np.abs(ds_jax - ds_ref) / np.abs(ds_ref)
