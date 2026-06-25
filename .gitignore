@@ -176,13 +176,9 @@ test_sim.ipynb
 create_virtual_snapshot.py
 downsample.py 
 flamingo_0057_downsampled.hdf5
-CLAUDE.md
-EXTENDED_NFW_CHANGES.md
-EMULATOR_README.md
 example_emulator_parameter_generation.py
 test_emulator_performance.ipynb
 HOD_NRV/test/output
-HOD_NRV/twopoint_calculator/README_MEMMAP.md
 two_point.py
 
 # IDE and editor directories
@@ -206,7 +202,11 @@ HOD_NRV/HOD_numerical/test/output/
 *.hdf5
 *.txt
 HOD_NRV/utilsf/subhalo_catalogue.py
+# beta^NL-from-simulation test (untracked, kept locally)
 HOD_NRV/utilsf/measure_beta_nl.py
+HOD_NRV/utilsf/measure_beta_nl_xi.py
+HOD_NRV/HOD_analytical/emu_numerical.py
+example_scripts/compare_beta_nl_emulator_vs_sim.py
 #common_test/precompute_subhalo_catalogue.py
 #common_test/cross_check_nfw_vs_subhalo.py  
 example_scripts/cross_check_emulator_grid.py
