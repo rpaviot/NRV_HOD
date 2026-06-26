@@ -1052,7 +1052,97 @@ class CSMFFitter:
                     return -1e100
         
         return total_log_L
-    
+
+    def build_batched_loglike(self, jit: bool = True):
+        """Build a ``jax.vmap``-batched ΔΣ log-likelihood for ``vectorized=True``.
+
+        Returns ``(loglike_fn, free_names)``. ``loglike_fn`` maps a
+        ``(n_batch, n_free)`` array of free-parameter points — columns ordered as
+        ``free_names`` — to a ``(n_batch,)`` numpy array of log-likelihoods. It is
+        the batched twin of :meth:`log_likelihood`: pure data χ² summed over mass
+        bins, with the prior (including any Gaussian γ1) left to nautilus's prior
+        transform exactly as in the serial path.
+
+        Mechanics: the de-stated pure forward pass
+        ``HaloModel.make_deltasigma_jax`` (theta[10] -> ΔΣ[n_z, nbin]) is wrapped in
+        ``jax.vmap`` over the batch; data, scale-cut mask and inverse covariance are
+        pre-computed once per bin. Assumes a shared rp grid / scale cut across bins
+        (the model already evaluates all bins on ``mass_bins[0].rp``) and
+        DeltaSigma-only observables.
+        """
+        import jax
+        import jax.numpy as jnp
+        from HOD_NRV.utilsf.hankel_jax import build_direct_deltasigma
+
+        if 'WGG' in self.observables:
+            raise NotImplementedError(
+                "build_batched_loglike supports DeltaSigma-only fits.")
+
+        if self._halo_model is None:
+            self._initialize_halo_model()
+        hm = self._halo_model
+
+        # Pure forward pass theta[10] -> ΔΣ[n_z, nbin] on the model's k-grid.
+        k = np.asarray(hm.get_k())
+        rp_bins = np.asarray(self.mass_bins[0].rp_bins)
+        rp_centers = np.asarray(self.mass_bins[0].rp)
+        ds_builder = build_direct_deltasigma(k, rp_bins)
+        predict = hm.make_deltasigma_jax(ds_builder, rp_centers)
+
+        # Per-bin data / mask / inverse covariance (bins in z order = vmap order).
+        masks, data_rows, covinv_rows = [], [], []
+        for mb in self.mass_bins:
+            _, ds_data, cov, mask = self._apply_scale_cuts(mb)
+            masks.append(mask)
+            data_rows.append(ds_data)
+            covinv_rows.append(np.linalg.inv(cov))
+        mask0 = masks[0]
+        if not all(np.array_equal(m, mask0) for m in masks):
+            raise ValueError(
+                "build_batched_loglike assumes a shared rp scale cut across bins.")
+        mask_idx = jnp.asarray(np.where(mask0)[0])         # kept-bin indices
+        ds_data_all = jnp.asarray(np.stack(data_rows))     # (n_z, ncut)
+        covinv_all = jnp.asarray(np.stack(covinv_rows))    # (n_z, ncut, ncut)
+
+        # Static map: nautilus free-param columns -> 10-slot theta vector.
+        names = ['M0', 'M1', 'gamma1', 'gamma2', 'sigma_c', 'alpha_s',
+                 'b0', 'b1', 'f_c', 'f_s']
+        free_names = [n for n in names
+                      if n in self.priors and self.priors[n].prior_type != 'fixed']
+        free_idx = {n: i for i, n in enumerate(free_names)}
+        const_val = {}
+        for n in names:
+            if n in free_idx:
+                continue
+            if n in self.priors and self.priors[n].prior_type == 'fixed':
+                const_val[n] = float(self.priors[n].fixed_value)
+            else:
+                const_val[n] = 1.0     # f_c / f_s absent entirely -> profile default
+        take_col = [free_idx.get(n, -1) for n in names]    # -1 == fixed constant
+        consts = [const_val.get(n, 0.0) for n in names]
+
+        vpredict = jax.vmap(predict)                       # (n,10) -> (n, n_z, nbin)
+
+        def _loglike(points):
+            points = jnp.asarray(points)
+            npts = points.shape[0]
+            cols = [points[:, take_col[s]] if take_col[s] >= 0
+                    else jnp.full((npts,), consts[s]) for s in range(len(names))]
+            theta = jnp.stack(cols, axis=1)                # (n, 10)
+            ds = vpredict(theta)                           # (n, n_z, nbin)
+            resid = ds_data_all[None] - ds[:, :, mask_idx]  # (n, n_z, ncut)
+            chi2 = jnp.einsum('nzi,zij,nzj->n', resid, covinv_all, resid)
+            logL = -0.5 * chi2
+            good = jnp.isfinite(ds).all(axis=(1, 2)) & jnp.isfinite(logL)
+            return jnp.where(good, logL, -1e100)
+
+        compiled = jax.jit(_loglike) if jit else _loglike
+
+        def loglike_fn(points):
+            return np.asarray(compiled(points))
+
+        return loglike_fn, free_names
+
     # ========================================================================
     # Minimization Methods
     # ========================================================================
@@ -1575,6 +1665,7 @@ class CSMFFitter:
         filepath: Optional[str] = None,
         seed: Optional[int] = None,
         pool: Optional[Any] = None,
+        vectorized: bool = False,
         **nautilus_kwargs
     ) -> Dict:
         """
@@ -1616,18 +1707,34 @@ class CSMFFitter:
             self._initialize_halo_model()
         
         nautilus_prior = self._build_nautilus_prior()
-        
+
         if self.verbose:
             print(f"\nFree parameters: {list(nautilus_prior.keys)}")
             print(f"Fixed parameters: {self.fixed_params}")
-        
+
+        if vectorized:
+            likelihood, free_names = self.build_batched_loglike()
+            # nautilus passes points as (n_batch, n_dim) in prior-key order with
+            # pass_dict=False; our batched columns must follow the same order.
+            if list(nautilus_prior.keys) != free_names:
+                raise RuntimeError(
+                    "Free-parameter ordering mismatch between nautilus prior "
+                    f"{list(nautilus_prior.keys)} and batched likelihood {free_names}")
+            vec_kwargs = dict(vectorized=True, pass_dict=False)
+            if self.verbose:
+                print("Using vmap-batched vectorized likelihood (pass_dict=False).")
+        else:
+            likelihood = self.log_likelihood
+            vec_kwargs = {}
+
         self.sampler = Sampler(
             nautilus_prior,
-            self.log_likelihood,
+            likelihood,
             n_live=n_live,
             filepath=filepath,
             seed=seed,
             pool=pool,
+            **vec_kwargs,
             **nautilus_kwargs
         )
         
