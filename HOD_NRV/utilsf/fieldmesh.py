@@ -134,6 +134,36 @@ def apply_interlacing(fourier1: np.ndarray, fourier2: np.ndarray) -> None:
                                            + phase * fourier2[i, j, k])
 
 
+def interlaced_fourier_density(pos: np.ndarray, Nmesh: int, threads: int) -> np.ndarray:
+    """Paint ``pos`` and its half-cell-shifted copy, FFT both, and combine via
+    Jing-2005 interlacing.
+
+    Owns the whole second-field (``fourier2``) construction so callers only hand
+    over positions. ``pos`` must already be in the unit box ``[0, 1)`` (the
+    half-cell shift is ``0.5 / Nmesh`` in those units). The returned Fourier
+    field is NOT yet MAS-compensated — callers apply ``compensate_mas`` after.
+    """
+    delta1 = TSC(pos, ncells_1d=Nmesh)
+    m1 = np.mean(delta1)
+    deltak1 = fft_3D_real((delta1 - m1) / m1, threads=threads)
+    del delta1
+    gc.collect()
+
+    # Half-cell-shifted paint for Jing-2005 interlacing.
+    pos_shifted = pos + np.float32(0.5 / Nmesh)
+    periodic_wrap(pos_shifted)
+    delta2 = TSC(pos_shifted, ncells_1d=Nmesh)
+    del pos_shifted
+    m2 = np.mean(delta2)
+    deltak2 = fft_3D_real((delta2 - m2) / m2, threads=threads)
+    del delta2
+    gc.collect()
+
+    apply_interlacing(deltak1, deltak2)
+    del deltak2
+    return deltak1
+
+
 def compute_Tij(i: int, j: int, deltak: np.ndarray, phase_axes: Tuple[np.ndarray, ...],
                 halo_positions: np.ndarray, k2: np.ndarray, threads: int = 32) -> np.ndarray:
     """Tidal tensor component T_ij evaluated at halo positions."""
@@ -216,30 +246,9 @@ class PowerSpectrumEstimator:
         else:
             pos = positions.astype(np.float32, copy=False)
 
-        delta1 = TSC(pos, ncells_1d=self.Nmesh)
-        m1 = np.mean(delta1)
-        delta1 = (delta1 - m1) / m1
-        deltak1 = fft_3D_real(delta1, threads=self.threads)
-        del delta1
-        gc.collect()
-
-        # Half-cell-shifted paint for Jing-2005 interlacing.
-        shift = np.float32(0.5 / self.Nmesh)
-        pos_shifted = pos + shift
-        periodic_wrap(pos_shifted)
-        del pos
-        delta2 = TSC(pos_shifted, ncells_1d=self.Nmesh)
-        del pos_shifted
-        m2 = np.mean(delta2)
-        delta2 = (delta2 - m2) / m2
-        deltak2 = fft_3D_real(delta2, threads=self.threads)
-        del delta2
-        gc.collect()
-
-        apply_interlacing(deltak1, deltak2)
-        del deltak2
-        compensate_mas(deltak1, p=3)
-        return deltak1
+        deltak = interlaced_fourier_density(pos, self.Nmesh, self.threads)
+        compensate_mas(deltak, p=3)
+        return deltak
 
     def auto_pk(
         self,
@@ -357,30 +366,9 @@ class AssemblyBiasEnvironment:
         else:
             positions = particle_positions.astype(np.float32)
 
-        delta1 = TSC(positions, ncells_1d=self.Nmesh)
-        m1 = np.mean(delta1)
-        delta1 = (delta1 - m1) / m1
-        deltak1 = fft_3D_real(delta1, threads=self.threads)
-        del delta1
-        gc.collect()
-
-        shift = np.float32(0.5 / self.Nmesh)
-        positions_shifted = positions + shift
-        periodic_wrap(positions_shifted)
-        del positions
-        delta2 = TSC(positions_shifted, ncells_1d=self.Nmesh)
-        del positions_shifted
-        m2 = np.mean(delta2)
-        delta2 = (delta2 - m2) / m2
-        deltak2 = fft_3D_real(delta2, threads=self.threads)
-        del delta2
-        gc.collect()
-
-        apply_interlacing(deltak1, deltak2)
-        del deltak2
-        compensate_mas(deltak1, p=3)
-
-        return deltak1
+        deltak = interlaced_fourier_density(positions, self.Nmesh, self.threads)
+        compensate_mas(deltak, p=3)
+        return deltak
 
     def compute_density_field(self, particle_positions: np.ndarray,
                               normalize: bool = True) -> np.ndarray:
