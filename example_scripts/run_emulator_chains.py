@@ -76,17 +76,17 @@ COLORS = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']
 
 # Uniform prior ranges. Every free parameter referenced anywhere lives here.
 PRIOR_RANGES = {
-    "As":         (0.002, 0.08),
+    "As":         (0.001, 0.1),
     "Mmin":       (11.1,  13.0),
-    "sig_M":      (0.05,  1.5),
-    "gamma":      (0.1,   10.0),
-    "alpha":      (0.05,  1.5),
+    "sig_M":      (0.05,  2.0),
+    "gamma":      (0.0,   10.0),
+    "alpha":      (0.1,   2.0),
     "kappa":      (0.1,   2.0),     # standard satellite cutoff
     "Mcut":       (11.5,  13.5),    # ELG satellite cutoff (replaces kappa)
-    "lambda_NFW": (0.05,  1.0),
+    "lambda_NFW": (0.1,   2.0),
     "f_exp":      (0.0,   0.9),
     "tau":        (1.0,   10.0),
-    "kappa_EE":   (0.05,  1.0),
+    "kappa_EE":   (0.5,   1.0),
     "B_cent":     (-0.5,  0.5),
     "B_sat":      (-0.5,  0.5),
 }

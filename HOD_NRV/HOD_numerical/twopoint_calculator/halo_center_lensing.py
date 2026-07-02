@@ -168,7 +168,7 @@ def _process_batch_with_query(halo_indices):
     n_comp_bins = len(bins_comp) - 1
 
     results = np.empty((len(halo_indices), n_rp_bins))
-    sub_chunk_size = 100
+    sub_chunk_size = 10
     ptr = 0
 
     for start in range(0, len(halo_indices), sub_chunk_size):
@@ -351,7 +351,7 @@ def precompute_halo_center_lensing(
     rp_bins : np.ndarray
         Projected separation bin edges [Mpc/h]
     bins_comp : np.ndarray, optional
-        Computation bins for xi_gm. Default: geomspace(5e-3, 120, 151)
+        Computation bins for xi_gm. Default: geomspace(5e-3, 120, 201)
     verbose : bool, default=True
         Print progress information
     n_workers : int, default=-1
@@ -566,7 +566,7 @@ class OptimizedDeltaSigmaCalculator:
             Surface mass density contrast [Msun h/pc^2]
         """
         if bins_comp is None:
-            bins_comp = np.geomspace(5e-3, 120, 151)
+            bins_comp = np.geomspace(5e-3, 120, 201)
 
         rp_centers = np.sqrt(rp_bins[:-1] * rp_bins[1:])
         n_rp_bins = len(rp_bins) - 1

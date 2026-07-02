@@ -28,7 +28,9 @@ from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import precom
 HALO_PATH = "/Users/ler13nrv/Documents/flamingo_data/parquet_halo_catalogue_L1000N1800.parquet"
 PARTICLE_PATH = "/Users/ler13nrv/Documents/flamingo_data/particle_catalogue_L1000N1800_downsampled.parquet"
 
-PARTICLE_FRACTION = 0.05
+# Use >=5x the grid-evaluation fraction (0.05) so the per-halo cached DeltaSigma
+# profiles are not noisy; the cache is computed once, so the extra cost is fine.
+PARTICLE_FRACTION = 0.25
 PARTICLE_SUBSAMPLE_SEED = 99
 CACHE_OUTPUT = "halo_center_lensing_cache.h5"
 
@@ -53,7 +55,7 @@ dict_cosmo = {
 
 
 # Lensing bins (same as example)
-rp_bins = np.geomspace(0.1, 50.0, 16)
+rp_bins = np.geomspace(0.1, 50.0, 26)
 
 # ============================================================================
 # Helper
