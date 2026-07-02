@@ -605,3 +605,176 @@ class EmulatorFitter:
             if hasattr(self, "cov_wgg"):
                 arrays["cov_wgg"] = self.cov_wgg
         np.savez(path, **arrays)
+
+
+# ---------------------------------------------------------------------------
+# TabulatedFitter — Nautilus sampler backed by TabulatedDeltaSigma (no emulator)
+# ---------------------------------------------------------------------------
+
+class TabulatedFitter(EmulatorFitter):
+    """
+    Nautilus sampler calling TabulatedDeltaSigma.predict() directly.
+
+    Replaces the LHS grid + NN emulator: each likelihood call rescales
+    (Ac, As) to ``target_ngal`` (same convention as the grid pipeline),
+    evaluates the tabulated DeltaSigma (exact expectation of the MC forward
+    model, ~0.2-0.5 s/call), and log-log interpolates onto the observed rp
+    grid. Uses pure NumPy/SciPy in the likelihood so fork-based Nautilus
+    pools are safe (no JAX in workers) — except the per-halo occupation,
+    which goes through the halo model's JAX functions (works in practice,
+    see project notes).
+
+    Parameters
+    ----------
+    tabulated_ds : TabulatedDeltaSigma
+        Predictor built from a cache with xi_gm tabulation.
+    occupation_rescale : Occupation
+        NON-assembly-bias Occupation used only for the (Ac, As) -> ngal
+        rescaling (mirrors _full_rescaled_params in run_emulator_chains).
+    target_ngal : float
+        Galaxy number density the (Ac, As) pair is rescaled to.
+    Other arguments are as in EmulatorFitter (data_path / arrays, rp cuts,
+    param_config, max_fsat, ...). ``emulator_path`` is not used.
+    """
+
+    def __init__(
+        self,
+        tabulated_ds,
+        occupation_rescale,
+        target_ngal: float,
+        fit_case: FitCase = FitCase.STANDARD_NFW,
+        data_path: str = "",
+        ds_obs: Optional[np.ndarray] = None,
+        cov_inv: Optional[np.ndarray] = None,
+        rp_obs: Optional[np.ndarray] = None,
+        M1_fixed: float = 13.0,
+        rp_min: Optional[float] = None,
+        rp_max: Optional[float] = None,
+        param_config: Optional[dict] = None,
+        max_fsat: Optional[float] = None,
+        Ac_fiducial: float = 0.01,
+        hod_occupation=None,
+    ):
+        self.fit_case = FitCase(fit_case)
+        self.M1_fixed = M1_fixed
+        self.fixed_params_dict = {"M1": M1_fixed}
+        self.rp_min = rp_min
+        self.rp_max = rp_max
+
+        self.max_fsat = max_fsat
+        self.Ac_fiducial = Ac_fiducial
+        self.hod_occupation = hod_occupation
+        if max_fsat is not None and hod_occupation is None:
+            raise ValueError("max_fsat requires hod_occupation.")
+
+        self.tab = tabulated_ds
+        self.occupation_rescale = occupation_rescale
+        self.target_ngal = target_ngal
+        # Model rp grid = the cache binning the tabulated profiles live on
+        self.emulator_rp = np.asarray(tabulated_ds.cache.rp_centers)
+        self.emulator_param_order = []   # no emulator
+
+        self.free_params = _get_free_params(self.fit_case)
+        self.param_names = [p[0] for p in self.free_params]
+        self.n_params = len(self.free_params)
+
+        if data_path:
+            self._load_data(data_path)
+        elif ds_obs is not None and cov_inv is not None and rp_obs is not None:
+            self.rp_obs = np.asarray(rp_obs)
+            self.ds_obs = np.asarray(ds_obs)
+            self.cov_inv = np.asarray(cov_inv)
+            mask = np.ones(len(self.rp_obs), dtype=bool)
+            if rp_min is not None:
+                mask &= (self.rp_obs >= rp_min)
+            if rp_max is not None:
+                mask &= (self.rp_obs <= rp_max)
+            if not mask.all():
+                self.rp_obs = self.rp_obs[mask]
+                self.ds_obs = self.ds_obs[mask]
+                self.cov_inv = self.cov_inv[np.ix_(mask, mask)]
+            self.n_bins = len(self.ds_obs)
+        else:
+            raise ValueError("Provide data_path or (ds_obs, cov_inv, rp_obs).")
+
+        self._setup_interp()
+        self._fit_wgg = False
+
+        if param_config is not None:
+            priors, fixed = _parse_param_config(param_config)
+            self.set_priors(priors, fixed)
+
+    def set_priors(self, priors, fixed_params=()):
+        """As EmulatorFitter.set_priors but without emulator-name filtering."""
+        self.fixed_params_dict = dict(fixed_params)
+        if "M1" not in self.fixed_params_dict:
+            self.fixed_params_dict["M1"] = self.M1_fixed
+        else:
+            self.M1_fixed = self.fixed_params_dict["M1"]
+
+        active = []
+        for entry in priors:
+            if len(entry) == 3:
+                name, a, b = entry
+                kind = "uniform"
+            else:
+                name, a, b, kind = entry
+            if name not in _ALL_KNOWN_PARAMS:
+                warnings.warn(f"set_priors: unknown parameter '{name}'; ignoring.")
+            else:
+                active.append((name, float(a), float(b), kind))
+
+        self.free_params = active
+        self.param_names = [p[0] for p in active]
+        self.n_params = len(active)
+
+    def full_params(self, free_dict):
+        """Merge free + fixed and rescale (Ac, As) to target_ngal."""
+        from HOD_NRV.HOD_numerical.HOD_models import rescale_Ac_to_target_ngal
+        merged = {**self.fixed_params_dict, **free_dict}
+        merged.pop("Ac", None)
+        Ac, As = rescale_Ac_to_target_ngal(
+            self.occupation_rescale, merged, self.target_ngal,
+            Ac_fiducial=self.Ac_fiducial)
+        return {**merged, "Ac": float(np.asarray(Ac).ravel()[0]),
+                "As": float(np.asarray(As).ravel()[0])}
+
+    def predict_at_obs(self, free_dict, rp_eval=None):
+        """Tabulated DeltaSigma log-log interpolated onto rp_eval (or rp_obs)."""
+        from scipy.interpolate import CubicSpline
+        full = self.full_params(free_dict)
+        _, ds_pred, _ = self.tab.predict(full)
+        if not np.all(np.isfinite(ds_pred)):
+            raise ValueError("non-finite tabulated prediction")
+        log_rp = np.log(rp_eval) if rp_eval is not None else self._log_rp_obs
+        spl = CubicSpline(self._log_rp_emu, np.log(np.maximum(ds_pred, 1e-30)))
+        return np.exp(spl(log_rp))
+
+    def log_likelihood(self, theta) -> float:
+        if isinstance(theta, dict):
+            free_dict = dict(theta)
+        else:
+            free_dict = dict(zip(self.param_names, theta))
+
+        if self.max_fsat is not None:
+            try:
+                params_arrays = {
+                    name: np.array([value])
+                    for name, value in {**self.fixed_params_dict, **free_dict}.items()
+                }
+                fsat = float(self.hod_occupation.compute_fsat_batched(
+                    params_arrays, self.Ac_fiducial)[0])
+            except Exception:
+                return -1e100
+            if not np.isfinite(fsat) or fsat > self.max_fsat:
+                return -1e100
+
+        try:
+            ds_at_obs = self.predict_at_obs(free_dict)
+        except Exception:
+            return -1e100
+        if not np.all(np.isfinite(ds_at_obs)):
+            return -1e100
+
+        residual = ds_at_obs - self.ds_obs
+        return -0.5 * float(residual @ self.cov_inv @ residual)

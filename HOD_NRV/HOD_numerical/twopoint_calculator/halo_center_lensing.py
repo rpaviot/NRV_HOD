@@ -36,9 +36,11 @@ import numpy as np
 import h5py
 from typing import Dict, Optional, Tuple
 from scipy.spatial import cKDTree
+from scipy.interpolate import interp1d
 
+from HOD_NRV.utilsf.utils_functions import gauss_legendre_integration
 from .standard_two_point_calculator import (
-    compute_corr, DeltaSigmaCalculator
+    compute_corr, DeltaSigmaCalculator, binavg_2D
 )
 
 def periodic_distance(pos1: np.ndarray, pos2: np.ndarray, boxsize: float) -> np.ndarray:
@@ -130,6 +132,12 @@ def _process_batch_prequeried(halo_indices):
     idx_lists = s['idx_lists']
     n_comp_bins = len(bins_comp) - 1
 
+    halo_bin_index = s.get('halo_bin_index')
+    tabulate = halo_bin_index is not None
+    if tabulate:
+        xi_sum = np.zeros((s['n_bins'], n_comp_bins))
+        xi_count = np.zeros(s['n_bins'])
+
     results = np.empty((len(halo_indices), n_rp_bins))
 
     for k, i in enumerate(halo_indices):
@@ -143,9 +151,15 @@ def _process_batch_prequeried(halo_indices):
             counts, _ = np.histogram(r, bins=bins_comp)
             xi_gm = (counts / shell_volumes / n_mean) - 1.0
 
+        if tabulate:
+            xi_sum[halo_bin_index[i]] += xi_gm
+            xi_count[halo_bin_index[i]] += 1
+
         calc = DeltaSigmaCalculator(r_centers, xi_gm, RHO_M, chi_max=chi_max)
         results[k] = calc.compute_deltasigma_averaged(rp_bins)
 
+    if tabulate:
+        return results, xi_sum, xi_count
     return results
 
 
@@ -166,6 +180,12 @@ def _process_batch_with_query(halo_indices):
     search_radius = s['search_radius']
     kdtree = s['kdtree']
     n_comp_bins = len(bins_comp) - 1
+
+    halo_bin_index = s.get('halo_bin_index')
+    tabulate = halo_bin_index is not None
+    if tabulate:
+        xi_sum = np.zeros((s['n_bins'], n_comp_bins))
+        xi_count = np.zeros(s['n_bins'])
 
     results = np.empty((len(halo_indices), n_rp_bins))
     sub_chunk_size = 10
@@ -189,10 +209,16 @@ def _process_batch_with_query(halo_indices):
                 counts, _ = np.histogram(r, bins=bins_comp)
                 xi_gm = (counts / shell_volumes / n_mean) - 1.0
 
+            if tabulate:
+                xi_sum[halo_bin_index[i]] += xi_gm
+                xi_count[halo_bin_index[i]] += 1
+
             calc = DeltaSigmaCalculator(r_centers, xi_gm, RHO_M, chi_max=chi_max)
             results[ptr] = calc.compute_deltasigma_averaged(rp_bins)
             ptr += 1
 
+    if tabulate:
+        return results, xi_sum, xi_count
     return results
 
 
@@ -231,13 +257,25 @@ class HaloCenterLensingCache:
         positions: np.ndarray,
         deltasigma: np.ndarray,
         rp_bins: np.ndarray,
-        metadata: Optional[Dict] = None
+        metadata: Optional[Dict] = None,
+        xi_gm_bins: Optional[np.ndarray] = None,
+        bin_counts: Optional[np.ndarray] = None,
+        bins_comp: Optional[np.ndarray] = None,
+        bin_logM_edges: Optional[np.ndarray] = None,
+        bin_fI_edges: Optional[np.ndarray] = None,
     ):
         self.positions = np.asarray(positions)
         self.deltasigma = np.asarray(deltasigma)
         self.rp_bins = np.asarray(rp_bins)
         self.rp_centers = np.sqrt(rp_bins[:-1] * rp_bins[1:])
         self.metadata = metadata or {}
+
+        # Optional TabCorr-style tabulation: mean xi_gm(r) per (logM [, fI]) bin
+        self.xi_gm_bins = None if xi_gm_bins is None else np.asarray(xi_gm_bins)
+        self.bin_counts = None if bin_counts is None else np.asarray(bin_counts)
+        self.bins_comp = None if bins_comp is None else np.asarray(bins_comp)
+        self.bin_logM_edges = None if bin_logM_edges is None else np.asarray(bin_logM_edges)
+        self.bin_fI_edges = None if bin_fI_edges is None else np.asarray(bin_fI_edges)
 
         # Validate shapes
         n_halos = len(positions)
@@ -247,6 +285,10 @@ class HaloCenterLensingCache:
                 f"deltasigma shape {deltasigma.shape} doesn't match "
                 f"expected ({n_halos}, {n_rp_bins})"
             )
+
+    @property
+    def has_tabulation(self) -> bool:
+        return self.xi_gm_bins is not None
 
     def save(self, output_path: str) -> None:
         """
@@ -261,6 +303,16 @@ class HaloCenterLensingCache:
             f.create_dataset('positions', data=self.positions, compression='gzip')
             f.create_dataset('deltasigma', data=self.deltasigma, compression='gzip')
             f.create_dataset('rp_bins', data=self.rp_bins)
+
+            if self.has_tabulation:
+                tab_grp = f.create_group('tabulation')
+                tab_grp.create_dataset('xi_gm_bins', data=self.xi_gm_bins,
+                                       compression='gzip')
+                tab_grp.create_dataset('bin_counts', data=self.bin_counts)
+                tab_grp.create_dataset('bins_comp', data=self.bins_comp)
+                tab_grp.create_dataset('bin_logM_edges', data=self.bin_logM_edges)
+                if self.bin_fI_edges is not None:
+                    tab_grp.create_dataset('bin_fI_edges', data=self.bin_fI_edges)
 
             if self.metadata:
                 meta_grp = f.create_group('metadata')
@@ -294,6 +346,16 @@ class HaloCenterLensingCache:
             deltasigma = f['deltasigma'][:]
             rp_bins = f['rp_bins'][:]
 
+            tab = {}
+            if 'tabulation' in f:
+                tab_grp = f['tabulation']
+                tab['xi_gm_bins'] = tab_grp['xi_gm_bins'][:]
+                tab['bin_counts'] = tab_grp['bin_counts'][:]
+                tab['bins_comp'] = tab_grp['bins_comp'][:]
+                tab['bin_logM_edges'] = tab_grp['bin_logM_edges'][:]
+                if 'bin_fI_edges' in tab_grp:
+                    tab['bin_fI_edges'] = tab_grp['bin_fI_edges'][:]
+
             metadata = {}
             if 'metadata' in f:
                 meta_grp = f['metadata']
@@ -305,8 +367,10 @@ class HaloCenterLensingCache:
         print(f"Loaded HaloCenterLensingCache from {input_path}")
         print(f"  {len(positions)} halos")
         print(f"  {len(rp_bins)-1} radial bins")
+        if tab:
+            print(f"  xi_gm tabulation: {tab['xi_gm_bins'].shape[0]} bins")
 
-        return cls(positions, deltasigma, rp_bins, metadata)
+        return cls(positions, deltasigma, rp_bins, metadata, **tab)
 
     def __repr__(self) -> str:
         return (
@@ -315,6 +379,89 @@ class HaloCenterLensingCache:
             f"n_rp_bins={len(self.rp_bins)-1}, "
             f"rp_range=[{self.rp_bins[0]:.2f}, {self.rp_bins[-1]:.2f}] Mpc/h)"
         )
+
+
+def satellite_radial_nodes(Rvir, conc, f_exp, tau, lambda_NFW,
+                           u_nodes, u_w, x_norm):
+    """
+    Weighted 3D radial satellite-offset nodes (r_j, w_j).
+
+    Mirrors NFW_jax sampling exactly: NFW component with Rs/lambda_NFW and
+    c*lambda_NFW truncated at Rvir (inverse CDF on the same normalized
+    radial grid as the sampler); exponential component
+    dN/dr ~ exp(-r/(tau*Rs)) truncated at 3*Rvir.
+
+    Rvir in Mpc/h. u_nodes/u_w are Gauss-Legendre nodes/weights on [0, 1];
+    x_norm is the normalized radial grid.
+    """
+    Rs = Rvir / conc
+    comps = []
+    if f_exp < 1.0:
+        rbins = x_norm * Rvir
+        x = rbins / (Rs / lambda_NFW)
+        cdf = np.log(1 + x) - x / (1 + x)
+        cdf = cdf / cdf[-1]
+        comps.append((np.interp(u_nodes, cdf, rbins), (1.0 - f_exp) * u_w))
+    if f_exp > 0.0:
+        u_max = 1.0 - np.exp(-3.0 * Rvir / (tau * Rs))
+        comps.append((-tau * Rs * np.log(1.0 - u_nodes * u_max), f_exp * u_w))
+
+    r_all = np.concatenate([c[0] for c in comps])
+    w_r = np.concatenate([c[1] for c in comps])
+    return r_all, w_r / w_r.sum()
+
+
+def satellite_offset_nodes(Rvir, conc, f_exp, tau, lambda_NFW,
+                           u_nodes, u_w, mu_nodes, mu_w, x_norm):
+    """
+    Weighted projected (transverse) satellite-offset nodes (rho_j, w_j).
+
+    Projected offset rho = r * sqrt(1 - mu^2) with mu = |cos theta|
+    uniform in [0, 1]; radial nodes from satellite_radial_nodes.
+    """
+    r_all, w_r = satellite_radial_nodes(
+        Rvir, conc, f_exp, tau, lambda_NFW, u_nodes, u_w, x_norm)
+    sin_th = np.sqrt(1.0 - mu_nodes ** 2)
+    rho = (r_all[:, None] * sin_th[None, :]).ravel()
+    w_rho = (w_r[:, None] * mu_w[None, :]).ravel()
+    return rho, w_rho / w_rho.sum()
+
+
+def build_tabulation_bins(
+    logM: np.ndarray,
+    fI: Optional[np.ndarray] = None,
+    n_logM_bins: int = 40,
+    n_fI_bins: int = 8,
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """
+    Assign each halo to a (logM [, fI]) tabulation bin.
+
+    logM bins are equal-width over the catalog range; fI bins (optional,
+    for assembly bias) are equal-count quantile bins so every fI bin is
+    well populated.
+
+    Returns
+    -------
+    bin_index : np.ndarray, shape (N_halos,)
+        Flat bin index i_logM * n_fI_bins + i_fI (or i_logM if fI is None)
+    logM_edges : np.ndarray, shape (n_logM_bins+1,)
+    fI_edges : np.ndarray or None, shape (n_fI_bins+1,)
+    """
+    logM = np.asarray(logM)
+    eps = 1e-6
+    logM_edges = np.linspace(logM.min() - eps, logM.max() + eps, n_logM_bins + 1)
+    i_m = np.clip(np.digitize(logM, logM_edges) - 1, 0, n_logM_bins - 1)
+
+    if fI is None:
+        return i_m.astype(np.int64), logM_edges, None
+
+    fI = np.asarray(fI)
+    fI_edges = np.quantile(fI, np.linspace(0, 1, n_fI_bins + 1))
+    fI_edges[0] -= eps
+    fI_edges[-1] += eps
+    i_f = np.clip(np.digitize(fI, fI_edges) - 1, 0, n_fI_bins - 1)
+
+    return (i_m * n_fI_bins + i_f).astype(np.int64), logM_edges, fI_edges
 
 
 def precompute_halo_center_lensing(
@@ -327,7 +474,12 @@ def precompute_halo_center_lensing(
     bins_comp: Optional[np.ndarray] = None,
     verbose: bool = True,
     n_workers: int = -1,
-    prequery_all: bool = False
+    prequery_all: bool = False,
+    chi_max: float = 100.0,
+    halo_logM: Optional[np.ndarray] = None,
+    halo_fI: Optional[np.ndarray] = None,
+    n_logM_bins: int = 40,
+    n_fI_bins: int = 8,
 ) -> HaloCenterLensingCache:
     """
     Precompute DeltaSigma profiles at all halo centers using KD-tree + multiprocessing.
@@ -362,6 +514,19 @@ def precompute_halo_center_lensing(
         via fork COW. Uses more RAM (~18 GB for downsampled case).
         If False (Mode 2), each worker queries the shared KD-tree independently
         for its halos. Lower RAM, slightly less efficient KD-tree queries.
+    chi_max : float, default=100.0
+        Maximum line-of-sight distance for the Sigma integral [Mpc/h]
+    halo_logM : np.ndarray, optional, shape (N_halos,)
+        Halo log10 masses. If given, the mean xi_gm(r) is additionally
+        tabulated in (logM [, fI]) bins and stored in the cache — this is
+        the TabCorr-style table used by TabulatedDeltaSigma for the
+        satellite term. Costs nothing extra (xi_gm per halo is already
+        computed for the central profiles).
+    halo_fI : np.ndarray, optional, shape (N_halos,)
+        Assembly-bias property (e.g. fs_norm). Adds a second, quantile-based
+        binning dimension to the xi_gm tabulation.
+    n_logM_bins, n_fI_bins : int
+        Tabulation bin counts (fI bins only used when halo_fI is given).
 
     Returns
     -------
@@ -410,6 +575,16 @@ def precompute_halo_center_lensing(
     shell_volumes = (4.0/3.0) * np.pi * (bins_comp[1:]**3 - bins_comp[:-1]**3)
     n_mean = n_particles_total / volume_total
 
+    tabulate = halo_logM is not None
+    if tabulate:
+        bin_index, logM_edges, fI_edges = build_tabulation_bins(
+            halo_logM, halo_fI, n_logM_bins, n_fI_bins
+        )
+        n_bins = n_logM_bins * (n_fI_bins if halo_fI is not None else 1)
+        if verbose:
+            print(f"  Tabulating xi_gm in {n_bins} bins "
+                  f"({n_logM_bins} logM x {n_fI_bins if halo_fI is not None else 1} fI)")
+
     _shared.update({
         'particle_positions': particle_positions,
         'halo_positions': halo_positions,
@@ -423,6 +598,8 @@ def precompute_halo_center_lensing(
         'chi_max': chi_max,
         'n_rp_bins': n_rp_bins,
         'search_radius': search_radius,
+        'halo_bin_index': bin_index if tabulate else None,
+        'n_bins': n_bins if tabulate else None,
     })
 
     if prequery_all:
@@ -455,7 +632,14 @@ def precompute_halo_center_lensing(
     with ctx.Pool(n_workers) as pool:
         results = pool.map(worker_fn, batches)
 
-    all_deltasigma = np.vstack(results)
+    if tabulate:
+        all_deltasigma = np.vstack([r[0] for r in results])
+        xi_sum = np.sum([r[1] for r in results], axis=0)
+        xi_count = np.sum([r[2] for r in results], axis=0)
+        xi_gm_bins = np.where(xi_count[:, None] > 0,
+                              xi_sum / np.maximum(xi_count, 1)[:, None], 0.0)
+    else:
+        all_deltasigma = np.vstack(results)
 
     t_phase3 = time.time() - t0
     if verbose:
@@ -475,8 +659,15 @@ def precompute_halo_center_lensing(
         'RHO_M': RHO_M,
         'rsd_axis': rsd_axis,
         'n_particles': len(particle_positions),
+        'chi_max': chi_max,
     }
 
+    if tabulate:
+        return HaloCenterLensingCache(
+            halo_positions, all_deltasigma, rp_bins, metadata,
+            xi_gm_bins=xi_gm_bins, bin_counts=xi_count, bins_comp=bins_comp,
+            bin_logM_edges=logM_edges, bin_fI_edges=fI_edges,
+        )
     return HaloCenterLensingCache(halo_positions, all_deltasigma, rp_bins, metadata)
 
 
@@ -615,3 +806,235 @@ class OptimizedDeltaSigmaCalculator:
             f"cache={self.cache!r}, "
             f"Lbox={self.Lbox})"
         )
+
+
+class TabulatedDeltaSigma:
+    """
+    TabCorr-style tabulated DeltaSigma predictor (Zheng & Guo 2016;
+    Lange et al. 2019, 2025 arXiv:2512.15962 Sect. 3.2).
+
+    DeltaSigma is linear in the halo occupation, so the Monte-Carlo
+    population step can be replaced by occupation-weighted sums over
+    precomputed per-halo / per-bin lensing tables:
+
+    - **Centrals** (exact, per halo): weighted average of the per-halo
+      cache profiles with weights <N_cen>(logM_h, fI_h). Assembly bias
+      is handled natively since weights are evaluated per halo.
+    - **Satellites** (per (logM, fI) bin): the tabulated mean xi_gm(r)
+      per bin gives Sigma(R) around halo centers; the satellite signal
+      is the miscentering convolution of Sigma with the projected
+      satellite offset distribution. The radial profile (truncated NFW
+      rescaled by lambda_NFW + exponential tail with f_exp, tau,
+      truncated at 3 Rvir) is analytic, so arbitrary profile parameters
+      are exact — no interpolation over profile parameters is needed
+      (unlike TabCorr's spline over eta). The inverse-CDF quadrature
+      mirrors NFW_jax sampling exactly, so the prediction is the
+      expectation value of the Monte-Carlo pipeline.
+
+    Predictions are noise-free (no realization scatter) and cost ~0.1 s,
+    so a sampler can call this directly — no LHS grid or NN emulator.
+
+    Not supported: triaxial satellite profiles, subhalo satellite
+    placement (both break the isotropic-offset convolution).
+
+    Parameters
+    ----------
+    cache : HaloCenterLensingCache
+        Cache with xi_gm tabulation (precompute with halo_logM given).
+    halo : HaloOccupation
+        Configured halo model (set_halo_model already called). Supplies
+        per-halo logM, radius, concentration, fI and the Occupation object.
+
+    Examples
+    --------
+    >>> cache = precompute_halo_center_lensing(..., halo_logM=halo.logM,
+    ...                                        halo_fI=halo.fI)
+    >>> tab = TabulatedDeltaSigma(cache, halo)
+    >>> rp, ds, info = tab.predict(dict_params)
+    """
+
+    def __init__(
+        self,
+        cache: HaloCenterLensingCache,
+        halo,
+        n_sigma_grid: int = 96,
+        n_out_grid: int = 64,
+        n_gl_u: int = 32,
+        n_gl_mu: int = 16,
+        n_gl_phi: int = 12,
+    ):
+        if not cache.has_tabulation:
+            raise ValueError(
+                "Cache has no xi_gm tabulation. Regenerate it with "
+                "precompute_halo_center_lensing(..., halo_logM=..., halo_fI=...)."
+            )
+        if not hasattr(halo, 'HOD'):
+            raise ValueError("halo has no HOD model — call set_halo_model() first.")
+        if len(halo.logM) != len(cache.positions):
+            raise ValueError(
+                f"Halo catalog ({len(halo.logM)}) and cache "
+                f"({len(cache.positions)}) sizes differ — same catalog required."
+            )
+
+        self.cache = cache
+        self.halo = halo
+        self.RHO_M = halo.RHO_M
+        chi_max = float(cache.metadata.get('chi_max', 100.0))
+
+        logM = np.asarray(halo.logM)
+        logM_edges = cache.bin_logM_edges
+        fI_edges = cache.bin_fI_edges
+        self.n_m = len(logM_edges) - 1
+        self.n_f = 1 if fI_edges is None else len(fI_edges) - 1
+
+        i_m = np.clip(np.digitize(logM, logM_edges) - 1, 0, self.n_m - 1)
+        if fI_edges is None:
+            self.bin_index = i_m.astype(np.int64)
+        else:
+            # AB property: whichever of fI/fE the halo model carries — must be
+            # the same array the cache tabulation was built with
+            ab_prop = halo.fI if getattr(halo, 'fI', None) is not None else halo.fE
+            if ab_prop is None:
+                raise ValueError("Cache has fI tabulation but halo has no fI/fE.")
+            fI = np.asarray(ab_prop)
+            i_f = np.clip(np.digitize(fI, fI_edges) - 1, 0, self.n_f - 1)
+            self.bin_index = (i_m * self.n_f + i_f).astype(np.int64)
+
+        # Mean Rvir [Mpc/h] and concentration per logM bin (halo.radius is kpc/h)
+        counts_m = np.maximum(np.bincount(i_m, minlength=self.n_m), 1)
+        self.Rvir_m = np.bincount(
+            i_m, weights=np.asarray(halo.radius) / 1e3, minlength=self.n_m) / counts_m
+        self.conc_m = np.bincount(
+            i_m, weights=np.asarray(halo.concentration), minlength=self.n_m) / counts_m
+        self.Rvir_m[self.Rvir_m == 0] = 1e-3   # empty bins (weights will be 0)
+        self.conc_m[self.conc_m == 0] = 5.0
+
+        # ── Tabulate Sigma(R) per bin from mean xi_gm (rho_m units) ──
+        r_centers = np.sqrt(cache.bins_comp[:-1] * cache.bins_comp[1:])
+        xi = cache.xi_gm_bins
+        R_max = cache.rp_bins[-1] + 3.5 * self.Rvir_m.max()
+        self.R_sigma = np.geomspace(5e-3, min(R_max, chi_max), n_sigma_grid)
+
+        t_chi, w_chi = np.polynomial.legendre.leggauss(200)
+        chi = 0.5 * (t_chi + 1) * chi_max
+        w_chi = 0.5 * chi_max * w_chi
+        rr = np.sqrt(self.R_sigma[:, None] ** 2 + chi[None, :] ** 2)
+
+        n_bins = xi.shape[0]
+        self.Sigma_bins = np.empty((n_bins, n_sigma_grid))
+        for b in range(n_bins):
+            spl = interp1d(r_centers, xi[b], kind='cubic', bounds_error=False,
+                           fill_value=(xi[b, 0], 0.0))
+            self.Sigma_bins[b] = 2.0 * (spl(rr) @ w_chi)
+        self.Sigma_bins = self.Sigma_bins.reshape(self.n_m, self.n_f, n_sigma_grid)
+
+        # Output grid for the satellite Sigma / DeltaSigma pipeline
+        self.R_out = np.geomspace(1e-2, cache.rp_bins[-1] * 1.05, n_out_grid)
+
+        # Quadrature nodes (unit intervals; scaled at predict time)
+        self._u_nodes, self._u_w = self._gl_unit(n_gl_u)          # CDF u in [0,1]
+        self._mu_nodes, self._mu_w = self._gl_unit(n_gl_mu)       # |cos theta| in [0,1]
+        t_phi, w_phi = np.polynomial.legendre.leggauss(n_gl_phi)  # phi in [0,pi]
+        self._cos_phi = np.cos(0.5 * (t_phi + 1) * np.pi)
+        self._phi_w = 0.5 * w_phi                                 # weights of (1/pi) dphi
+
+        # Normalized radial grid mirroring NFW_jax._X_NORM_GRID for inverse CDF
+        self._x_norm = np.geomspace(1e-4, 1.0, 1000)
+
+    @staticmethod
+    def _gl_unit(n):
+        t, w = np.polynomial.legendre.leggauss(n)
+        return 0.5 * (t + 1), 0.5 * w
+
+    def _offset_nodes(self, m, f_exp, tau, lambda_NFW):
+        """Weighted projected-offset nodes (rho_j, w_j) for mass bin m."""
+        return satellite_offset_nodes(
+            self.Rvir_m[m], self.conc_m[m], f_exp, tau, lambda_NFW,
+            self._u_nodes, self._u_w, self._mu_nodes, self._mu_w, self._x_norm,
+        )
+
+    def predict(
+        self,
+        dict_params: Dict,
+        rp_bins: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict]:
+        """
+        Predict DeltaSigma for an HOD parameter set (no population step).
+
+        Parameters
+        ----------
+        dict_params : dict
+            HOD parameters (same keys as populate_haloes), optionally
+            including profile parameters f_exp, tau, lambda_NFW and
+            assembly-bias parameters.
+        rp_bins : np.ndarray, optional
+            Projected bin edges. Defaults to (and must match) cache.rp_bins,
+            on which the per-halo central profiles were bin-averaged.
+
+        Returns
+        -------
+        rp_centers : np.ndarray
+        delta_sigma : np.ndarray [Msun h/pc^2]
+        info : dict with ngal, fsat, ds_cen, ds_sat
+        """
+        if rp_bins is None:
+            rp_bins = self.cache.rp_bins
+        elif not np.allclose(rp_bins, self.cache.rp_bins):
+            raise ValueError("rp_bins must match cache.rp_bins (central profiles "
+                             "are pre-averaged on that binning).")
+        rp_centers = self.cache.rp_centers
+
+        f_exp = float(dict_params.get('f_exp', 0.0))
+        tau = float(dict_params.get('tau', 6.0))
+        lambda_NFW = float(dict_params.get('lambda_NFW', 1.0))
+
+        probC, probS = self.halo.HOD.compute_HOD_occupation(
+            np.asarray(self.halo.logM), dict_params
+        )
+        # Bernoulli sampling in populate_centrals clips probC at 1 implicitly
+        probC = np.minimum(np.asarray(probC, dtype=np.float64), 1.0)
+        probS = np.asarray(probS, dtype=np.float64)
+
+        sum_C, sum_S = probC.sum(), probS.sum()
+        ngal = (sum_C + sum_S) / self.halo.Lbox ** 3
+        fsat = sum_S / (sum_C + sum_S)
+
+        # ── Centrals: exact per-halo weighted average ──
+        ds_cen = (probC @ self.cache.deltasigma) / sum_C
+
+        # ── Satellites: per-bin Sigma + analytic offset convolution ──
+        w = np.bincount(self.bin_index, weights=probS,
+                        minlength=self.n_m * self.n_f).reshape(self.n_m, self.n_f)
+        Sigma_M = np.einsum('mf,mfr->mr', w, self.Sigma_bins)  # unnormalized
+        w_M = w.sum(axis=1)
+
+        Sigma_sat = np.zeros_like(self.R_out)
+        for m in np.nonzero(w_M > 0)[0]:
+            rho, w_rho = self._offset_nodes(m, f_exp, tau, lambda_NFW)
+            # dist(R_out, rho, phi): azimuthal + offset average of Sigma_M[m]
+            d2 = (self.R_out[:, None, None] ** 2 + rho[None, :, None] ** 2
+                  + 2.0 * self.R_out[:, None, None] * rho[None, :, None]
+                  * self._cos_phi[None, None, :])
+            dist = np.sqrt(np.maximum(d2, 0.0))
+            Sig = np.interp(dist, self.R_sigma, Sigma_M[m],
+                            left=Sigma_M[m, 0], right=0.0)
+            Sigma_sat += (Sig @ self._phi_w) @ w_rho
+        Sigma_sat /= w_M.sum()
+
+        # DeltaSigma from Sigma (same quadrature as DeltaSigmaCalculator)
+        spl_S = interp1d(self.R_out, Sigma_sat, kind='cubic', bounds_error=False,
+                         fill_value=(Sigma_sat[0], 0.0))
+        Sigma_mean = 2.0 * gauss_legendre_integration(
+            lambda r: spl_S(r) * r, 0, self.R_out) / self.R_out ** 2
+        ds_sat_grid = (Sigma_mean - Sigma_sat) * self.RHO_M / 1e12
+        spl_ds = interp1d(self.R_out, ds_sat_grid, kind='cubic', bounds_error=False,
+                          fill_value=(ds_sat_grid[0], ds_sat_grid[-1]))
+        ds_sat = binavg_2D(spl_ds, rp_bins)
+
+        ds_total = (1.0 - fsat) * ds_cen + fsat * ds_sat
+        info = {'ngal': ngal, 'fsat': fsat, 'ds_cen': ds_cen, 'ds_sat': ds_sat}
+        return rp_centers, ds_total, info
+
+    def __repr__(self) -> str:
+        return (f"TabulatedDeltaSigma(n_logM_bins={self.n_m}, "
+                f"n_fI_bins={self.n_f}, n_halos={len(self.bin_index)})")
