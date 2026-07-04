@@ -4,8 +4,15 @@ run_tabulated_chains.py
 
 Nautilus DeltaSigma fits on the Flamingo L1000N1800 ELG data using the
 TabCorr-style TabulatedDeltaSigma forward model — no LHS grid, no NN
-emulator. Each likelihood call is the exact expectation of the MC pipeline
-(~0.2-0.5 s), so chains run directly against the tabulated cache.
+emulator. Each likelihood call is the exact expectation of the MC pipeline,
+so chains run directly against the tabulated cache.
+
+Sampling is single-process with nautilus ``vectorized=True`` on the
+jit/vmap-batched likelihood (TabulatedFitter.build_batched_loglike):
+no multiprocessing pool, hence no JAX-after-fork deadlock (which stalled
+jobs 52827669-75 at zero likelihood calls). Parallelism comes from XLA
+threading; float64 is enabled below for parity with the NumPy path
+(validated by cross_check_tabulated.py --jax).
 
 Mirrors run_emulator_chains.py (same priors, fixed params, ngal rescaling,
 scale cuts, outputs) so posteriors are directly comparable to the
@@ -14,13 +21,16 @@ grid+emulator chains (chains_BARYON / FULL_* generations).
 Usage (cluster):
     python example_scripts/run_tabulated_chains.py NFW \
         --cache_path /sps/euclid/Users/rpaviot/flamingo/tabulated_cache_DMO.h5 \
-        --output_dir /sps/euclid/Users/rpaviot/flamingo/chains_TABULATED_DMO \
-        --n_workers 20
+        --output_dir /sps/euclid/Users/rpaviot/flamingo/chains_TABULATED_DMO
 """
 
 import argparse
 import os
 import sys
+
+import jax
+jax.config.update("jax_enable_x64", True)
+
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -287,10 +297,11 @@ def run_case(case_name, fit_case, halo, tab, args):
         print(f"  {fitter.n_bins} bins in [{fitter.rp_obs[0]:.3f}, "
               f"{fitter.rp_obs[-1]:.2f}] Mpc/h, {fitter.n_params} free params")
 
-        print(f"  Running Nautilus (n_live={N_LIVE}, n_workers={args.n_workers}) ...")
+        print(f"  Running Nautilus (n_live={N_LIVE}, vectorized jit/vmap "
+              "likelihood, single process) ...")
         points, weights, log_l, log_z = fitter.run(
             n_eff=args.n_eff, n_live=N_LIVE, verbose=True,
-            n_workers=args.n_workers,
+            vectorized=True,
         )
         fitter.save_results(chain_path, points, weights, log_l, log_z)
         print(f"  Chain saved: {chain_path}")
@@ -364,7 +375,9 @@ def parse_args():
     p.add_argument("--data_path", default=DATA_PATH_DEFAULT)
     p.add_argument("--output_dir",
                    default=os.path.join(FLAMINGO_DIR, "chains_TABULATED_DMO"))
-    p.add_argument("--n_workers", type=int, default=20)
+    p.add_argument("--n_workers", type=int, default=20,
+                   help="Unused (kept for CLI compatibility); sampling is "
+                        "single-process vectorized")
     p.add_argument("--n_eff", type=int, default=N_EFF)
     p.add_argument("--rp_min_values", type=float, nargs="+",
                    default=RP_MIN_VALUES)

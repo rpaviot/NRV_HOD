@@ -73,6 +73,11 @@ def parse_args():
     p.add_argument("--output_dir", type=str, default="tabulated_crosscheck")
     p.add_argument("--wgg", action="store_true",
                    help="Cross-check tabulated wgg instead of DeltaSigma")
+    p.add_argument("--jax", action="store_true",
+                   help="Validate the pure-JAX predict/loglike (make_predict_jax"
+                        " + build_batched_loglike) against the NumPy path")
+    p.add_argument("--jax_n_points", type=int, default=64,
+                   help="Random prior draws per case for --jax validation")
     p.add_argument("--n_logM_bins_wgg", type=int, default=24,
                    help="24 validated; 16 leaves ~6% cc binning errors")
     p.add_argument("--n_fI_bins_wgg", type=int, default=8)
@@ -80,6 +85,144 @@ def parse_args():
 
 
 PI_BINS = np.linspace(0.0, 60.0, 61)
+
+
+# ── --jax validation: chains' prior structure (run_tabulated_chains.py) ──
+JAX_PRIORS = {
+    "As":         (0.001, 0.1),
+    "Mmin":       (11.1,  13.0),
+    "sig_M":      (0.05,  2.0),
+    "gamma":      (0.0,   10.0),
+    "alpha":      (0.1,   2.0),
+    "Mcut":       (11.5,  13.5),
+    "lambda_NFW": (0.1,   2.0),
+    "f_exp":      (0.0,   0.9),
+    "tau":        (1.0,   10.0),
+    "kappa_EE":   (0.5,   1.0),
+    "B_cent":     (-0.5,  0.5),
+    "B_sat":      (-0.5,  0.5),
+}
+JAX_FIXED = {"M1": 13.0, "Mmax": 15.0, "A_cent": 0.0, "A_sat": 0.0}
+JAX_TARGET_NGAL = 2.3e-4
+JAX_AC_FIDUCIAL = 0.01
+
+
+def _jax_param_config(case, assembly_bias):
+    base = ["As", "Mmin", "sig_M", "gamma", "alpha", "Mcut", "lambda_NFW"]
+    cfg = dict(JAX_FIXED)
+    if case == "NFW":
+        free = base
+        cfg["f_exp"], cfg["tau"], cfg["kappa_EE"] = 0.0, 5.0, 1.0
+    elif case == "EXT":
+        free = base + ["f_exp", "tau"]
+        cfg["kappa_EE"] = 1.0
+    else:  # CONF
+        free = base + ["f_exp", "tau", "kappa_EE"]
+    if assembly_bias:
+        free = free + ["B_cent", "B_sat"]
+    else:
+        cfg["B_cent"], cfg["B_sat"] = 0.0, 0.0
+    for name in free:
+        cfg[name] = JAX_PRIORS[name]
+    return cfg
+
+
+def run_jax_check(args, halo, cache):
+    """Validate make_predict_jax + build_batched_loglike vs the NumPy path."""
+    from HOD_NRV.HOD_numerical.HOD_models import Occupation
+    from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import (
+        TabulatedDeltaSigma,
+    )
+    from HOD_NRV.utilsf.numerical_sampler import TabulatedFitter, FitCase
+
+    fit_case_of = {"NFW": FitCase.STANDARD_NFW, "EXT": FitCase.EXTENDED_PROFILE,
+                   "CONF": FitCase.CONFORMITY}
+    cases = ["NFW", "EXT", "CONF"]
+    rng = np.random.default_rng(7)
+    all_pass = True
+
+    for case in cases:
+        conformity = case == "CONF"
+        halo.set_halo_model("ELG_mHMQ", conformity=conformity,
+                            elg_satellite=True)
+        tab = TabulatedDeltaSigma(cache, halo)
+        occ_rescale = Occupation(
+            "ELG_mHMQ", halo.logM_bins, halo.mass_function,
+            conformity=conformity, elg_satellite=True)
+
+        cfg = _jax_param_config(case, args.assembly_bias)
+
+        # Synthetic data: NumPy prediction at prior midpoint, 5% diag errors
+        mid = {k: 0.5 * (v[0] + v[1]) for k, v in cfg.items()
+               if isinstance(v, tuple)}
+        fitter0 = TabulatedFitter(
+            tabulated_ds=tab, occupation_rescale=occ_rescale,
+            target_ngal=JAX_TARGET_NGAL, fit_case=fit_case_of[case],
+            ds_obs=np.ones(len(cache.rp_centers)),
+            cov_inv=np.eye(len(cache.rp_centers)),
+            rp_obs=np.asarray(cache.rp_centers),
+            param_config=cfg, Ac_fiducial=JAX_AC_FIDUCIAL,
+        )
+        _, ds_ref, _ = tab.predict(fitter0.full_params(mid))
+        err = 0.05 * np.abs(ds_ref) + 1e-3
+        fitter = TabulatedFitter(
+            tabulated_ds=tab, occupation_rescale=occ_rescale,
+            target_ngal=JAX_TARGET_NGAL, fit_case=fit_case_of[case],
+            ds_obs=ds_ref, cov_inv=np.diag(1.0 / err**2),
+            rp_obs=np.asarray(cache.rp_centers),
+            rp_min=0.2, param_config=cfg, Ac_fiducial=JAX_AC_FIDUCIAL,
+        )
+
+        bounds = np.array([(a, b) for _, a, b, _ in fitter.free_params])
+        pts = rng.uniform(bounds[:, 0], bounds[:, 1],
+                          size=(args.jax_n_points, len(bounds)))
+
+        # ── predict-level parity on a subset ──
+        predict_fn = tab.make_predict_jax()
+        dev_ds, dev_ngal, dev_fsat = [], [], []
+        t_np = 0.0
+        for theta in pts[:16]:
+            full = fitter.full_params(dict(zip(fitter.param_names, theta)))
+            t0 = time.time()
+            _, ds_np, info = tab.predict(full)
+            t_np += time.time() - t0
+            ds_j, ngal_j, fsat_j = (np.asarray(x) for x in predict_fn(full))
+            dev_ds.append(np.max(np.abs(ds_j / ds_np - 1)))
+            dev_ngal.append(abs(ngal_j / info['ngal'] - 1))
+            dev_fsat.append(abs(fsat_j / info['fsat'] - 1))
+        t_np /= 16
+
+        # ── loglike-level parity on all points ──
+        loglike_fn, free_names = fitter.build_batched_loglike()
+        assert free_names == fitter.param_names
+        t0 = time.time()
+        ll_jax = loglike_fn(pts)          # includes compile
+        t_compile = time.time() - t0
+        t0 = time.time()
+        ll_jax = loglike_fn(pts)
+        t_jax = (time.time() - t0) / len(pts)
+        ll_np = np.array([fitter.log_likelihood(p) for p in pts])
+        d_ll = np.abs(ll_jax - ll_np)
+        # compare rejected points only by agreement of the rejection
+        both_ok = (ll_np > -1e99) & (ll_jax > -1e99)
+        agree_rej = np.array_equal(ll_np > -1e99, ll_jax > -1e99)
+
+        ok = (max(dev_ds) < 5e-3 and max(dev_fsat) < 5e-3
+              and np.max(d_ll[both_ok], initial=0.0) < 0.5 and agree_rej)
+        all_pass &= ok
+        ab_tag = " +AB" if args.assembly_bias else ""
+        print(f"\n=== jax {case}{ab_tag} ===  [{'PASS' if ok else 'FAIL'}]")
+        print(f"  predict : max|ds dev|={max(dev_ds):.2e}  "
+              f"ngal dev={max(dev_ngal):.2e}  fsat dev={max(dev_fsat):.2e}")
+        print(f"  loglike : max|dlogL|={np.max(d_ll[both_ok], initial=0.0):.3e} "
+              f"over {both_ok.sum()}/{len(pts)} finite pts  "
+              f"(rejection agreement: {agree_rej})")
+        print(f"  timing  : numpy {t_np*1e3:.0f} ms/pt | jax "
+              f"{t_jax*1e3:.1f} ms/pt (compile {t_compile:.1f} s) | "
+              f"speedup x{t_np/max(t_jax, 1e-9):.0f}")
+
+    print(f"\nOVERALL (--jax): {'PASS' if all_pass else 'FAIL'}")
+    return all_pass
 
 
 # Denser sample for wgg (clustering noise scales with 1/ngal; probC peak
@@ -187,6 +330,11 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
+    if args.jax:
+        # float64 parity with the NumPy path; must precede any JAX array use
+        import jax
+        jax.config.update("jax_enable_x64", True)
+
     import pandas as pd
     from HOD_NRV.HOD_numerical.HOD import HaloOccupation
     from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import (
@@ -204,11 +352,17 @@ def main():
     df = df[keep].reset_index(drop=True)
     print(f"  {len(df)} halos kept")
 
+    cache_path = args.cache_path or os.path.join(
+        args.output_dir,
+        f"tabulated_cache_check{'_AB' if args.assembly_bias else ''}.h5")
+    # particles are only needed to (pre)compute the lensing cache
+    need_particles = not args.wgg and not (args.jax and os.path.exists(cache_path))
+
     halo = HaloOccupation(
         cosmology=COSMO_PARAMS, zeff=ZEFF, Lbox=LBOX,
         column_mapping=column_mapping, mass_definition=MASS_DEFINITION,
         DataFrame=df,
-        DataFrame_part=None if args.wgg else pd.read_parquet(PARTICLE_PATH),
+        DataFrame_part=pd.read_parquet(PARTICLE_PATH) if need_particles else None,
         assembly_bias=args.assembly_bias, apply_rsd=True, do_test=False,
         particle_fraction=args.particle_fraction,
         population_backend="numba", mass_function="Despali16",
@@ -223,9 +377,6 @@ def main():
         run_wgg_check(args, halo, cases)
         return
 
-    cache_path = args.cache_path or os.path.join(
-        args.output_dir,
-        f"tabulated_cache_check{'_AB' if args.assembly_bias else ''}.h5")
     if os.path.exists(cache_path):
         cache = HaloCenterLensingCache.load(cache_path)
         if not cache.has_tabulation or len(cache.positions) != len(halo.logM):
@@ -242,6 +393,10 @@ def main():
             n_logM_bins=args.n_logM_bins, n_fI_bins=args.n_fI_bins,
         )
         cache.save(cache_path)
+
+    if args.jax:
+        run_jax_check(args, halo, cache)
+        return
 
     tab = TabulatedDeltaSigma(cache, halo)
     print(tab)

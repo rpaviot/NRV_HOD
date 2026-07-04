@@ -174,6 +174,42 @@ def rescale_Ac_to_target_ngal(hod_model, params, target_ngal, Ac_fiducial=1.0):
     return Ac_fiducial * rescale_factor, params['As'] * rescale_factor
 
 
+def build_occupation_fn_jax(occ):
+    """Pure-JAX twin of Occupation.compute_HOD_occupation for traced params.
+
+    Returns ``fn(logM, params, mmin_shift=0.0, m1_shift=0.0) -> (probC, probS)``
+    where ``params`` is a dict of (possibly traced) scalars and the shifts carry
+    the ``ab_method='mass'`` assembly-bias offsets (A*fI + B*fE evaluated by the
+    caller on its own grid; central shift applies to Mmin, satellite to M1).
+    Conformity uses the probabilistic expectation, matching
+    ``_compute_probS(has_central=None)``. The closure captures only the
+    occupation's function choices — no per-halo state — so it is safe inside
+    jit/vmap.
+    """
+    central_fn = occ.HOD_central
+    cen_names = list(occ.central_params)
+    sat_fn = occ.HOD_satellite
+    sat_names = list(occ._sat_param_names)
+    conformity = occ.conformity
+
+    def fn(logM, params, mmin_shift=0.0, m1_shift=0.0):
+        cen_args = [params[n] + mmin_shift if n == "Mmin" else params[n]
+                    for n in cen_names]
+        sat_args = [params[n] + m1_shift if n == "M1" else params[n]
+                    for n in sat_names]
+        probC = central_fn(logM, *cen_args)
+        if conformity:
+            ones = jnp.ones_like(logM, dtype=bool)
+            zeros = jnp.zeros_like(logM, dtype=bool)
+            probS = (probC * sat_fn(logM, *sat_args, ones)
+                     + (1.0 - probC) * sat_fn(logM, *sat_args, zeros))
+        else:
+            probS = sat_fn(logM, *sat_args)
+        return probC, probS
+
+    return fn
+
+
 class Occupation:
     central_funcs = {
         "LRG": (LRG_Zheng07, ["Ac", "Mmin", "sig_M"]),
