@@ -299,9 +299,11 @@ def run_case(case_name, fit_case, halo, tab, args):
 
         print(f"  Running Nautilus (n_live={N_LIVE}, vectorized jit/vmap "
               "likelihood, single process) ...")
+        checkpoint = os.path.join(args.output_dir,
+                                  f"checkpoint_{case_name}_rmin{rp_min}.h5")
         points, weights, log_l, log_z = fitter.run(
             n_eff=args.n_eff, n_live=N_LIVE, verbose=True,
-            vectorized=True,
+            vectorized=True, filepath=checkpoint,
         )
         fitter.save_results(chain_path, points, weights, log_l, log_z)
         print(f"  Chain saved: {chain_path}")
@@ -344,7 +346,10 @@ def run_case(case_name, fit_case, halo, tab, args):
     ax.legend(fontsize=7.5, loc='lower left')
     ax.grid(True, alpha=0.3, which='both', ls=':')
     fig.tight_layout()
-    plot_path = os.path.join(args.output_dir, f"fit_{case_name}.png")
+    # scope filenames by rp_min when a single cut runs (jobs split per rp_min)
+    rp_tag = ("" if len(args.rp_min_values) > 1 else
+              f"_rmin{str(args.rp_min_values[0]).replace('.', 'p')}")
+    plot_path = os.path.join(args.output_dir, f"fit_{case_name}{rp_tag}.png")
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
     print(f"\n  Plot saved: {plot_path}")
@@ -354,7 +359,8 @@ def run_case(case_name, fit_case, halo, tab, args):
                  for k in ('ncen_med', 'ncen_sig', 'nsat_med', 'nsat_sig')}
         for rp_min in args.rp_min_values
     }
-    plot_hod_profiles(case_name, logM_bins, profiles_by_rp_min, args.output_dir)
+    plot_hod_profiles(case_name + rp_tag, logM_bins, profiles_by_rp_min,
+                      args.output_dir)
 
     return rp_all, bestfits, logM_bins
 
@@ -424,7 +430,10 @@ def main():
             all_bestfits_arrays[f"{prefix}_nsat_sig"] = vals['nsat_sig']
 
     if all_bestfits_arrays:
-        bestfits_path = os.path.join(args.output_dir, "all_bestfits.npz")
+        tag = names[0] if len(names) == 1 else "all"
+        if len(args.rp_min_values) == 1:
+            tag += f"_rmin{str(args.rp_min_values[0]).replace('.', 'p')}"
+        bestfits_path = os.path.join(args.output_dir, f"bestfits_{tag}.npz")
         np.savez(bestfits_path,
                  rp_centers=rp_centers_saved,
                  logM_bins=logM_bins_saved,

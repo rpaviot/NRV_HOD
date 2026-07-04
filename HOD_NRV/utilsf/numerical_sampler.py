@@ -524,7 +524,8 @@ class EmulatorFitter:
         if vectorized:
             likelihood, _ = self.build_batched_loglike()
             pool_arg = None
-            vec_kwargs = dict(vectorized=True)
+            # n_batch=128 matches the loglike's pad_to multiple: no padding waste
+            vec_kwargs = dict(vectorized=True, n_batch=128)
         else:
             likelihood = _emulator_likelihood
             pool_arg = n_workers if n_workers > 1 else None
