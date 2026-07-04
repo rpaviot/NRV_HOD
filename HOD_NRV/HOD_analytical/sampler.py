@@ -501,7 +501,6 @@ class CSMFFitter:
         rp_max_wgg: Optional[float] = None,
         include_beta_nl: bool = False,
         beta_nl_kwargs: Optional[Dict] = None,
-        beta_nl_source: str = 'emulator',
         k_array: Optional = None,
         units_per_h: bool = True,
         verbose: bool = True
@@ -513,7 +512,6 @@ class CSMFFitter:
         self.rp_max_wgg = rp_max_wgg if rp_max_wgg is not None else rp_max
         self.include_beta_nl = include_beta_nl
         self.beta_nl_kwargs = beta_nl_kwargs or {}
-        self.beta_nl_source = beta_nl_source
         self.units_per_h = units_per_h
         self.verbose = verbose
         self.k_array = k_array
@@ -812,7 +810,6 @@ class CSMFFitter:
             median_Mstar=self._median_mstar_array,
             include_beta_nl=self.include_beta_nl,
             beta_nl_kwargs=beta_nl_kwargs,
-            beta_nl_source=self.beta_nl_source,
             verbose=self.verbose,
             k_array=self.k_array,mass_function='Tinker08'
         )
