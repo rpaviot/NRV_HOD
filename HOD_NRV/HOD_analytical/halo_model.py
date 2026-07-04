@@ -707,6 +707,50 @@ class HaloModel(Cosmology):
 
         return jax.jit(_predict)
 
+    def make_ngal_jax(self):
+        """Return a pure, ``jax.vmap``-able function ``theta -> n_gal[n_z]``.
+
+        The de-stated abundance twin of :meth:`ngal`, for the batched likelihood
+        (nautilus ``vectorized=True``). Threads the same 10-vector
+
+            theta = [M0, M1, gamma1, gamma2, sigma_c, alpha_s, b0, b1, f_c, f_s]
+
+        and returns the model galaxy number density per mass bin. Units follow
+        ``units_per_h``: ``self._n_M_jax`` already carries the 1/h^3 factor
+        (set in the HMF prep), so with ``units_per_h=True`` the output is in
+        h^3/Mpc^3 -- exactly matching :meth:`ngal` (whose ``*h**3`` line is
+        intentionally inert) and the measured n_gal fed to the likelihood.
+        f_c/f_s do not enter the occupation integral, so they are ignored here.
+
+        Returns
+        -------
+        callable : theta[10] -> jnp.ndarray of shape (n_z,)
+        """
+        if not isinstance(self.hod, CSMF_HOD):
+            raise TypeError("make_ngal_jax supports the CSMF HOD only "
+                            f"(got {type(self.hod).__name__}).")
+        n_z = self.n_z
+        M = self._M_jax
+        log10M_min, log10M_max = self.log10M_min, self.log10M_max
+        masses_are_log10 = self.hod.masses_are_log10
+
+        def _predict(theta):
+            M0, M1, g1, g2, sig, al, b0, b1, f_c, f_s = (theta[i] for i in range(10))
+            if masses_are_log10:
+                M0 = 10.0 ** M0
+                M1 = 10.0 ** M1
+            rows = []
+            for iz in range(n_z):
+                ms_lo = self._Mstar_min_jax[iz]
+                ms_hi = self._Mstar_max_jax[iz]
+                N_c = csmf_N_central(M, ms_lo, ms_hi, M0, M1, g1, g2, sig)
+                N_s = csmf_N_satellite(M, ms_lo, ms_hi, M0, M1, g1, g2, al, b0, b1)
+                rows.append(_compute_ngal(N_c, N_s, self._n_M_jax[iz],
+                                          log10M_min, log10M_max))
+            return jnp.stack(rows)                              # (n_z,)
+
+        return jax.jit(_predict)
+
 
 __all__ = [
     # Re-export from hod_analytical

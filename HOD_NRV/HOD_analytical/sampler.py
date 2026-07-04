@@ -215,6 +215,10 @@ class MassBinData:
     wp_err: Optional[np.ndarray] = None
     cov_wgg: Optional[np.ndarray] = None
     
+    # Galaxy number density (abundance anchor, optional)
+    n_gal: Optional[float] = None          # measured comoving n_gal [h^3/Mpc^3]
+    n_gal_err: Optional[float] = None      # its 1-sigma error (same units)
+
     # Magnification contribution (for LRG)
     mag_contribution: Optional[np.ndarray] = None
     alpha_minus_one: Optional[float] = None  # (alpha - 1) factor for LRG
@@ -288,6 +292,12 @@ class MassBinData:
         else:
             raise KeyError("Could not find covariance matrix in data file")
         
+        # Load galaxy number density (abundance anchor) if present
+        n_gal = data.get('n_gal', None)
+        n_gal = float(n_gal) if n_gal is not None else None
+        n_gal_err = data.get('n_gal_err', None)
+        n_gal_err = float(n_gal_err) if n_gal_err is not None else None
+
         # Load magnification contribution if available (for LRG)
         mag_contribution = data.get('mag_contribution', None)
         
@@ -314,6 +324,8 @@ class MassBinData:
             wp=data.get('wp', None),
             wp_err=data.get('wp_err', None),
             cov_wgg=data.get('cov_wgg', None),
+            n_gal=n_gal,
+            n_gal_err=n_gal_err,
             mag_contribution=mag_contribution,
             alpha_minus_one=alpha_minus_one,
             mean_sigma_crit=data.get('mean_sigma_crit', None),
@@ -1050,7 +1062,25 @@ class CSMFFitter:
                     if self.verbose:
                         print(f"Warning: WGG likelihood failed: {e}")
                     return -1e100
-        
+
+        # Galaxy number-density (abundance) anchor: Gaussian chi^2 per mass bin on
+        # the model n_gal vs the measured n_gal (h^3/Mpc^3; units_per_h=True). HOD
+        # params were already set on the halo model by _compute_model_observables.
+        if 'ngal' in self.observables:
+            try:
+                ng_model = np.asarray(self._halo_model.ngal()).ravel()
+            except Exception as e:
+                if self.verbose:
+                    print(f"Warning: n_gal evaluation failed: {e}")
+                return -1e100
+            for i, mass_bin in enumerate(self.mass_bins):
+                if mass_bin.n_gal is None or mass_bin.n_gal_err is None:
+                    continue
+                if not np.isfinite(ng_model[i]):
+                    return -1e100
+                r = (ng_model[i] - mass_bin.n_gal) / mass_bin.n_gal_err
+                total_log_L += -0.5 * r * r
+
         return total_log_L
 
     def build_batched_loglike(self, jit: bool = True):
@@ -1104,6 +1134,24 @@ class CSMFFitter:
         ds_data_all = jnp.asarray(np.stack(data_rows))     # (n_z, ncut)
         covinv_all = jnp.asarray(np.stack(covinv_rows))    # (n_z, ncut, ncut)
 
+        # Optional galaxy number-density (abundance) anchor: a Gaussian n_gal term
+        # per mass bin, the batched twin of the serial log_likelihood's. Bins with
+        # no measured n_gal get zero inverse-variance (no contribution).
+        use_ngal = 'ngal' in self.observables
+        ng_predict = vng = ng_data = ng_invvar = None
+        if use_ngal:
+            ng_predict = hm.make_ngal_jax()                # theta[10] -> (n_z,)
+            vng = jax.vmap(ng_predict)                      # (n,10) -> (n, n_z)
+            ngd, ngiv = [], []
+            for mb in self.mass_bins:
+                if mb.n_gal is None or mb.n_gal_err is None:
+                    ngd.append(0.0); ngiv.append(0.0)
+                else:
+                    ngd.append(float(mb.n_gal))
+                    ngiv.append(1.0 / float(mb.n_gal_err) ** 2)
+            ng_data = jnp.asarray(ngd)                      # (n_z,)
+            ng_invvar = jnp.asarray(ngiv)                   # (n_z,)
+
         # Static map: nautilus free-param columns -> 10-slot theta vector.
         names = ['M0', 'M1', 'gamma1', 'gamma2', 'sigma_c', 'alpha_s',
                  'b0', 'b1', 'f_c', 'f_s']
@@ -1132,8 +1180,14 @@ class CSMFFitter:
             ds = vpredict(theta)                           # (n, n_z, nbin)
             resid = ds_data_all[None] - ds[:, :, mask_idx]  # (n, n_z, ncut)
             chi2 = jnp.einsum('nzi,zij,nzj->n', resid, covinv_all, resid)
+            good = jnp.isfinite(ds).all(axis=(1, 2))
+            if use_ngal:
+                ng = vng(theta)                            # (n, n_z)
+                rng = ng - ng_data[None]                   # (n, n_z)
+                chi2 = chi2 + jnp.sum(rng * rng * ng_invvar[None], axis=1)
+                good = good & jnp.isfinite(ng).all(axis=1)
             logL = -0.5 * chi2
-            good = jnp.isfinite(ds).all(axis=(1, 2)) & jnp.isfinite(logL)
+            good = good & jnp.isfinite(logL)
             return jnp.where(good, logL, -1e100)
 
         compiled = jax.jit(_loglike) if jit else _loglike
