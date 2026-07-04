@@ -75,13 +75,11 @@ class HaloModel(Cosmology):
         median_Mstar: Optional[Union[float, np.ndarray]] = None,
         include_beta_nl: bool = False,
         beta_nl_kwargs: Optional[Dict] = None,
-        beta_nl_source: str = 'emulator',
         verbose: bool = True,
         **cosmo_kwargs
     ):
         # Initialize Cosmology base class
         super().__init__(cosmo_params, beta_nl_kwargs=beta_nl_kwargs,
-                         beta_nl_source=beta_nl_source,
                          verbose=verbose, k_array=k_array,
                          units_per_h=units_per_h, **cosmo_kwargs)
 
@@ -135,7 +133,7 @@ class HaloModel(Cosmology):
             print(f"  HOD: {self.hod_type}, f_c={f_c}, f_s={f_s}")
             print(f"  Mass: [10^{self.log10M_min:.1f}, 10^{self.log10M_max:.1f}]")
             if include_beta_nl:
-                print(f"  β^NL: enabled (source='{self.beta_nl_source}')")
+                print("  β^NL: enabled")
             else:
                 print("  β^NL: disabled")
 
@@ -238,28 +236,23 @@ class HaloModel(Cosmology):
                 print("Warning: interpax not available, skipping β^NL")
             return
 
-        if self.beta_nl_source == 'emulator':
-            if self.emu is None:
-                if self.verbose:
-                    print("Warning: DarkEmulator not available, skipping β^NL")
-                return
+        if self.emu is None:
+            if self.verbose:
+                print("Warning: DarkEmulator not available, skipping β^NL")
+            return
 
-            beta_nl_opts = {
-                'n_k': 100,
-                'n_mass': 20,
-                'k_min': 1e-2,
-                'k_max': 10.0,
-                'log_M_min': 12.0,
-                'log_M_max': 15.0,
-                'method': 'linear',
-                'verbose': self.verbose,
-            }
-            beta_nl_opts.update(self._beta_nl_kwargs)
-            self.compute_beta_nl(self.z_array, **beta_nl_opts)
-        else:
-            # Numerical source: opts owned by NumericalBetaNLInterpolator,
-            # do not inject emulator-only keys (n_mass, log_M_min, log_M_max).
-            self.compute_beta_nl(self.z_array)
+        beta_nl_opts = {
+            'n_k': 100,
+            'n_mass': 20,
+            'k_min': 1e-2,
+            'k_max': 10.0,
+            'log_M_min': 12.0,
+            'log_M_max': 15.0,
+            'method': 'linear',
+            'verbose': self.verbose,
+        }
+        beta_nl_opts.update(self._beta_nl_kwargs)
+        self.compute_beta_nl(self.z_array, **beta_nl_opts)
 
         if self.beta_nl_interp is None:
             return

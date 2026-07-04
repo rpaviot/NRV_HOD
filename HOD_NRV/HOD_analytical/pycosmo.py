@@ -31,7 +31,6 @@ import pyccl as ccl
 from .emu import (
     BetaNLInterpolator, HAS_DARK_EMULATOR, HAS_INTERPAX, HAS_JAX, darkemu
 )
-from .emu_numerical import NumericalBetaNLInterpolator
 
 
 # ============================================================================
@@ -111,18 +110,12 @@ class Cosmology:
         matter_power_spectrum: str = 'camb',
         halofit_version: str = 'mead2020',
         beta_nl_kwargs: Optional[Dict] = None,
-        beta_nl_source: str = 'emulator',
         verbose: bool = True,
     ):
         self.cosmo_params = cosmo_params.copy()
         self.units_per_h = units_per_h
         self.verbose = verbose
-        if beta_nl_source not in ('emulator', 'numerical'):
-            raise ValueError(
-                f"beta_nl_source must be 'emulator' or 'numerical', got {beta_nl_source!r}"
-            )
-        self.beta_nl_source = beta_nl_source
-        
+
         self._validate_cosmo_params(cosmo_params)
         self.h = cosmo_params['h']
         
@@ -415,12 +408,6 @@ class Cosmology:
         if not HAS_INTERPAX:
             raise RuntimeError("Cannot compute β^NL without interpax")
 
-        if self.beta_nl_source == 'numerical':
-            return self._compute_beta_nl_numerical(
-                z_values, force_to_zero=force_to_zero, k_lin=k_lin,
-                constant_low=constant_low, **kwargs
-            )
-
         if self.emu is None:
             raise RuntimeError("Cannot compute β^NL without DarkEmulator")
 
@@ -449,58 +436,6 @@ class Cosmology:
         )
         return self.beta_nl_interp
 
-    def _compute_beta_nl_numerical(
-        self,
-        z_values,
-        force_to_zero: str = "additive",
-        k_lin: float = 0.02,
-        constant_low: bool = False,
-        **kwargs,
-    ) -> NumericalBetaNLInterpolator:
-        """Build the numerical (sim-measured) β^NL interpolator at one z."""
-        z_arr = np.atleast_1d(z_values)
-        if len(z_arr) != 1:
-            raise ValueError(
-                "Numerical β^NL source supports a single redshift per cache; "
-                f"got {len(z_arr)} z values."
-            )
-        z = float(z_arr[0])
-
-        opts = {
-            'n_k': 100,
-            'k_min': 1e-2,
-            'k_max': 10.0,
-            'eps': 0.02,
-            'method': 'linear',
-            'verbose': self.verbose,
-            'force_to_zero': force_to_zero,
-            'k_lin': k_lin,
-            'constant_low': constant_low,
-        }
-        opts.update(self._beta_nl_kwargs)
-        opts.update(kwargs)
-
-        try:
-            xi_grid_path = opts.pop('xi_grid_path')
-            log10M_targets = opts.pop('log10M_targets')
-        except KeyError as exc:
-            raise ValueError(
-                "beta_nl_source='numerical' requires 'xi_grid_path' and "
-                "'log10M_targets' in beta_nl_kwargs"
-            ) from exc
-
-        def P_lin_func(k):
-            return self.linear_power(np.asarray(k), z=z)
-
-        self.beta_nl_interp = NumericalBetaNLInterpolator(
-            xi_grid_path=xi_grid_path,
-            P_lin_func=P_lin_func,
-            z=z,
-            log10M_targets=log10M_targets,
-            **opts,
-        )
-        return self.beta_nl_interp
-    
     def beta_nl(self, k: Any, M1: Any, M2: Any, z: float = 0.0) -> Any:
         """
         Get β^NL at (k, M1, M2, z).
