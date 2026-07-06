@@ -209,12 +209,22 @@ def compute_hod_profiles_from_chain(points, weights, fitter, occupation, halo,
     logM = np.asarray(halo.logM_bins)
     ncen_all = np.empty((n_samples, len(logM)))
     nsat_all = np.empty((n_samples, len(logM)))
-    for i, theta in enumerate(samples):
-        theta_dict = dict(zip(fitter.param_names, theta))
-        full = fitter.full_params(theta_dict)
-        nc, ns = occupation.compute_HOD_occupation(logM, full)
-        ncen_all[i] = np.asarray(nc)
-        nsat_all[i] = np.asarray(ns)
+    # The mean <N>(M) profile is AB-free: direct AB is zero-mean over the fI/fE
+    # sign split within a mass bin (same reasoning compute_ngal/fsat/Meff use via
+    # _compute_prob_bins). Evaluating compute_HOD_occupation on the logM grid with
+    # AB on would instead try to broadcast the per-halo AB values against the grid
+    # occupation and crash — so disable AB for the profile evaluation.
+    ab_state = occupation.assembly_bias
+    occupation.assembly_bias = False
+    try:
+        for i, theta in enumerate(samples):
+            theta_dict = dict(zip(fitter.param_names, theta))
+            full = fitter.full_params(theta_dict)
+            nc, ns = occupation.compute_HOD_occupation(logM, full)
+            ncen_all[i] = np.asarray(nc)
+            nsat_all[i] = np.asarray(ns)
+    finally:
+        occupation.assembly_bias = ab_state
 
     def _med_sig(arr):
         q16, q50, q84 = np.percentile(arr, [16, 50, 84], axis=0)
