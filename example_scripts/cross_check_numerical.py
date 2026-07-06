@@ -28,6 +28,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
+from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import (
+    HaloCenterLensingCache, precompute_halo_center_lensing, TabulatedDeltaSigma,
+)
 from HOD_NRV.utilsf.emulator_utils import rescale_Ac_to_target_ngal
 
 # ============================================================================
@@ -39,6 +42,10 @@ PARTICLE_PATH = "/Users/ler13nrv/Documents/flamingo_data/particle_catalogue_L100
 
 BASELINE_CACHE = "baseline_dsigma_cache.npz"
 BENCHMARK_JSON = "benchmark_results.json"
+# xi_gm-tabulated halo-center cache (full halo catalog, 5% particles).
+# Built once on first run (~minutes); delete after changing particle
+# fraction/seed, rp_bins, or BINS_COMP.
+TABULATED_CACHE = "cross_check_tabulated_cache.h5"
 
 PLOT_OUTPUT = "cross_check_numerical.png"
 RESULTS_OUTPUT = "cross_check_numerical_results.txt"
@@ -206,6 +213,30 @@ def main():
     print(f"\nParticle downsampling: {n_part_full:,} -> "
           f"{len(halo.positions_part):,} ({particle_fraction*100:.0f}%)")
 
+    # --- Tabulated halo-center cache (before JIT warmup: fork-safe) ---
+    if os.path.exists(TABULATED_CACHE):
+        print(f"\nLoading tabulated cache from {TABULATED_CACHE}...")
+        tab_cache = HaloCenterLensingCache.load(TABULATED_CACHE)
+        if (not tab_cache.has_tabulation
+                or len(tab_cache.positions) != len(halo.logM)):
+            raise ValueError(
+                f"Stale tabulated cache {TABULATED_CACHE} — delete and re-run.")
+    else:
+        print(f"\nPrecomputing tabulated halo-center cache (one-time)...")
+        t0 = time.perf_counter()
+        tab_cache = precompute_halo_center_lensing(
+            halo_positions=np.asarray(halo.positions),
+            particle_positions=np.asarray(halo.positions_part),
+            Lbox=Lbox,
+            rsd_axis=halo.rsd_axis,
+            RHO_M=halo.RHO_M,
+            rp_bins=rp_bins,
+            bins_comp=BINS_COMP,
+            halo_logM=np.asarray(halo.logM),
+        )
+        tab_cache.save(TABULATED_CACHE)
+        print(f"  Precompute time: {fmt_time(time.perf_counter() - t0)}")
+
     # --- JIT warmup ---
     print("\nWarming up JAX JIT (throw-away population)...")
     t0 = time.perf_counter()
@@ -224,20 +255,34 @@ def main():
     )
     total_time = time.perf_counter() - t0
 
+    # --- Tabulated prediction (noise-free, no population step) ---
+    print("\nRunning tabulated prediction (TabulatedDeltaSigma)...")
+    tab = TabulatedDeltaSigma(tab_cache, halo)
+    t0 = time.perf_counter()
+    rp_tab, ds_tab, tab_info = tab.predict(hod_params)
+    tab_time = time.perf_counter() - t0
+    print(f"  Predict time: {fmt_time(tab_time)}  "
+          f"(fsat={tab_info['fsat']:.4f}, ngal={tab_info['ngal']:.3e})")
+
     # --- Comparison metrics ---
     print("\n" + "=" * 70)
-    print("Comparison: Optimized vs Full-Resolution Baseline")
+    print("Comparison: Optimized MC & Tabulated vs Full-Resolution Baseline")
     print("=" * 70)
 
     metrics = compute_deviation_metrics(ds_opt_mean, ds_baseline_mean)
+    metrics_tab = compute_deviation_metrics(ds_tab, ds_baseline_mean)
 
     print(f"\n  Settings: {particle_fraction*100:.0f}% particles, "
           f"{galaxy_fraction*100:.0f}% galaxies, {n_real} realizations")
     print(f"  Baseline: {n_baseline} realizations (100% particles/galaxies)")
-    print(f"\n  Deviation metrics (mean of {n_real} vs mean of {n_baseline}):")
-    print(f"    Median fractional:  {metrics['median_frac_dev']*100:.2f}%")
-    print(f"    Max fractional:     {metrics['max_frac_dev']*100:.2f}%")
-    print(f"    RMS fractional:     {metrics['rms_frac_dev']*100:.2f}%")
+    print(f"\n  Deviation metrics vs baseline:")
+    print(f"    {'':12s}  {'Optimized MC':>14s}  {'Tabulated':>14s}")
+    print(f"    {'Median':12s}  {metrics['median_frac_dev']*100:13.2f}%  "
+          f"{metrics_tab['median_frac_dev']*100:13.2f}%")
+    print(f"    {'Max':12s}  {metrics['max_frac_dev']*100:13.2f}%  "
+          f"{metrics_tab['max_frac_dev']*100:13.2f}%")
+    print(f"    {'RMS':12s}  {metrics['rms_frac_dev']*100:13.2f}%  "
+          f"{metrics_tab['rms_frac_dev']*100:13.2f}%")
 
     # Per-bin deviation table
     mask = np.abs(ds_baseline_mean) > 1e-10
@@ -245,26 +290,40 @@ def main():
     per_bin_dev[mask] = np.abs(
         (ds_opt_mean[mask] - ds_baseline_mean[mask]) / ds_baseline_mean[mask]
     )
+    per_bin_dev_tab = np.zeros_like(ds_tab)
+    per_bin_dev_tab[mask] = np.abs(
+        (ds_tab[mask] - ds_baseline_mean[mask]) / ds_baseline_mean[mask]
+    )
 
-    print(f"\n  {'rp [Mpc/h]':>14s}  {'Baseline':>14s}  {'Optimized':>14s}  {'Deviation':>10s}")
-    print("  " + "-" * 58)
-    for r, ds_b, ds_o, dev in zip(rp_centers, ds_baseline_mean, ds_opt_mean, per_bin_dev):
-        print(f"    {r:12.4f}  {ds_b:14.6e}  {ds_o:14.6e}  {dev*100:8.2f}%")
+    header = (f"  {'rp [Mpc/h]':>14s}  {'Baseline':>14s}  {'Optimized':>14s}  "
+              f"{'Dev':>8s}  {'Tabulated':>14s}  {'Dev':>8s}")
+    print("\n" + header)
+    print("  " + "-" * (len(header) - 2))
+    for r, ds_b, ds_o, dev, ds_t, dev_t in zip(
+            rp_centers, ds_baseline_mean, ds_opt_mean, per_bin_dev,
+            ds_tab, per_bin_dev_tab):
+        print(f"    {r:12.4f}  {ds_b:14.6e}  {ds_o:14.6e}  {dev*100:6.2f}%  "
+              f"{ds_t:14.6e}  {dev_t*100:6.2f}%")
 
     # Timing
     print(f"\n  Timing:")
-    print(f"    Total ({n_real} realizations): {fmt_time(total_time)}")
-    print(f"    Mean per realization: {fmt_time(total_time / n_real)}")
+    print(f"    Optimized MC total ({n_real} realizations): {fmt_time(total_time)}")
+    print(f"    Optimized MC per realization: {fmt_time(total_time / n_real)}")
+    print(f"    Tabulated per call: {fmt_time(tab_time)}")
 
     # --- PASS/FAIL verdict ---
     max_dev = metrics["max_frac_dev"]
-    passed = max_dev < THRESHOLD
+    max_dev_tab = metrics_tab["max_frac_dev"]
+    passed_opt = max_dev < THRESHOLD
+    passed_tab = max_dev_tab < THRESHOLD
+    passed = passed_opt and passed_tab
 
     print(f"\n  {'=' * 40}")
-    if passed:
-        print(f"  PASS  (max deviation {max_dev*100:.2f}% < {THRESHOLD*100:.0f}% threshold)")
-    else:
-        print(f"  FAIL  (max deviation {max_dev*100:.2f}% >= {THRESHOLD*100:.0f}% threshold)")
+    print(f"  Optimized MC: {'PASS' if passed_opt else 'FAIL'}  "
+          f"(max deviation {max_dev*100:.2f}% vs {THRESHOLD*100:.0f}% threshold)")
+    print(f"  Tabulated:    {'PASS' if passed_tab else 'FAIL'}  "
+          f"(max deviation {max_dev_tab*100:.2f}% vs {THRESHOLD*100:.0f}% threshold)")
+    print(f"  Overall:      {'PASS' if passed else 'FAIL'}")
     print(f"  {'=' * 40}")
 
     # --- Save results text ---
@@ -276,15 +335,25 @@ def main():
         f.write(f"# Baseline: {n_baseline} realizations (100% particles/galaxies)\n")
         f.write(f"# Base seed: {BASE_SEED}\n")
         f.write(f"# Threshold: {THRESHOLD*100:.0f}%\n")
-        f.write(f"# Result: {'PASS' if passed else 'FAIL'}\n")
+        f.write(f"# Result: {'PASS' if passed else 'FAIL'} "
+                f"(optimized MC: {'PASS' if passed_opt else 'FAIL'}, "
+                f"tabulated: {'PASS' if passed_tab else 'FAIL'})\n")
         f.write(f"#\n")
-        f.write(f"# Median deviation: {metrics['median_frac_dev']*100:.2f}%\n")
-        f.write(f"# Max deviation:    {metrics['max_frac_dev']*100:.2f}%\n")
-        f.write(f"# RMS deviation:    {metrics['rms_frac_dev']*100:.2f}%\n")
+        f.write(f"# Deviations vs baseline      Optimized MC   Tabulated\n")
+        f.write(f"# Median deviation: {metrics['median_frac_dev']*100:10.2f}%  "
+                f"{metrics_tab['median_frac_dev']*100:9.2f}%\n")
+        f.write(f"# Max deviation:    {metrics['max_frac_dev']*100:10.2f}%  "
+                f"{metrics_tab['max_frac_dev']*100:9.2f}%\n")
+        f.write(f"# RMS deviation:    {metrics['rms_frac_dev']*100:10.2f}%  "
+                f"{metrics_tab['rms_frac_dev']*100:9.2f}%\n")
         f.write(f"#\n")
-        f.write(f"# {'rp [Mpc/h]':>14s}  {'Baseline':>14s}  {'Optimized':>14s}  {'Deviation':>10s}\n")
-        for r, ds_b, ds_o, dev in zip(rp_centers, ds_baseline_mean, ds_opt_mean, per_bin_dev):
-            f.write(f"  {r:14.6f}  {ds_b:14.6e}  {ds_o:14.6e}  {dev*100:8.2f}%\n")
+        f.write(f"# {'rp [Mpc/h]':>14s}  {'Baseline':>14s}  {'Optimized':>14s}  "
+                f"{'Dev':>8s}  {'Tabulated':>14s}  {'Dev':>8s}\n")
+        for r, ds_b, ds_o, dev, ds_t, dev_t in zip(
+                rp_centers, ds_baseline_mean, ds_opt_mean, per_bin_dev,
+                ds_tab, per_bin_dev_tab):
+            f.write(f"  {r:14.6f}  {ds_b:14.6e}  {ds_o:14.6e}  {dev*100:6.2f}%  "
+                    f"{ds_t:14.6e}  {dev_t*100:6.2f}%\n")
     print(f"\n  Saved results: {RESULTS_OUTPUT}")
 
     # --- Plot ---
@@ -295,9 +364,11 @@ def main():
 
     # Top panel: DeltaSigma comparison
     ax1.loglog(rp_centers, ds_baseline_mean, "k-", lw=2,
-               label=f"Baseline (mean of {n_baseline})")
+               label=f"Raw baseline (mean of {n_baseline}, full res)")
     ax1.loglog(rp_centers, ds_opt_mean, "ro--", lw=1.5, ms=5,
-               label=f"Optimized (mean of {n_real})")
+               label=f"Optimized MC (mean of {n_real})")
+    ax1.loglog(rp_tab, ds_tab, "b^-", lw=1.5, ms=5,
+               label="Tabulated (noise-free)")
 
     # ±1σ band across realizations
     ax1.fill_between(rp_centers, ds_opt_mean - ds_opt_std, ds_opt_mean + ds_opt_std,
@@ -305,7 +376,7 @@ def main():
 
     ax1.set_ylabel(r"$\Delta\Sigma$ [$h\,M_\odot/\mathrm{pc}^2$]")
     ax1.legend(loc="upper right")
-    ax1.set_title("Numerical Regression Test: Optimized vs Baseline DeltaSigma")
+    ax1.set_title("Numerical Regression Test: Optimized MC & Tabulated vs Baseline")
 
     # Bottom panel: fractional difference
     frac_diff = np.where(
@@ -313,7 +384,13 @@ def main():
         (ds_opt_mean - ds_baseline_mean) / ds_baseline_mean,
         0.0,
     )
-    ax2.semilogx(rp_centers, frac_diff * 100, "ko-", ms=4)
+    frac_diff_tab = np.where(
+        np.abs(ds_baseline_mean) > 1e-10,
+        (ds_tab - ds_baseline_mean) / ds_baseline_mean,
+        0.0,
+    )
+    ax2.semilogx(rp_centers, frac_diff * 100, "ro-", ms=4, label="Optimized MC")
+    ax2.semilogx(rp_centers, frac_diff_tab * 100, "b^-", ms=4, label="Tabulated")
     ax2.axhline(0, color="gray", ls="--", lw=0.8)
     ax2.axhspan(-THRESHOLD * 100, THRESHOLD * 100, color="green", alpha=0.1,
                 label=rf"$\pm {THRESHOLD*100:.0f}\%$")

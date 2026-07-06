@@ -64,8 +64,9 @@ def parse_args():
     p.add_argument("--rsd_axis", default="z", choices=["x", "y", "z"])
     p.add_argument("--pi_max", type=float, default=100.0,
                    help="wgg LOS integration half-length [Mpc/h].")
-    p.add_argument("--chi_max", type=float, default=120.0,
-                   help="DeltaSigma LOS projection half-length [Mpc/h].")
+    p.add_argument("--chi_max", type=float, default=100.0,
+                   help="DeltaSigma LOS projection half-length [Mpc/h] "
+                        "(100 matches the tabulated forward model the fits use).")
     p.add_argument("--gal_type", type=int, default=None,
                    help="Optional NISP 'type' selection (default: all galaxies).")
     p.add_argument("--no_mass_weight", action="store_true",
@@ -124,7 +125,8 @@ def main():
     print("Measuring DeltaSigma ...")
     _, ds_meas = compute_galaxy_lensing(
         pos_g, pos_p, LBOX, args.rsd_axis, RHO_M, rp_bins,
-        weights_part=w_p, chi_max=args.chi_max)
+        weights_part=w_p, chi_max=args.chi_max,
+        bins_comp=np.geomspace(5e-3, 120, 201))  # matches tabulated + DMO pipeline
 
     # ---- wgg (redshift space galaxy auto) ----------------------------------
     print("Measuring wgg ...")

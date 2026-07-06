@@ -41,17 +41,19 @@ def parse_args():
     p.add_argument("--halo_path", default=HALO_PATH_DEFAULT)
     p.add_argument("--output",
                    default=os.path.join(FLAMINGO_DIR, "wgg_tabulation_AB.npz"))
-    # Defaults match the DeltaSigma cache (40 logM x 8 fI, rp geomspace(0.1,50,26))
-    # so both observables share the same (logM, fI, rp) binning schema.
+    # logM/fI bins match the DeltaSigma cache (40 x 8) so both observables share
+    # the same occupation grid.
     p.add_argument("--n_logM_bins", type=int, default=40)
     p.add_argument("--n_fI_bins", type=int, default=8)
     p.add_argument("--no_ab", action="store_true",
                    help="Tabulate without fI bins (logM only).")
-    # analysis rp binning the tabulation must nest (refine_rp_edges); the tab
-    # aggregates onto any sub-binning of this at predict time.
-    p.add_argument("--rp_min", type=float, default=0.1)
-    p.add_argument("--rp_max", type=float, default=50.0)
-    p.add_argument("--n_rp", type=int, default=26)
+    # The tabulation rp grid must NEST the analysis (fit/data) rp bins exactly:
+    # TabulatedWgg.predict raises unless the rp_bins edges appear in the
+    # tabulation's refined grid. So build it from the data 'rp_bins_wgg' rather
+    # than an independent geomspace.
+    p.add_argument("--data_path",
+                   default=os.path.join(FLAMINGO_DIR, "data_bin0_finalbinning.npz"),
+                   help="npz whose 'rp_bins_wgg' the tabulation nests.")
     p.add_argument("--pi_max", type=float, default=100.0)
     p.add_argument("--n_pi", type=int, default=101)
     return p.parse_args()
@@ -73,13 +75,14 @@ def main():
 
     # bin the fI dimension on halo.fE (= fs_norm), matching the DeltaSigma cache
     halo_fI = None if args.no_ab else np.asarray(halo.fE)
-    rp_bins = np.geomspace(args.rp_min, args.rp_max, args.n_rp)
+    rp_bins = np.asarray(np.load(args.data_path)["rp_bins_wgg"])
     pi_bins = np.linspace(0.0, args.pi_max, args.n_pi)
 
     print(f"  {len(halo.logM):,} halos, Lbox={LBOX}, rsd_axis={halo.rsd_axis}")
     print(f"  bins: {args.n_logM_bins} logM x "
-          f"{1 if args.no_ab else args.n_fI_bins} fI; "
-          f"rp {args.rp_min}-{args.rp_max} ({args.n_rp}), pi_max={args.pi_max}")
+          f"{1 if args.no_ab else args.n_fI_bins} fI; rp = data 'rp_bins_wgg' "
+          f"[{rp_bins[0]:.3f}, {rp_bins[-1]:.1f}] ({len(rp_bins)-1} bins); "
+          f"pi_max={args.pi_max}")
 
     tab = precompute_wgg_tabulation(
         pos_rsd, np.asarray(halo.logM), LBOX, halo.rsd_axis,

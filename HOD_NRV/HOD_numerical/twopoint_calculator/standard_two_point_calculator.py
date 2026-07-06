@@ -456,7 +456,7 @@ def compute_galaxy_lensing(positions_gal: jnp.ndarray,
                           bins1: np.ndarray,
                           output: str = 'xi',
                           bins2: Optional[np.ndarray] = None,
-                          bins_comp: np.ndarray = np.geomspace(5e-3, 100, 81),
+                          bins_comp: np.ndarray = np.geomspace(5e-3, 120, 201),
                           weights_part: Optional[np.ndarray] = None,
                           chi_max: float = 120.0) -> Tuple[np.ndarray, np.ndarray]:
     """
