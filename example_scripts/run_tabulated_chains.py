@@ -194,7 +194,8 @@ def _make_rescale_occupation(halo, fit_case):
 
 def compute_meff_fsat(occupation, theta_best, fitter):
     full = fitter.full_params(theta_best)
-    return occupation.compute_Meff(full)[0], occupation.compute_fsat(full)[0]
+    # compute_Meff / compute_fsat return scalars (not arrays) — no [0] indexing.
+    return occupation.compute_Meff(full), occupation.compute_fsat(full)
 
 
 def compute_hod_profiles_from_chain(points, weights, fitter, occupation, halo,
@@ -297,16 +298,30 @@ def run_case(case_name, fit_case, halo, tab, args):
         print(f"  {fitter.n_bins} bins in [{fitter.rp_obs[0]:.3f}, "
               f"{fitter.rp_obs[-1]:.2f}] Mpc/h, {fitter.n_params} free params")
 
-        print(f"  Running Nautilus (n_live={N_LIVE}, vectorized jit/vmap "
-              "likelihood, single process) ...")
-        checkpoint = os.path.join(args.output_dir,
-                                  f"checkpoint_{case_name}_rmin{rp_min}.h5")
-        points, weights, log_l, log_z = fitter.run(
-            n_eff=args.n_eff, n_live=N_LIVE, verbose=True,
-            vectorized=True, filepath=checkpoint,
-        )
-        fitter.save_results(chain_path, points, weights, log_l, log_z)
-        print(f"  Chain saved: {chain_path}")
+        if args.postprocess:
+            # Reuse an already-sampled chain: recompute Meff/fsat/chi2/plots
+            # without re-running Nautilus (the sampling is the expensive part).
+            if not os.path.exists(chain_path):
+                print(f"  [skip] no saved chain at {chain_path}")
+                continue
+            saved = np.load(chain_path)
+            points, weights, log_l, log_z = (
+                saved['points'], saved['weights'],
+                saved['log_l'], float(saved['log_z']),
+            )
+            print(f"  Loaded saved chain: {chain_path} "
+                  f"({len(points)} pts, logZ = {log_z:.2f})")
+        else:
+            print(f"  Running Nautilus (n_live={N_LIVE}, vectorized jit/vmap "
+                  "likelihood, single process) ...")
+            checkpoint = os.path.join(args.output_dir,
+                                      f"checkpoint_{case_name}_rmin{rp_min}.h5")
+            points, weights, log_l, log_z = fitter.run(
+                n_eff=args.n_eff, n_live=N_LIVE, verbose=True,
+                vectorized=True, filepath=checkpoint,
+            )
+            fitter.save_results(chain_path, points, weights, log_l, log_z)
+            print(f"  Chain saved: {chain_path}")
 
         theta_best = fitter.get_best_fit(points, log_l)
         ds_map = fitter.predict_at_obs(theta_best)
@@ -357,7 +372,7 @@ def run_case(case_name, fit_case, halo, tab, args):
     profiles_by_rp_min = {
         rp_min: {k: bestfits[rp_min][k]
                  for k in ('ncen_med', 'ncen_sig', 'nsat_med', 'nsat_sig')}
-        for rp_min in args.rp_min_values
+        for rp_min in bestfits
     }
     plot_hod_profiles(case_name + rp_tag, logM_bins, profiles_by_rp_min,
                       args.output_dir)
@@ -389,6 +404,11 @@ def parse_args():
                    default=RP_MIN_VALUES)
     p.add_argument("--max_fsat", type=float, default=None)
     p.add_argument("--gaussian_ab", action="store_true")
+    p.add_argument("--postprocess", action="store_true",
+                   help="Skip sampling: load the saved chain_*.npz and "
+                        "(re)compute Meff/fsat/chi2, plots, and the aggregate. "
+                        "Use to recover the outputs when a run crashed in "
+                        "post-processing after the chains were saved.")
     return p.parse_args()
 
 
