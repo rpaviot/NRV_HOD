@@ -192,10 +192,28 @@ def _make_rescale_occupation(halo, fit_case):
 # Posterior HOD profiles / Meff / fsat (same as run_emulator_chains.py)
 # ============================================================================
 
-def compute_meff_fsat(occupation, theta_best, fitter):
+def compute_meff_fsat(occupation, theta_best, fitter, halo):
+    """Meff, fsat, ngal by direct per-halo summation of the AB-modified
+    occupation — the *same* method tab.predict() uses (halo_center_lensing.py:
+    compute_HOD_occupation over self.halo.logM, then sum probC/probS).
+
+    occupation.compute_Meff / compute_fsat instead use the no-AB mass-function
+    integral (logM_halos is None -> _compute_prob_bins), which ignores the
+    preferred-halo selection when B_cent/B_sat != 0: with AB on, occupation is
+    up-weighted on one side of the fI/fE split, so ngal (and fsat, Meff) shift.
+    Summing the AB occupation over the actual halos captures that and stays
+    consistent with the tabulated DeltaSigma (which sums over the same halos);
+    identical to the old path for the non-AB cases (B = 0)."""
     full = fitter.full_params(theta_best)
-    # compute_Meff / compute_fsat return scalars (not arrays) — no [0] indexing.
-    return occupation.compute_Meff(full), occupation.compute_fsat(full)
+    logM_h = np.asarray(halo.logM)
+    probC, probS = occupation.compute_HOD_occupation(logM_h, full)
+    probC = np.minimum(np.asarray(probC, dtype=float), 1.0)
+    probS = np.asarray(probS, dtype=float)
+    sum_C, sum_S = probC.sum(), probS.sum()
+    Meff = float((probC * 10.0**logM_h).sum() / sum_C)
+    fsat = float(sum_S / (sum_C + sum_S))
+    ngal = float((sum_C + sum_S) / halo.Lbox**3)
+    return Meff, fsat, ngal
 
 
 def compute_hod_profiles_from_chain(points, weights, fitter, occupation, halo,
@@ -339,12 +357,16 @@ def run_case(case_name, fit_case, halo, tab, args):
         chi2 = float(residual @ fitter.cov_inv @ residual)
         chi2_red = chi2 / (len(fitter.ds_obs) - fitter.n_params)
         ds_map_full = fitter.predict_at_obs(theta_best, rp_eval=rp_all)
-        Meff, fsat = compute_meff_fsat(occupation_full, theta_best, fitter)
+        Meff, fsat, ngal_ab = compute_meff_fsat(occupation_full, theta_best,
+                                                fitter, halo)
         log10Meff = np.log10(Meff)
+        ngal_drift = 100.0 * (ngal_ab / TARGET_NGAL - 1.0)
 
         print(f"  chi2_red = {chi2_red:.3f}")
         print(f"  log10(Meff / [Msun/h]) = {log10Meff:.3f}")
         print(f"  fsat = {fsat:.3f}")
+        print(f"  ngal (AB per-halo sum) = {ngal_ab:.4e}  "
+              f"(target {TARGET_NGAL:.3e}, drift {ngal_drift:+.2f}%)")
 
         logM_bins, ncen_med, ncen_sig, nsat_med, nsat_sig = \
             compute_hod_profiles_from_chain(points, weights, fitter,
@@ -352,7 +374,7 @@ def run_case(case_name, fit_case, halo, tab, args):
 
         bestfits[rp_min] = {
             'ds': ds_map_full, 'chi2_red': chi2_red,
-            'Meff': Meff, 'fsat': fsat,
+            'Meff': Meff, 'fsat': fsat, 'ngal': ngal_ab,
             'ncen_med': ncen_med, 'ncen_sig': ncen_sig,
             'nsat_med': nsat_med, 'nsat_sig': nsat_sig,
         }
@@ -454,6 +476,7 @@ def main():
             all_bestfits_arrays[f"{prefix}_chi2_red"] = np.array(vals['chi2_red'])
             all_bestfits_arrays[f"{prefix}_Meff"]     = np.array(vals['Meff'])
             all_bestfits_arrays[f"{prefix}_fsat"]     = np.array(vals['fsat'])
+            all_bestfits_arrays[f"{prefix}_ngal"]     = np.array(vals['ngal'])
             all_bestfits_arrays[f"{prefix}_ncen_med"] = vals['ncen_med']
             all_bestfits_arrays[f"{prefix}_ncen_sig"] = vals['ncen_sig']
             all_bestfits_arrays[f"{prefix}_nsat_med"] = vals['nsat_med']
