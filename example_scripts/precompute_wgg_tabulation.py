@@ -41,8 +41,9 @@ def parse_args():
     p.add_argument("--halo_path", default=HALO_PATH_DEFAULT)
     p.add_argument("--output",
                    default=os.path.join(FLAMINGO_DIR, "wgg_tabulation_AB.npz"))
-    p.add_argument("--n_logM_bins", type=int, default=24,
-                   help="wgg needs >=24 logM bins (within-bin cc weighting).")
+    # Defaults match the DeltaSigma cache (40 logM x 8 fI, rp geomspace(0.1,50,26))
+    # so both observables share the same (logM, fI, rp) binning schema.
+    p.add_argument("--n_logM_bins", type=int, default=40)
     p.add_argument("--n_fI_bins", type=int, default=8)
     p.add_argument("--no_ab", action="store_true",
                    help="Tabulate without fI bins (logM only).")
@@ -50,9 +51,9 @@ def parse_args():
     # aggregates onto any sub-binning of this at predict time.
     p.add_argument("--rp_min", type=float, default=0.1)
     p.add_argument("--rp_max", type=float, default=50.0)
-    p.add_argument("--n_rp", type=int, default=16)
-    p.add_argument("--pi_max", type=float, default=60.0)
-    p.add_argument("--n_pi", type=int, default=61)
+    p.add_argument("--n_rp", type=int, default=26)
+    p.add_argument("--pi_max", type=float, default=100.0)
+    p.add_argument("--n_pi", type=int, default=101)
     return p.parse_args()
 
 
