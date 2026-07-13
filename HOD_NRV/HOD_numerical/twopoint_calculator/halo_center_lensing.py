@@ -1035,6 +1035,198 @@ class TabulatedDeltaSigma:
         info = {'ngal': ngal, 'fsat': fsat, 'ds_cen': ds_cen, 'ds_sat': ds_sat}
         return rp_centers, ds_total, info
 
+    def make_predict_jax(self, n_sub_logM: int = 16, n_sub_fI: int = 4):
+        """Build a pure-JAX twin of :meth:`predict` for jit/vmap sampling.
+
+        Returns ``predict_fn(params) -> (ds_total, ngal, fsat)`` where
+        ``params`` is a dict of (traced) scalars. The satellite pipeline is
+        the exact jnp translation of :meth:`predict` (the scipy cubic-spline
+        stages are linear in their inputs and are precomputed as matrices by
+        probing the NumPy code with unit vectors). The centrals — exact
+        per-halo sums in :meth:`predict` — are tabulated on a fine
+        (n_m*n_sub_logM, n_f*n_sub_fI) occupation grid nested inside the
+        cache bins: profile sums are exact, only the occupation weight is
+        evaluated at the per-cell mean (logM, fI) instead of per halo.
+
+        The ngal/fsat catalog sums use the same fine grid. AB is supported
+        for ``ab_method`` 'mass' or 'direct' with a single AB property
+        (fI or fE); 'direct' uses exact per-cell means of sign(prop).
+        """
+        import jax
+        import jax.numpy as jnp
+        from ..HOD_models import build_occupation_fn_jax
+
+        occ = self.halo.HOD
+        if occ.assembly_bias and occ.ab_method not in ("mass", "direct"):
+            raise NotImplementedError(
+                "make_predict_jax supports ab_method 'mass' or 'direct'.")
+
+        # ── AB property and the coefficient names that multiply it ──
+        prop = None
+        cen_coef = sat_coef = None
+        if occ.assembly_bias:
+            if occ.fI is not None and occ.fE is not None:
+                raise NotImplementedError(
+                    "make_predict_jax supports a single AB property (fI or fE).")
+            if occ.fI is not None:
+                prop, cen_coef, sat_coef = np.asarray(occ.fI), "A_cent", "A_sat"
+            else:
+                prop, cen_coef, sat_coef = np.asarray(occ.fE), "B_cent", "B_sat"
+
+        # ── Fine occupation grid nested in the cache tabulation bins ──
+        logM = np.asarray(self.halo.logM)
+        edges_m = np.asarray(self.cache.bin_logM_edges)
+        n_mc = self.n_m * n_sub_logM
+        fine_m_edges = np.concatenate(
+            [np.linspace(edges_m[i], edges_m[i + 1], n_sub_logM + 1)[:-1]
+             for i in range(self.n_m)] + [edges_m[-1:]])
+        i_mc = np.clip(np.digitize(logM, fine_m_edges) - 1, 0, n_mc - 1)
+
+        if self.n_f > 1:
+            fI_edges = np.asarray(self.cache.bin_fI_edges)
+            i_f = np.clip(np.digitize(prop, fI_edges) - 1, 0, self.n_f - 1)
+            n_fc = self.n_f * n_sub_fI
+            i_fc = np.empty(len(prop), dtype=np.int64)
+            eps = 1e-9
+            for f in range(self.n_f):
+                sel = i_f == f
+                q = np.quantile(prop[sel], np.linspace(0, 1, n_sub_fI + 1))
+                q[0] -= eps
+                q[-1] += eps
+                i_fc[sel] = f * n_sub_fI + np.clip(
+                    np.digitize(prop[sel], q) - 1, 0, n_sub_fI - 1)
+        else:
+            n_fc, n_sub_fI = 1, 1
+            i_fc = np.zeros(len(logM), dtype=np.int64)
+
+        cell = i_mc * n_fc + i_fc
+        n_cells = n_mc * n_fc
+        N_cell = np.bincount(cell, minlength=n_cells).astype(np.float64)
+        safe_N = np.maximum(N_cell, 1.0)
+        logM_cell = np.bincount(cell, weights=logM, minlength=n_cells) / safe_N
+        # empty cells: use the fine-bin midpoint (weight is 0 anyway)
+        mid_m = 0.5 * (fine_m_edges[:-1] + fine_m_edges[1:])
+        empty = N_cell == 0
+        logM_cell[empty] = np.repeat(mid_m, n_fc)[empty]
+        if prop is not None:
+            prop_cell = np.bincount(cell, weights=prop, minlength=n_cells) / safe_N
+            # 'direct' AB uses sign(prop): exact per-cell mean of the signs
+            sign_cell = np.bincount(
+                cell, weights=np.sign(prop), minlength=n_cells) / safe_N
+        else:
+            prop_cell = np.zeros(n_cells)
+            sign_cell = np.zeros(n_cells)
+
+        n_rp = len(self.cache.rp_centers)
+        D_cen = np.empty((n_cells, n_rp))
+        dsig = np.asarray(self.cache.deltasigma)
+        for j in range(n_rp):
+            D_cen[:, j] = np.bincount(cell, weights=dsig[:, j], minlength=n_cells)
+
+        # ── Linear-map matrices probing the exact NumPy spline stages ──
+        n_out = len(self.R_out)
+        M_sig = np.empty((n_out, n_out))
+        M_avg = np.empty((n_rp, n_out))
+        rp_bins = self.cache.rp_bins
+        for j in range(n_out):
+            e = np.zeros(n_out)
+            e[j] = 1.0
+            spl_S = interp1d(self.R_out, e, kind='cubic', bounds_error=False,
+                             fill_value=(e[0], 0.0))
+            M_sig[:, j] = 2.0 * gauss_legendre_integration(
+                lambda r: spl_S(r) * r, 0, self.R_out) / self.R_out ** 2
+            spl_d = interp1d(self.R_out, e, kind='cubic', bounds_error=False,
+                             fill_value=(e[0], e[-1]))
+            M_avg[:, j] = binavg_2D(spl_d, rp_bins)
+
+        # ── Constants as jnp arrays ──
+        j_logM_cell = jnp.asarray(logM_cell.reshape(n_mc, n_fc))
+        j_prop_cell = jnp.asarray(prop_cell.reshape(n_mc, n_fc))
+        j_sign_cell = jnp.asarray(sign_cell.reshape(n_mc, n_fc))
+        j_N_cell = jnp.asarray(N_cell.reshape(n_mc, n_fc))
+        j_D_cen = jnp.asarray(D_cen.reshape(n_mc, n_fc, n_rp))
+        j_Sigma_bins = jnp.asarray(self.Sigma_bins)
+        j_Rvir_m = jnp.asarray(self.Rvir_m)
+        j_conc_m = jnp.asarray(self.conc_m)
+        j_R_sigma = jnp.asarray(self.R_sigma)
+        j_R_out = jnp.asarray(self.R_out)
+        j_x_norm = jnp.asarray(self._x_norm)
+        j_u_nodes, j_u_w = jnp.asarray(self._u_nodes), jnp.asarray(self._u_w)
+        j_mu_w = jnp.asarray(self._mu_w)
+        j_sin_th = jnp.asarray(np.sqrt(1.0 - self._mu_nodes ** 2))
+        j_cos_phi, j_phi_w = jnp.asarray(self._cos_phi), jnp.asarray(self._phi_w)
+        j_M_sig, j_M_avg = jnp.asarray(M_sig), jnp.asarray(M_avg)
+        occ_fn = build_occupation_fn_jax(occ)
+        n_m, n_f = self.n_m, self.n_f
+        Lbox3 = self.halo.Lbox ** 3
+        rho_fac = self.RHO_M / 1e12
+        has_ab = occ.assembly_bias
+        ab_method = occ.ab_method
+
+        def predict_fn(params):
+            cshift = sshift = 0.0
+            if has_ab and ab_method == "mass":
+                cshift = params.get(cen_coef, 0.0) * j_prop_cell
+                sshift = params.get(sat_coef, 0.0) * j_prop_cell
+            probC, probS = occ_fn(j_logM_cell, params, cshift, sshift)
+            if has_ab and ab_method == "direct":
+                ab_c = params.get(cen_coef, 0.0) * j_sign_cell
+                ab_s = params.get(sat_coef, 0.0) * j_sign_cell
+                probC = probC + ab_c * jnp.minimum(probC, 1.0 - probC)
+                probS = probS * (1.0 + ab_s)
+            probC = jnp.minimum(probC, 1.0)
+
+            sum_C = jnp.sum(probC * j_N_cell)
+            sum_S = jnp.sum(probS * j_N_cell)
+            ngal = (sum_C + sum_S) / Lbox3
+            fsat = sum_S / (sum_C + sum_S)
+
+            # Centrals: binned twin of probC @ cache.deltasigma / sum_C
+            ds_cen = jnp.einsum('mf,mfr->r', probC, j_D_cen) / sum_C
+
+            # Satellites: per-(logM, fI)-bin Sigma + offset convolution
+            w = (probS * j_N_cell).reshape(
+                n_m, n_sub_logM, n_f, n_sub_fI).sum(axis=(1, 3))
+            Sigma_M = jnp.einsum('mf,mfr->mr', w, j_Sigma_bins)
+
+            f_exp = params.get('f_exp', 0.0)
+            tau = params.get('tau', 6.0)
+            lam = params.get('lambda_NFW', 1.0)
+
+            def per_m(Rvir, conc, SigM_row):
+                Rs = Rvir / conc
+                # radial nodes: NFW comp (weight 1-f_exp) + exp comp (weight f_exp)
+                x = j_x_norm * conc * lam
+                cdf = jnp.log1p(x) - x / (1.0 + x)
+                cdf = cdf / cdf[-1]
+                r_nfw = jnp.interp(j_u_nodes, cdf, j_x_norm * Rvir)
+                u_max = 1.0 - jnp.exp(-3.0 * Rvir / (tau * Rs))
+                r_exp = -tau * Rs * jnp.log1p(-j_u_nodes * u_max)
+                r_all = jnp.concatenate([r_nfw, r_exp])
+                w_r = jnp.concatenate([(1.0 - f_exp) * j_u_w, f_exp * j_u_w])
+                w_r = w_r / jnp.sum(w_r)
+                rho = (r_all[:, None] * j_sin_th[None, :]).ravel()
+                w_rho = (w_r[:, None] * j_mu_w[None, :]).ravel()
+                w_rho = w_rho / jnp.sum(w_rho)
+                d2 = (j_R_out[:, None, None] ** 2 + rho[None, :, None] ** 2
+                      + 2.0 * j_R_out[:, None, None] * rho[None, :, None]
+                      * j_cos_phi[None, None, :])
+                dist = jnp.sqrt(jnp.maximum(d2, 0.0))
+                Sig = jnp.interp(dist, j_R_sigma, SigM_row,
+                                 left=SigM_row[0], right=0.0)
+                return (Sig @ j_phi_w) @ w_rho
+
+            Sigma_sat = jax.vmap(per_m)(j_Rvir_m, j_conc_m, Sigma_M).sum(axis=0)
+            Sigma_sat = Sigma_sat / jnp.sum(w)
+
+            Sigma_mean = j_M_sig @ Sigma_sat
+            ds_sat = j_M_avg @ ((Sigma_mean - Sigma_sat) * rho_fac)
+
+            ds_total = (1.0 - fsat) * ds_cen + fsat * ds_sat
+            return ds_total, ngal, fsat
+
+        return predict_fn
+
     def __repr__(self) -> str:
         return (f"TabulatedDeltaSigma(n_logM_bins={self.n_m}, "
                 f"n_fI_bins={self.n_f}, n_halos={len(self.bin_index)})")

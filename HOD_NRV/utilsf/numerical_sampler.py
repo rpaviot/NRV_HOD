@@ -498,9 +498,16 @@ class EmulatorFitter:
         filepath: Optional[str] = None,
         verbose: bool = True,
         n_workers: int = 1,
+        vectorized: bool = False,
         **nautilus_kwargs,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-        """Run the Nautilus nested sampler with the emulator likelihood."""
+        """Run the Nautilus nested sampler with the emulator likelihood.
+
+        With ``vectorized=True`` the sampler uses the jit/vmap-batched
+        likelihood from :meth:`build_batched_loglike` in a single process
+        (``vectorized=True, pool=None``) — no fork, no JAX-after-fork
+        deadlock; parallelism comes from XLA's own threading.
+        """
         import nautilus
         import HOD_NRV.utilsf.numerical_sampler as _self_mod
 
@@ -514,16 +521,25 @@ class EmulatorFitter:
 
         _self_mod._emulator_fitter_instance = self
 
-        pool_arg = n_workers if n_workers > 1 else None
+        if vectorized:
+            likelihood, _ = self.build_batched_loglike()
+            pool_arg = None
+            # n_batch=128 matches the loglike's pad_to multiple: no padding waste
+            vec_kwargs = dict(vectorized=True, n_batch=128)
+        else:
+            likelihood = _emulator_likelihood
+            pool_arg = n_workers if n_workers > 1 else None
+            vec_kwargs = {}
 
         try:
             sampler = nautilus.Sampler(
                 prior,
-                _emulator_likelihood,
+                likelihood,
                 n_live=n_live,
                 filepath=filepath,
                 pool=pool_arg,
                 pass_dict=False,
+                **vec_kwargs,
             )
             sampler.run(n_eff=n_eff, verbose=verbose, **nautilus_kwargs)
         finally:
@@ -778,3 +794,118 @@ class TabulatedFitter(EmulatorFitter):
 
         residual = ds_at_obs - self.ds_obs
         return -0.5 * float(residual @ self.cov_inv @ residual)
+
+    def build_batched_loglike(self, pad_to: int = 32, vmap_chunk: int = 8):
+        """Build a jit-compiled batched log-likelihood for ``vectorized=True``.
+
+        Returns ``(loglike_fn, free_names)``; ``loglike_fn`` maps an
+        ``(n, n_free)`` array (columns in ``free_names`` = nautilus prior
+        order) to an ``(n,)`` numpy array of log-likelihoods. It is the
+        batched twin of :meth:`log_likelihood`: the (Ac, As) -> target_ngal
+        rescale, the tabulated forward pass and the log-log cubic
+        interpolation onto the observed rp grid are all reproduced in pure
+        jnp. The scipy cubic-spline stages (ngal GL integral, rp
+        interpolation) are linear in their inputs and precomputed as
+        matrices by probing the exact NumPy code with basis vectors.
+        Points run through ``jax.lax.map`` over ``vmap``-ed chunks of
+        ``vmap_chunk`` points (caps the transient satellite-convolution
+        tensor at ~vmap_chunk * 0.25 GB while giving XLA large ops to
+        thread) and batches are padded to a multiple of ``pad_to`` to
+        avoid shape-driven recompilation.
+        """
+        import jax
+        import jax.numpy as jnp
+        from scipy.interpolate import CubicSpline
+        from HOD_NRV.HOD_numerical.HOD_models import (
+            build_occupation_fn_jax, ELG_satellite_cutoff, HOD_satellite,
+        )
+        from HOD_NRV.utilsf.utils_functions import x_legendre, w_legendre
+
+        predict_fn = self.tab.make_predict_jax()
+
+        # ── ngal rescale: GL integral of a CubicSpline is linear in the
+        # integrand values on logM_bins — probe it once with the identity ──
+        occ_r = self.occupation_rescale
+        logMb = np.asarray(occ_r.logM_bins)
+        a, b = logMb.min(), logMb.max()
+        gl_nodes = 0.5 * ((b - a) * np.asarray(x_legendre) + (a + b))
+        basis_at_nodes = CubicSpline(logMb, np.eye(len(logMb)))(gl_nodes)
+        W_ngal = 0.5 * (b - a) * (np.asarray(w_legendre) @ basis_at_nodes)
+        occ_r_fn = build_occupation_fn_jax(occ_r)
+        j_logMb = jnp.asarray(logMb)
+        j_mf = jnp.asarray(np.asarray(occ_r.mass_function))
+        j_W_ngal = jnp.asarray(W_ngal)
+
+        # ── obs-grid interpolation: log-log CubicSpline is linear in
+        # log(ds) on the cache rp grid ──
+        W_obs = CubicSpline(
+            self._log_rp_emu, np.eye(len(self._log_rp_emu)))(self._log_rp_obs)
+        j_W_obs = jnp.asarray(W_obs)
+        j_ds_obs = jnp.asarray(self.ds_obs)
+        j_cov_inv = jnp.asarray(self.cov_inv)
+
+        free_names = list(self.param_names)
+        fixed = {k: float(v) for k, v in self.fixed_params_dict.items()}
+        target_ngal = float(self.target_ngal)
+        Ac_fid = float(self.Ac_fiducial)
+
+        # ── optional max_fsat gate: twin of compute_fsat_batched (trapezoid,
+        # no conformity/AB corrections, fiducial Ac, unrescaled As) ──
+        max_fsat = self.max_fsat
+        if max_fsat is not None:
+            hocc = self.hod_occupation
+            fs_cen_fn, fs_cen_names = hocc.HOD_central, list(hocc.central_params)
+            if hocc.elg_satellite:
+                fs_sat_fn = ELG_satellite_cutoff
+                fs_sat_names = ["As", "M1", "alpha", "Mcut", "Mmax"]
+            else:
+                fs_sat_fn = HOD_satellite
+                fs_sat_names = ["As", "Mmin", "M1", "alpha", "kappa"]
+            j_logMb_fs = jnp.asarray(np.asarray(hocc.logM_bins))
+            j_mf_fs = jnp.asarray(np.asarray(hocc.mass_function))
+
+        def _loglike_one(theta):
+            free = {name: theta[i] for i, name in enumerate(free_names)}
+            merged = {**fixed, **free}
+            merged.pop("Ac", None)
+
+            if max_fsat is not None:
+                fs_params = {**merged, "Ac": Ac_fid}
+                pC = fs_cen_fn(j_logMb_fs, *[fs_params[n] for n in fs_cen_names])
+                pS = fs_sat_fn(j_logMb_fs, *[fs_params[n] for n in fs_sat_names])
+                fsat_gate = (jnp.trapezoid(j_mf_fs * pS, j_logMb_fs)
+                             / jnp.trapezoid(j_mf_fs * (pC + pS), j_logMb_fs))
+
+            # (Ac, As) -> target_ngal rescale (mass-function ngal, no AB)
+            probC, probS = occ_r_fn(j_logMb, {**merged, "Ac": Ac_fid})
+            ngal_fid = j_W_ngal @ (j_mf * (probC + probS))
+            rf = target_ngal / ngal_fid
+            full = {**merged, "Ac": Ac_fid * rf, "As": merged["As"] * rf}
+
+            ds, ngal, fsat = predict_fn(full)
+            log_ds = jnp.log(jnp.maximum(ds, 1e-30))
+            ds_at_obs = jnp.exp(j_W_obs @ log_ds)
+            resid = ds_at_obs - j_ds_obs
+            logL = -0.5 * (resid @ j_cov_inv @ resid)
+
+            good = jnp.isfinite(ds).all() & jnp.isfinite(logL)
+            if max_fsat is not None:
+                good = good & jnp.isfinite(fsat_gate) & (fsat_gate <= max_fsat)
+            return jnp.where(good, logL, -1e100)
+
+        if pad_to % vmap_chunk:
+            raise ValueError("pad_to must be a multiple of vmap_chunk.")
+        _loglike_chunk = jax.vmap(_loglike_one)
+        compiled = jax.jit(lambda pts: jax.lax.map(
+            _loglike_chunk,
+            pts.reshape(-1, vmap_chunk, pts.shape[-1])).ravel())
+
+        def loglike_fn(points):
+            points = np.atleast_2d(np.asarray(points, dtype=np.float64))
+            n = len(points)
+            n_pad = (-n) % pad_to
+            if n_pad:
+                points = np.vstack([points, np.repeat(points[-1:], n_pad, 0)])
+            return np.asarray(compiled(jnp.asarray(points)))[:n]
+
+        return loglike_fn, free_names

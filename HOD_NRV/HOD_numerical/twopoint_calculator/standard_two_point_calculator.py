@@ -24,14 +24,16 @@ import jax.numpy as jnp
 
 cpu_count = multiprocessing.cpu_count()
 
-def compute_corr(mode: str, 
-                catalog1: jnp.ndarray, 
-                bins1: np.ndarray, 
-                catalog2: Optional[jnp.ndarray] = None, 
-                bins2: Optional[np.ndarray] = None, 
-                boxsize: Optional[float] = None, 
-                los: str = 'z', 
-                output: str = 'auto') -> Tuple[np.ndarray, np.ndarray]:
+def compute_corr(mode: str,
+                catalog1: jnp.ndarray,
+                bins1: np.ndarray,
+                catalog2: Optional[jnp.ndarray] = None,
+                bins2: Optional[np.ndarray] = None,
+                boxsize: Optional[float] = None,
+                los: str = 'z',
+                output: str = 'auto',
+                weights1: Optional[np.ndarray] = None,
+                weights2: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute two-point correlation functions using the Natural estimator.
     
@@ -126,12 +128,16 @@ def compute_corr(mode: str,
         edges = bins1
 
 
-    # Construct TwoPointCorrelationFunction
+    # Construct TwoPointCorrelationFunction. Optional per-object weights
+    # (e.g. particle mass for a mass-weighted matter field in hydro lensing);
+    # pycorr normalises the natural estimator by the summed weights.
     corr = TwoPointCorrelationFunction(
         mode=mode,
         edges=edges,
         data_positions1=catalog1.T,
         data_positions2=catalog2.T if is_cross else None,
+        data_weights1=weights1,
+        data_weights2=weights2 if is_cross else None,
         boxsize=boxsize,
         compute_sepsavg=False,
         los=los,
@@ -447,10 +453,12 @@ def compute_galaxy_lensing(positions_gal: jnp.ndarray,
                           Lbox: float,
                           rsd_axis: str,
                           RHO_M: float,
-                          bins1: np.ndarray, 
+                          bins1: np.ndarray,
                           output: str = 'xi',
                           bins2: Optional[np.ndarray] = None,
-                          bins_comp: np.ndarray = np.geomspace(5e-3, 100, 81)) -> Tuple[np.ndarray, np.ndarray]:
+                          bins_comp: np.ndarray = np.geomspace(5e-3, 120, 201),
+                          weights_part: Optional[np.ndarray] = None,
+                          chi_max: float = 120.0) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute galaxy-galaxy lensing signal ΔΣ(rp).
     
@@ -514,15 +522,18 @@ def compute_galaxy_lensing(positions_gal: jnp.ndarray,
     # Compute bin centers
     rp_centers = np.sqrt(bins1[:-1] * bins1[1:])
     
-    # Compute galaxy-matter correlation function
+    # Compute galaxy-matter correlation function (particles may carry mass
+    # weights so ξ_gm traces the mass-weighted matter field, as needed for
+    # multi-species hydro particles).
     rr, xi_gm = compute_corr(
         's', positions_gal, bins_comp,
         catalog2=positions_part, bins2=bins2,
-        boxsize=Lbox, los=rsd_axis, output=output
+        boxsize=Lbox, los=rsd_axis, output=output,
+        weights2=weights_part,
     )
-    
+
     # Calculate surface mass density contrast
-    DeltaSigma_pipeline = DeltaSigmaCalculator(rr, xi_gm, RHO_M)
+    DeltaSigma_pipeline = DeltaSigmaCalculator(rr, xi_gm, RHO_M, chi_max=chi_max)
     DeltaSigma = DeltaSigma_pipeline.compute_deltasigma_averaged(bins1)
     
     return rp_centers, DeltaSigma

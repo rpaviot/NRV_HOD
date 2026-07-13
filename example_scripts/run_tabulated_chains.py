@@ -4,8 +4,15 @@ run_tabulated_chains.py
 
 Nautilus DeltaSigma fits on the Flamingo L1000N1800 ELG data using the
 TabCorr-style TabulatedDeltaSigma forward model — no LHS grid, no NN
-emulator. Each likelihood call is the exact expectation of the MC pipeline
-(~0.2-0.5 s), so chains run directly against the tabulated cache.
+emulator. Each likelihood call is the exact expectation of the MC pipeline,
+so chains run directly against the tabulated cache.
+
+Sampling is single-process with nautilus ``vectorized=True`` on the
+jit/vmap-batched likelihood (TabulatedFitter.build_batched_loglike):
+no multiprocessing pool, hence no JAX-after-fork deadlock (which stalled
+jobs 52827669-75 at zero likelihood calls). Parallelism comes from XLA
+threading; float64 is enabled below for parity with the NumPy path
+(validated by cross_check_tabulated.py --jax).
 
 Mirrors run_emulator_chains.py (same priors, fixed params, ngal rescaling,
 scale cuts, outputs) so posteriors are directly comparable to the
@@ -14,13 +21,16 @@ grid+emulator chains (chains_BARYON / FULL_* generations).
 Usage (cluster):
     python example_scripts/run_tabulated_chains.py NFW \
         --cache_path /sps/euclid/Users/rpaviot/flamingo/tabulated_cache_DMO.h5 \
-        --output_dir /sps/euclid/Users/rpaviot/flamingo/chains_TABULATED_DMO \
-        --n_workers 20
+        --output_dir /sps/euclid/Users/rpaviot/flamingo/chains_TABULATED_DMO
 """
 
 import argparse
 import os
 import sys
+
+import jax
+jax.config.update("jax_enable_x64", True)
+
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')
@@ -182,9 +192,28 @@ def _make_rescale_occupation(halo, fit_case):
 # Posterior HOD profiles / Meff / fsat (same as run_emulator_chains.py)
 # ============================================================================
 
-def compute_meff_fsat(occupation, theta_best, fitter):
+def compute_meff_fsat(occupation, theta_best, fitter, halo):
+    """Meff, fsat, ngal by direct per-halo summation of the AB-modified
+    occupation — the *same* method tab.predict() uses (halo_center_lensing.py:
+    compute_HOD_occupation over self.halo.logM, then sum probC/probS).
+
+    occupation.compute_Meff / compute_fsat instead use the no-AB mass-function
+    integral (logM_halos is None -> _compute_prob_bins), which ignores the
+    preferred-halo selection when B_cent/B_sat != 0: with AB on, occupation is
+    up-weighted on one side of the fI/fE split, so ngal (and fsat, Meff) shift.
+    Summing the AB occupation over the actual halos captures that and stays
+    consistent with the tabulated DeltaSigma (which sums over the same halos);
+    identical to the old path for the non-AB cases (B = 0)."""
     full = fitter.full_params(theta_best)
-    return occupation.compute_Meff(full)[0], occupation.compute_fsat(full)[0]
+    logM_h = np.asarray(halo.logM)
+    probC, probS = occupation.compute_HOD_occupation(logM_h, full)
+    probC = np.minimum(np.asarray(probC, dtype=float), 1.0)
+    probS = np.asarray(probS, dtype=float)
+    sum_C, sum_S = probC.sum(), probS.sum()
+    Meff = float((probC * 10.0**logM_h).sum() / sum_C)
+    fsat = float(sum_S / (sum_C + sum_S))
+    ngal = float((sum_C + sum_S) / halo.Lbox**3)
+    return Meff, fsat, ngal
 
 
 def compute_hod_profiles_from_chain(points, weights, fitter, occupation, halo,
@@ -198,12 +227,22 @@ def compute_hod_profiles_from_chain(points, weights, fitter, occupation, halo,
     logM = np.asarray(halo.logM_bins)
     ncen_all = np.empty((n_samples, len(logM)))
     nsat_all = np.empty((n_samples, len(logM)))
-    for i, theta in enumerate(samples):
-        theta_dict = dict(zip(fitter.param_names, theta))
-        full = fitter.full_params(theta_dict)
-        nc, ns = occupation.compute_HOD_occupation(logM, full)
-        ncen_all[i] = np.asarray(nc)
-        nsat_all[i] = np.asarray(ns)
+    # The mean <N>(M) profile is AB-free: direct AB is zero-mean over the fI/fE
+    # sign split within a mass bin (same reasoning compute_ngal/fsat/Meff use via
+    # _compute_prob_bins). Evaluating compute_HOD_occupation on the logM grid with
+    # AB on would instead try to broadcast the per-halo AB values against the grid
+    # occupation and crash — so disable AB for the profile evaluation.
+    ab_state = occupation.assembly_bias
+    occupation.assembly_bias = False
+    try:
+        for i, theta in enumerate(samples):
+            theta_dict = dict(zip(fitter.param_names, theta))
+            full = fitter.full_params(theta_dict)
+            nc, ns = occupation.compute_HOD_occupation(logM, full)
+            ncen_all[i] = np.asarray(nc)
+            nsat_all[i] = np.asarray(ns)
+    finally:
+        occupation.assembly_bias = ab_state
 
     def _med_sig(arr):
         q16, q50, q84 = np.percentile(arr, [16, 50, 84], axis=0)
@@ -287,13 +326,30 @@ def run_case(case_name, fit_case, halo, tab, args):
         print(f"  {fitter.n_bins} bins in [{fitter.rp_obs[0]:.3f}, "
               f"{fitter.rp_obs[-1]:.2f}] Mpc/h, {fitter.n_params} free params")
 
-        print(f"  Running Nautilus (n_live={N_LIVE}, n_workers={args.n_workers}) ...")
-        points, weights, log_l, log_z = fitter.run(
-            n_eff=args.n_eff, n_live=N_LIVE, verbose=True,
-            n_workers=args.n_workers,
-        )
-        fitter.save_results(chain_path, points, weights, log_l, log_z)
-        print(f"  Chain saved: {chain_path}")
+        if args.postprocess:
+            # Reuse an already-sampled chain: recompute Meff/fsat/chi2/plots
+            # without re-running Nautilus (the sampling is the expensive part).
+            if not os.path.exists(chain_path):
+                print(f"  [skip] no saved chain at {chain_path}")
+                continue
+            saved = np.load(chain_path)
+            points, weights, log_l, log_z = (
+                saved['points'], saved['weights'],
+                saved['log_l'], float(saved['log_z']),
+            )
+            print(f"  Loaded saved chain: {chain_path} "
+                  f"({len(points)} pts, logZ = {log_z:.2f})")
+        else:
+            print(f"  Running Nautilus (n_live={N_LIVE}, vectorized jit/vmap "
+                  "likelihood, single process) ...")
+            checkpoint = os.path.join(args.output_dir,
+                                      f"checkpoint_{case_name}_rmin{rp_min}.h5")
+            points, weights, log_l, log_z = fitter.run(
+                n_eff=args.n_eff, n_live=N_LIVE, verbose=True,
+                vectorized=True, filepath=checkpoint,
+            )
+            fitter.save_results(chain_path, points, weights, log_l, log_z)
+            print(f"  Chain saved: {chain_path}")
 
         theta_best = fitter.get_best_fit(points, log_l)
         ds_map = fitter.predict_at_obs(theta_best)
@@ -301,12 +357,16 @@ def run_case(case_name, fit_case, halo, tab, args):
         chi2 = float(residual @ fitter.cov_inv @ residual)
         chi2_red = chi2 / (len(fitter.ds_obs) - fitter.n_params)
         ds_map_full = fitter.predict_at_obs(theta_best, rp_eval=rp_all)
-        Meff, fsat = compute_meff_fsat(occupation_full, theta_best, fitter)
+        Meff, fsat, ngal_ab = compute_meff_fsat(occupation_full, theta_best,
+                                                fitter, halo)
         log10Meff = np.log10(Meff)
+        ngal_drift = 100.0 * (ngal_ab / TARGET_NGAL - 1.0)
 
         print(f"  chi2_red = {chi2_red:.3f}")
         print(f"  log10(Meff / [Msun/h]) = {log10Meff:.3f}")
         print(f"  fsat = {fsat:.3f}")
+        print(f"  ngal (AB per-halo sum) = {ngal_ab:.4e}  "
+              f"(target {TARGET_NGAL:.3e}, drift {ngal_drift:+.2f}%)")
 
         logM_bins, ncen_med, ncen_sig, nsat_med, nsat_sig = \
             compute_hod_profiles_from_chain(points, weights, fitter,
@@ -314,7 +374,7 @@ def run_case(case_name, fit_case, halo, tab, args):
 
         bestfits[rp_min] = {
             'ds': ds_map_full, 'chi2_red': chi2_red,
-            'Meff': Meff, 'fsat': fsat,
+            'Meff': Meff, 'fsat': fsat, 'ngal': ngal_ab,
             'ncen_med': ncen_med, 'ncen_sig': ncen_sig,
             'nsat_med': nsat_med, 'nsat_sig': nsat_sig,
         }
@@ -333,7 +393,10 @@ def run_case(case_name, fit_case, halo, tab, args):
     ax.legend(fontsize=7.5, loc='lower left')
     ax.grid(True, alpha=0.3, which='both', ls=':')
     fig.tight_layout()
-    plot_path = os.path.join(args.output_dir, f"fit_{case_name}.png")
+    # scope filenames by rp_min when a single cut runs (jobs split per rp_min)
+    rp_tag = ("" if len(args.rp_min_values) > 1 else
+              f"_rmin{str(args.rp_min_values[0]).replace('.', 'p')}")
+    plot_path = os.path.join(args.output_dir, f"fit_{case_name}{rp_tag}.png")
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
     print(f"\n  Plot saved: {plot_path}")
@@ -341,9 +404,10 @@ def run_case(case_name, fit_case, halo, tab, args):
     profiles_by_rp_min = {
         rp_min: {k: bestfits[rp_min][k]
                  for k in ('ncen_med', 'ncen_sig', 'nsat_med', 'nsat_sig')}
-        for rp_min in args.rp_min_values
+        for rp_min in bestfits
     }
-    plot_hod_profiles(case_name, logM_bins, profiles_by_rp_min, args.output_dir)
+    plot_hod_profiles(case_name + rp_tag, logM_bins, profiles_by_rp_min,
+                      args.output_dir)
 
     return rp_all, bestfits, logM_bins
 
@@ -364,12 +428,19 @@ def parse_args():
     p.add_argument("--data_path", default=DATA_PATH_DEFAULT)
     p.add_argument("--output_dir",
                    default=os.path.join(FLAMINGO_DIR, "chains_TABULATED_DMO"))
-    p.add_argument("--n_workers", type=int, default=20)
+    p.add_argument("--n_workers", type=int, default=20,
+                   help="Unused (kept for CLI compatibility); sampling is "
+                        "single-process vectorized")
     p.add_argument("--n_eff", type=int, default=N_EFF)
     p.add_argument("--rp_min_values", type=float, nargs="+",
                    default=RP_MIN_VALUES)
     p.add_argument("--max_fsat", type=float, default=None)
     p.add_argument("--gaussian_ab", action="store_true")
+    p.add_argument("--postprocess", action="store_true",
+                   help="Skip sampling: load the saved chain_*.npz and "
+                        "(re)compute Meff/fsat/chi2, plots, and the aggregate. "
+                        "Use to recover the outputs when a run crashed in "
+                        "post-processing after the chains were saved.")
     return p.parse_args()
 
 
@@ -405,13 +476,17 @@ def main():
             all_bestfits_arrays[f"{prefix}_chi2_red"] = np.array(vals['chi2_red'])
             all_bestfits_arrays[f"{prefix}_Meff"]     = np.array(vals['Meff'])
             all_bestfits_arrays[f"{prefix}_fsat"]     = np.array(vals['fsat'])
+            all_bestfits_arrays[f"{prefix}_ngal"]     = np.array(vals['ngal'])
             all_bestfits_arrays[f"{prefix}_ncen_med"] = vals['ncen_med']
             all_bestfits_arrays[f"{prefix}_ncen_sig"] = vals['ncen_sig']
             all_bestfits_arrays[f"{prefix}_nsat_med"] = vals['nsat_med']
             all_bestfits_arrays[f"{prefix}_nsat_sig"] = vals['nsat_sig']
 
     if all_bestfits_arrays:
-        bestfits_path = os.path.join(args.output_dir, "all_bestfits.npz")
+        tag = names[0] if len(names) == 1 else "all"
+        if len(args.rp_min_values) == 1:
+            tag += f"_rmin{str(args.rp_min_values[0]).replace('.', 'p')}"
+        bestfits_path = os.path.join(args.output_dir, f"bestfits_{tag}.npz")
         np.savez(bestfits_path,
                  rp_centers=rp_centers_saved,
                  logM_bins=logM_bins_saved,
