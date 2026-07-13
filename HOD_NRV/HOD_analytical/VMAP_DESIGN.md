@@ -15,7 +15,7 @@ Per likelihood call: `log_likelihood` -> `_compute_model_observables` ->
 | Cosmology / halo structure (`_Pk_lin_jax`, `_b_h_jax`, `_R_s_jax`, `_c_jax`, `_n_M_jax`) | halo_model | **Precomputed once at init** (fixed cosmology) — constants, fine |
 | β^NL emulator templates (`_beta_nl_*_cache`) | halo_model | **Cached once at init** — constants, fine |
 | HOD occupation `_get_occupation` | hod_analytical | jnp, BUT reads HOD params from mutable `self.hod.params` (stateful) |
-| `_compute_Pgm[_with_beta_nl]` | power_spectrum | jnp ✓ (takes cached arrays + `f_c`,`f_s` as explicit args) |
+| `_compute_Pgm[_with_beta_nl]` | power_spectrum | jnp ✓ (takes cached arrays + `f_h`,`f_s` as explicit args) |
 | Per-z assembly | halo_model `Pgm`/`DeltaSigma` | Python `for iz` loop + `np.asarray` round-trip |
 | **P_gm → ΔΣ Hankel transform** (`Pk_to_DeltaSigma_direct`) | **utilsf/hankel_transforms.py** | **NO — pure numpy/scipy: FAST-PT `HT.k_to_r` + `scipy.interpolate.interp1d` (cubic). Not traceable.** |
 | stellar term | halo_model | trivial numpy, easily jnp |
@@ -34,8 +34,8 @@ the *only* thing standing between us and a real `jax.vmap(theta -> ΔΣ)` is the
 ### Route A — true vmap (reimplement the Hankel stage in JAX)
 - Rewrite `Pk_to_DeltaSigma_direct` as a jnp FFTLog + `interpax` cubic interp
   (interpax is already a dependency), matching FAST-PT bin-for-bin.
-- De-state the occupation: thread HOD params (incl. `f_c`,`f_s`) as explicit
-  traced args instead of `self.hod.params`/`self.f_c`.
+- De-state the occupation: thread HOD params (incl. `f_h`,`f_s`) as explicit
+  traced args instead of `self.hod.params`/`self.f_h`.
 - Replace the per-z Python loops with `vmap`/`scan` over the z axis.
 - Precompute per-bin `cov_inv` as jnp constants; build `log_likelihood_batched`.
 - `jax.vmap` over the parameter batch; pass `vectorized=True` to nautilus.

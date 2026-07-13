@@ -85,13 +85,15 @@ _HOD_FREE_PARAMS: Dict[str, List[str]] = {
     "ELG_MHMQ": ["As", "log10Mmin", "sig_M", "gamma", "log10M1", "alpha", "kappa"],
 }
 
-# Concentration rescaling parameters (centrals / satellites). Fixed at 1.0 by
-# default; declare them in ``param_config`` to make them free or fix elsewhere.
-_PROFILE_PARAMS: List[str] = ["f_c", "f_s"]
-_PROFILE_DEFAULT_FIXED: Dict[str, float] = {"f_c": 1.0, "f_s": 1.0}
+# Concentration-mass normalisations for the halo/matter (f_h) and satellite
+# (f_s) NFW profiles (Dvornik+23 eq. 15). Fixed at 1.0 by default (no feedback);
+# declare them in ``param_config`` to make them free or fix elsewhere.
+_PROFILE_PARAMS: List[str] = ["f_h", "f_s"]
+_PROFILE_DEFAULT_FIXED: Dict[str, float] = {"f_h": 1.0, "f_s": 1.0}
 _PROFILE_DEFAULT_PRIOR: Dict[str, Tuple[float, float]] = {
-    "f_c": (0.4, 1.0),
-    "f_s": (0.4, 1.0),
+    "f_h": (0.1, 2.0),
+    # f_s <= 1: satellite galaxies are never more concentrated than the DM halo.
+    "f_s": (0.1, 1.0),
 }
 
 
@@ -108,7 +110,7 @@ def _parse_param_config(
     """
     free_names = _HOD_FREE_PARAMS[hod_type]
     cfg: Dict[str, Any] = {n: _DEFAULT_PRIORS[n] for n in free_names}
-    # f_c / f_s default to fixed at 1.0 (no rescaling); user can override.
+    # f_h / f_s default to fixed at 1.0 (no rescaling); user can override.
     for n in _PROFILE_PARAMS:
         cfg[n] = _PROFILE_DEFAULT_FIXED[n]
     if param_config:
@@ -282,17 +284,18 @@ class AnalyticalHODFitter:
     ) -> Optional[Tuple[Dict[str, float], float, float]]:
         """Apply fixed + free values, then derive (Ac, As) from target_ngal.
 
-        Returns (hod_params, f_c, f_s), or None if the rescale fails.
-        f_c / f_s are stripped from the HOD-param dict and applied via
+        Returns (hod_params, f_h, f_s), or None if the rescale fails.
+        f_h / f_s are stripped from the HOD-param dict and applied via
         ``HaloModel.update_f`` before observables are computed (the NFW
         concentration rescaling is not a parameter of the occupation function).
         """
         merged = {**self.fixed, **free_values}
-        f_c = float(merged.pop("f_c", 1.0))
+        f_h = float(merged.pop("f_h", 1.0))
         f_s = float(merged.pop("f_s", 1.0))
-        # f_c / f_s rescale the NFW profile inside Pgg/Pgm; they leave the
+        # f_h / f_s renormalise the matter / satellite NFW concentration inside
+        # Pgm (f_h also in the Pgm 2-halo; f_s in Pgg too); they leave the
         # occupation N_c/N_s — and therefore n_gal — invariant. The (Ac, As)
-        # rescale below is independent of (f_c, f_s).
+        # rescale below is independent of (f_h, f_s).
         for n in _HOD_FREE_PARAMS[self.hod_type]:
             if n not in merged:
                 raise KeyError(f"Missing HOD parameter {n!r}")
@@ -304,12 +307,12 @@ class AnalyticalHODFitter:
             return None
         merged["Ac"] = Ac
         merged["As"] = As
-        return merged, f_c, f_s
+        return merged, f_h, f_s
 
     def _model_observables(
-        self, full_params: Dict[str, float], f_c: float, f_s: float,
+        self, full_params: Dict[str, float], f_h: float, f_s: float,
     ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        self.halo_model.update_f(f_c=f_c, f_s=f_s)
+        self.halo_model.update_f(f_h=f_h, f_s=f_s)
         self.halo_model.set_hod_params(full_params)
         _, ds = self.halo_model.DeltaSigma(
             self.rp_ds, rp_bins=self.rp_bins_ds, method=self.ds_method
@@ -325,9 +328,9 @@ class AnalyticalHODFitter:
         built = self._build_params(free_values)
         if built is None:
             return -1e30
-        full, f_c, f_s = built
+        full, f_h, f_s = built
         try:
-            ds_m, wgg_m = self._model_observables(full, f_c, f_s)
+            ds_m, wgg_m = self._model_observables(full, f_h, f_s)
         except Exception:
             return -1e30
         if not np.all(np.isfinite(ds_m)):
@@ -353,15 +356,15 @@ class AnalyticalHODFitter:
     def derived_quantities(self, free_values: Dict[str, float]) -> Dict[str, float]:
         built = self._build_params(free_values)
         if built is None:
-            return {"Ac": np.nan, "As": np.nan, "f_c": np.nan, "f_s": np.nan,
+            return {"Ac": np.nan, "As": np.nan, "f_h": np.nan, "f_s": np.nan,
                     "f_sat": np.nan}
-        full, f_c, f_s = built
-        self.halo_model.update_f(f_c=f_c, f_s=f_s)
+        full, f_h, f_s = built
+        self.halo_model.update_f(f_h=f_h, f_s=f_s)
         self.halo_model.set_hod_params(full)
         return {
             "Ac": full["Ac"],
             "As": full["As"],
-            "f_c": f_c,
+            "f_h": f_h,
             "f_s": f_s,
             "f_sat": float(np.asarray(self.halo_model.satellite_fraction()).item()),
         }

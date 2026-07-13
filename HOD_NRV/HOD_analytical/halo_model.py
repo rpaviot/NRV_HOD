@@ -63,7 +63,7 @@ class HaloModel(Cosmology):
         cosmo_params: Dict[str, float],
         z: Union[float, np.ndarray, List[float]],
         hod_type: str,
-        f_c: float = 1.0,
+        f_h: float = 1.0,
         f_s: float = 1.0,
         M_min: float = 1e9,
         M_max: float = 1e16,
@@ -101,7 +101,7 @@ class HaloModel(Cosmology):
 
         self._Mstar_min_jax, self._Mstar_max_jax = self._prepare_mstar_arrays(Mstar_min, Mstar_max)
         self.RHO_M = self.get_rho_m()
-        self.f_c = f_c
+        self.f_h = f_h
         self.f_s = f_s
 
         # Mass array at GL nodes
@@ -130,7 +130,7 @@ class HaloModel(Cosmology):
 
         if self.verbose:
             print(f"HaloModel: {self.n_z} z, {self.n_k} k, {N_GL} M points")
-            print(f"  HOD: {self.hod_type}, f_c={f_c}, f_s={f_s}")
+            print(f"  HOD: {self.hod_type}, f_h={f_h}, f_s={f_s}")
             print(f"  Mass: [10^{self.log10M_min:.1f}, 10^{self.log10M_max:.1f}]")
             if include_beta_nl:
                 print("  β^NL: enabled")
@@ -320,9 +320,9 @@ class HaloModel(Cosmology):
     def set_hod_params(self, hod_params: Dict):
         self.hod.set_params(hod_params)
 
-    def update_f(self, f_c=None, f_s=None):
-        if f_c is not None:
-            self.f_c = f_c
+    def update_f(self, f_h=None, f_s=None):
+        if f_h is not None:
+            self.f_h = f_h
         if f_s is not None:
             self.f_s = f_s
 
@@ -362,7 +362,7 @@ class HaloModel(Cosmology):
                     N_c, N_s, self._n_M_jax[iz], self._b_h_jax[iz],
                     self._R_s_jax[iz], self._c_jax[iz],
                     self._Pk_lin_jax[iz], self._k_jax,
-                    self.log10M_min, self.log10M_max, self.f_c, self.f_s,
+                    self.log10M_min, self.log10M_max, self.f_h, self.f_s,
                     self._beta_nl_gl_cache[iz],
                 )
             else:
@@ -370,7 +370,7 @@ class HaloModel(Cosmology):
                     N_c, N_s, self._n_M_jax[iz], self._b_h_jax[iz],
                     self._R_s_jax[iz], self._c_jax[iz],
                     self._Pk_lin_jax[iz], self._k_jax,
-                    self.log10M_min, self.log10M_max, self.f_c, self.f_s,
+                    self.log10M_min, self.log10M_max, self.f_h, self.f_s,
                 )
             result.append(P)
 
@@ -398,7 +398,7 @@ class HaloModel(Cosmology):
                     self._R_s_jax[iz], self._c_jax[iz],
                     self._Pk_lin_jax[iz], self._k_jax,
                     self._M_jax, self.RHO_M,
-                    self.log10M_min, self.log10M_max, self.f_c, self.f_s,
+                    self.log10M_min, self.log10M_max, self.f_h, self.f_s,
                     self._beta_nl_gl_cache[iz],
                     self._beta_nl_Mmin_col_cache[iz],
                     self._R_s_Mmin_jax[iz], self._c_Mmin_jax[iz],
@@ -409,7 +409,7 @@ class HaloModel(Cosmology):
                     self._R_s_jax[iz], self._c_jax[iz],
                     self._Pk_lin_jax[iz], self._k_jax,
                     self._M_jax, self.RHO_M,
-                    self.log10M_min, self.log10M_max, self.f_c, self.f_s,
+                    self.log10M_min, self.log10M_max, self.f_h, self.f_s,
                 )
             result.append(P)
 
@@ -474,16 +474,15 @@ class HaloModel(Cosmology):
 
         N_c, N_s = self._get_occupation(iz)
 
-        # Compute profiles
-        u_c = nfw_fourier_u(self._k_jax, self._R_s_jax[iz], self._c_jax[iz], self.f_c)
+        # Compute profiles (centrals are points, u_c = 1; matter carries f_h)
         u_s = nfw_fourier_u(self._k_jax, self._R_s_jax[iz], self._c_jax[iz], self.f_s)
-        u_m = nfw_fourier_u(self._k_jax, self._R_s_jax[iz], self._c_jax[iz], 1.0)
-        u_m_Mmin = nfw_fourier_u_single(self._k_jax, self._R_s_Mmin_jax[iz], self._c_Mmin_jax[iz])
+        u_m = nfw_fourier_u(self._k_jax, self._R_s_jax[iz], self._c_jax[iz], self.f_h)
+        u_m_Mmin = nfw_fourier_u_single(self._k_jax, self._R_s_Mmin_jax[iz], self._c_Mmin_jax[iz], self.f_h)
 
         n_gal = gl_integrate((N_c + N_s) * self._n_M_jax[iz], self.log10M_min, self.log10M_max)
 
-        # H_g and H_m with profiles
-        H_g = (N_c[None, :] * u_c + N_s[None, :] * u_s) / n_gal
+        # H_g and H_m with profiles (central point: u_c = 1)
+        H_g = (N_c[None, :] + N_s[None, :] * u_s) / n_gal
         W_m = self._M_jax / self.RHO_M
         H_m = u_m * W_m[None, :]
 
@@ -619,10 +618,10 @@ class HaloModel(Cosmology):
         """Return a pure, ``jax.vmap``-able function ``theta -> ΔΣ[n_z, nbin]``.
 
         This is a stateless twin of ``set_hod_params``+``DeltaSigma``: instead of
-        mutating ``self.hod.params``/``self.f_c`` and round-tripping through numpy,
+        mutating ``self.hod.params``/``self.f_h`` and round-tripping through numpy,
         it threads the HOD parameter vector
 
-            theta = [M0, M1, gamma1, gamma2, sigma_c, alpha_s, b0, b1, f_c, f_s]
+            theta = [M0, M1, gamma1, gamma2, sigma_c, alpha_s, b0, b1, f_h, f_s]
 
         as explicit traced arguments and keeps everything in jnp, so the whole
         forward pass can be ``jax.vmap``'d over a batch of theta (nautilus
@@ -666,7 +665,7 @@ class HaloModel(Cosmology):
                 / (jnp.pi * rp_c[None, :] ** 2)
 
         def _predict(theta):
-            M0, M1, g1, g2, sig, al, b0, b1, f_c, f_s = (theta[i] for i in range(10))
+            M0, M1, g1, g2, sig, al, b0, b1, f_h, f_s = (theta[i] for i in range(10))
             if masses_are_log10:
                 M0 = 10.0 ** M0
                 M1 = 10.0 ** M1
@@ -681,7 +680,7 @@ class HaloModel(Cosmology):
                         N_c, N_s, self._n_M_jax[iz], self._b_h_jax[iz],
                         self._R_s_jax[iz], self._c_jax[iz],
                         self._Pk_lin_jax[iz], self._k_jax, M, rho_m,
-                        log10M_min, log10M_max, f_c, f_s,
+                        log10M_min, log10M_max, f_h, f_s,
                         self._beta_nl_gl_cache[iz], self._beta_nl_Mmin_col_cache[iz],
                         self._R_s_Mmin_jax[iz], self._c_Mmin_jax[iz],
                     )
@@ -690,7 +689,7 @@ class HaloModel(Cosmology):
                         N_c, N_s, self._n_M_jax[iz], self._b_h_jax[iz],
                         self._R_s_jax[iz], self._c_jax[iz],
                         self._Pk_lin_jax[iz], self._k_jax, M, rho_m,
-                        log10M_min, log10M_max, f_c, f_s,
+                        log10M_min, log10M_max, f_h, f_s,
                     )
                 rows.append(ds_builder.transform(Pgm, rho_m))   # (nbin,)
             ds_all = jnp.stack(rows)                            # (n_z, nbin)
@@ -706,14 +705,14 @@ class HaloModel(Cosmology):
         The de-stated abundance twin of :meth:`ngal`, for the batched likelihood
         (nautilus ``vectorized=True``). Threads the same 10-vector
 
-            theta = [M0, M1, gamma1, gamma2, sigma_c, alpha_s, b0, b1, f_c, f_s]
+            theta = [M0, M1, gamma1, gamma2, sigma_c, alpha_s, b0, b1, f_h, f_s]
 
         and returns the model galaxy number density per mass bin. Units follow
         ``units_per_h``: ``self._n_M_jax`` already carries the 1/h^3 factor
         (set in the HMF prep), so with ``units_per_h=True`` the output is in
         h^3/Mpc^3 -- exactly matching :meth:`ngal` (whose ``*h**3`` line is
         intentionally inert) and the measured n_gal fed to the likelihood.
-        f_c/f_s do not enter the occupation integral, so they are ignored here.
+        f_h/f_s do not enter the occupation integral, so they are ignored here.
 
         Returns
         -------
@@ -728,7 +727,7 @@ class HaloModel(Cosmology):
         masses_are_log10 = self.hod.masses_are_log10
 
         def _predict(theta):
-            M0, M1, g1, g2, sig, al, b0, b1, f_c, f_s = (theta[i] for i in range(10))
+            M0, M1, g1, g2, sig, al, b0, b1, f_h, f_s = (theta[i] for i in range(10))
             if masses_are_log10:
                 M0 = 10.0 ** M0
                 M1 = 10.0 ** M1
