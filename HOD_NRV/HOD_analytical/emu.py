@@ -403,7 +403,14 @@ class BetaNLInterpolator:
         log_M1 = self._clamp_log_mass_low(log_M1)
         log_M2 = self._clamp_log_mass_low(log_M2)
 
-        return self.interpolators[iz](log_k, log_M1, log_M2)
+        beta = self.interpolators[iz](log_k, log_M1, log_M2)
+        # beta^NL is anchored to zero at k_lin (force_to_zero); below it the
+        # k grid ends at k_min > k_lin's neighbourhood and interpax would
+        # linearly extrapolate in log k, contaminating the largest scales.
+        # Clamp to exactly zero for k < k_lin instead.
+        if self.force_to_zero != 'none':
+            beta = jnp.where(k < self.k_lin, 0.0, beta)
+        return beta
 
     def interpolate_to_mass_grid(
         self,
@@ -448,7 +455,13 @@ class BetaNLInterpolator:
             k_flat = jnp.full(n_M * n_M, log_k_val)
             return interp(k_flat, M1_grid.ravel(), M2_grid.ravel()).reshape(n_M, n_M)
 
-        return vmap(eval_at_k)(log_k_vals)
+        beta = vmap(eval_at_k)(log_k_vals)
+        # Same k < k_lin zero-clamp as __call__ (avoid log-k extrapolation
+        # below the tabulated grid leaking into the 2-halo term at k -> 0).
+        if self.force_to_zero != 'none':
+            mask = (10.0 ** log_k_vals) >= self.k_lin
+            beta = beta * mask[:, None, None]
+        return beta
 
     def get_grid_data(self, iz: int = 0) -> Dict[str, np.ndarray]:
         """
