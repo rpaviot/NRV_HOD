@@ -23,7 +23,7 @@ Main entry point. Inherits from `Cosmology` (pycosmo.py) and wraps HOD + power s
 
 **Key methods:**
 - `set_hod_params(hod_params)` - update HOD parameters
-- `update_f(f_c, f_s)` - update NFW profile scaling factors
+- `update_f(f_h, f_s)` - update NFW profile scaling factors
 - `ngal(hod_params)` - galaxy number density
 - `Pgg(hod_params)` - galaxy-galaxy power spectrum
 - `Pgm(hod_params)` - galaxy-matter power spectrum

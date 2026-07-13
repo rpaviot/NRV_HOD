@@ -30,8 +30,18 @@ jax.config.update("jax_enable_x64", True)
 def nfw_fourier_u(k: jnp.ndarray, R_s: jnp.ndarray, c: jnp.ndarray,
                   f_scale: float = 1.0) -> jnp.ndarray:
     """
-    NFW Fourier transform. Returns shape (n_k, n_M).
+    Normalised NFW Fourier transform u(k|M). Returns shape (n_k, n_M).
+
+    ``f_scale`` renormalises the concentration-mass relation (Dvornik+23 eq. 15):
+    c -> f_scale * c, at fixed virial mass so the scale radius follows
+    R_s -> R_s / f_scale (R_vir = R_s * c held constant). f_scale = 1 recovers the
+    input (Duffy+08) profile. This is a *shape* rescaling that keeps the profile
+    normalised to unity at k -> 0 for any f_scale -- unlike a flat amplitude
+    factor u * f_scale, which would violate u(k=0|M) = 1 (mass/number
+    conservation).
     """
+    c = c * f_scale
+    R_s = R_s / f_scale
     x = k[:, None] * R_s[None, :]
     norm = 1.0 / (jnp.log(1.0 + c) - c / (1.0 + c))
     si_x, ci_x = sici(x)
@@ -43,12 +53,19 @@ def nfw_fourier_u(k: jnp.ndarray, R_s: jnp.ndarray, c: jnp.ndarray,
 
     u = norm[None, :] * (term1 + term2 - term3)
     u = jnp.where(x < 1e-8, 1.0, u)
-    return u * f_scale
+    return u
 
 
 @jit
-def nfw_fourier_u_single(k: jnp.ndarray, R_s: float, c: float) -> jnp.ndarray:
-    """NFW Fourier transform for single halo. Returns shape (n_k,)."""
+def nfw_fourier_u_single(k: jnp.ndarray, R_s: float, c: float,
+                         f_scale: float = 1.0) -> jnp.ndarray:
+    """NFW Fourier transform for single halo. Returns shape (n_k,).
+
+    ``f_scale`` renormalises the concentration exactly as in :func:`nfw_fourier_u`
+    (c -> f_scale * c, R_s -> R_s / f_scale).
+    """
+    c = c * f_scale
+    R_s = R_s / f_scale
     x = k * R_s
     norm = 1.0 / (jnp.log(1.0 + c) - c / (1.0 + c))
     si_x, ci_x = sici(x)
@@ -73,9 +90,11 @@ def _compute_ngal(N_c, N_s, n_M, log10M_min, log10M_max):
 
 @jit
 def _compute_Pgg(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k,
-                 log10M_min, log10M_max, f_c, f_s):
+                 log10M_min, log10M_max, f_h, f_s):
+    # f_h (halo/matter concentration norm) does not enter P_gg -- there is no
+    # matter profile here. Centrals are points (H_c = N_c/n_c, eq. 9), so only
+    # the satellite profile u_s carries a concentration rescaling (f_s).
     n_gal = gl_integrate((N_c + N_s) * n_M, log10M_min, log10M_max)
-    u_c = nfw_fourier_u(k, R_s, c, f_c)
     u_s = nfw_fourier_u(k, R_s, c, f_s)
 
     # 1-halo
@@ -85,8 +104,8 @@ def _compute_Pgg(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k,
     I_ss = vmap(lambda x: gl_integrate(x, log10M_min, log10M_max))(integrand_ss)
     P_1h = (I_cs + I_ss) / n_gal ** 2
 
-    # 2-halo
-    integrand_2h = (N_c * u_c + N_s * u_s) * b_h * n_M
+    # 2-halo (central point: u_c = 1)
+    integrand_2h = (N_c + N_s * u_s) * b_h * n_M
     I_2h = vmap(lambda x: gl_integrate(x, log10M_min, log10M_max))(integrand_2h)
     P_2h = Pk_lin * (I_2h / n_gal) ** 2
 
@@ -95,18 +114,20 @@ def _compute_Pgg(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k,
 
 @jit
 def _compute_Pgm(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
-                 log10M_min, log10M_max, f_c, f_s):
+                 log10M_min, log10M_max, f_h, f_s):
+    # Centrals are points (u_c = 1, eq. 9); satellites carry u_s(f_s); the matter
+    # profile u_m carries the halo concentration norm f_h (eq. 8, 15) -- this is
+    # the baryon-feedback knob and enters both the 1-halo and 2-halo terms.
     n_gal = gl_integrate((N_c + N_s) * n_M, log10M_min, log10M_max)
-    u_c = nfw_fourier_u(k, R_s, c, f_c)
     u_s = nfw_fourier_u(k, R_s, c, f_s)
-    u_m = nfw_fourier_u(k, R_s, c, 1.0)
+    u_m = nfw_fourier_u(k, R_s, c, f_h)
 
     # 1-halo
     integrand_1h = (N_c + N_s * u_s) * u_m * (M / rho_m) * n_M
     P_1h = vmap(lambda x: gl_integrate(x, log10M_min, log10M_max))(integrand_1h) / n_gal
 
-    # 2-halo
-    integrand_g = (N_c * u_c + N_s * u_s) * b_h * n_M
+    # 2-halo (central point: u_c = 1)
+    integrand_g = (N_c + N_s * u_s) * b_h * n_M
     I_g = vmap(lambda x: gl_integrate(x, log10M_min, log10M_max))(integrand_g) / n_gal
 
     I_m1 = 1.0 - gl_integrate((M / rho_m) * b_h * n_M, log10M_min, log10M_max)
@@ -173,14 +194,13 @@ def _compute_I_NL_gm(beta_nl_gl, beta_nl_Mmin_col, H_g, H_m, b_h, n_M,
 
 @jit
 def _compute_Pgg_with_beta_nl(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k,
-                               log10M_min, log10M_max, f_c, f_s, beta_nl_gl):
+                               log10M_min, log10M_max, f_h, f_s, beta_nl_gl):
     P_gg = _compute_Pgg(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k,
-                        log10M_min, log10M_max, f_c, f_s)
+                        log10M_min, log10M_max, f_h, f_s)
 
     n_gal = gl_integrate((N_c + N_s) * n_M, log10M_min, log10M_max)
-    u_c = nfw_fourier_u(k, R_s, c, f_c)
     u_s = nfw_fourier_u(k, R_s, c, f_s)
-    H_g = (N_c[None, :] * u_c + N_s[None, :] * u_s) / n_gal
+    H_g = (N_c[None, :] + N_s[None, :] * u_s) / n_gal  # central point: u_c = 1
 
     I_NL = _compute_I_NL_gg(beta_nl_gl, H_g, b_h, n_M, log10M_min, log10M_max)
     return P_gg + Pk_lin * I_NL
@@ -188,18 +208,17 @@ def _compute_Pgg_with_beta_nl(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k,
 
 @jit
 def _compute_Pgm_with_beta_nl(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
-                               log10M_min, log10M_max, f_c, f_s,
+                               log10M_min, log10M_max, f_h, f_s,
                                beta_nl_gl, beta_nl_Mmin_col, R_s_Mmin, c_Mmin):
     P_gm = _compute_Pgm(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
-                        log10M_min, log10M_max, f_c, f_s)
+                        log10M_min, log10M_max, f_h, f_s)
 
     n_gal = gl_integrate((N_c + N_s) * n_M, log10M_min, log10M_max)
-    u_c = nfw_fourier_u(k, R_s, c, f_c)
     u_s = nfw_fourier_u(k, R_s, c, f_s)
-    u_m = nfw_fourier_u(k, R_s, c, 1.0)
-    u_m_Mmin = nfw_fourier_u_single(k, R_s_Mmin, c_Mmin)
+    u_m = nfw_fourier_u(k, R_s, c, f_h)
+    u_m_Mmin = nfw_fourier_u_single(k, R_s_Mmin, c_Mmin, f_h)
 
-    H_g = (N_c[None, :] * u_c + N_s[None, :] * u_s) / n_gal
+    H_g = (N_c[None, :] + N_s[None, :] * u_s) / n_gal  # central point: u_c = 1
     W_m = M / rho_m
     H_m = u_m * W_m[None, :]
     A_Mmin = 1.0 - gl_integrate(W_m * b_h * n_M, log10M_min, log10M_max)

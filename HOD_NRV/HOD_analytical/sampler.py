@@ -165,8 +165,12 @@ DEFAULT_CSMF_PRIORS = {
     'alpha_s': ParameterPrior(name='alpha_s', prior_type='uniform', bounds=(-5, 5)),
     'b0': ParameterPrior(name='b0', prior_type='uniform', bounds=(-5, 5)),
     'b1': ParameterPrior(name='b1', prior_type='uniform', bounds=(-5, 5)),
-    'f_c': ParameterPrior(name='f_c', prior_type='uniform', bounds=(0.2, 1.0)),
-    'f_s': ParameterPrior(name='f_s', prior_type='uniform', bounds=(0.2, 1.0)),
+    # f_h, f_s: concentration-mass normalisations for the halo/matter and
+    # satellite NFW profiles (Dvornik+23 eq. 15). Both capped at 1: baryonic
+    # feedback can only make the matter/satellite profiles less concentrated
+    # than the dark matter halo, never more.
+    'f_h': ParameterPrior(name='f_h', prior_type='uniform', bounds=(0.1, 1.0)),
+    'f_s': ParameterPrior(name='f_s', prior_type='uniform', bounds=(0.1, 1.0)),
 }
 
 FIDUCIAL_CSMF_PARAMS = {
@@ -178,7 +182,7 @@ FIDUCIAL_CSMF_PARAMS = {
     'alpha_s': -1.0,
     'b0': -2.0,
     'b1': 1.0,
-    'f_c': 0.7,
+    'f_h': 0.7,
     'f_s': 0.7
 }
 
@@ -487,7 +491,7 @@ class CSMFFitter:
     ... )
     >>> fitter.load_bgs_data('/path/to/data/', mass_bins=[0, 1, 2, 3])
     >>> fitter.load_lrg_data('/path/to/data/', mass_bins=[0, 1, 2, 3])
-    >>> fitter.set_priors(fixed_params={'f_c': 1.0, 'f_s': 1.0})
+    >>> fitter.set_priors(fixed_params={'f_h': 1.0, 'f_s': 1.0})
     >>> result = fitter.minimize_de(maxiter=1000, workers=-1)
     """
     
@@ -734,7 +738,7 @@ class CSMFFitter:
     def _get_free_param_names(self) -> List[str]:
         """Get list of free (non-fixed) parameter names in consistent order."""
         canonical_order = ['M0', 'M1', 'gamma1', 'gamma2', 'sigma_c', 
-                          'alpha_s', 'b0', 'b1', 'f_c', 'f_s']
+                          'alpha_s', 'b0', 'b1', 'f_h', 'f_s']
         return [
             name for name in canonical_order
             if name in self.priors and self.priors[name].prior_type != 'fixed'
@@ -803,7 +807,7 @@ class CSMFFitter:
             hod_type='CSMF',
             Mstar_min=self._mstar_min_array,
             Mstar_max=self._mstar_max_array,
-            f_c=1.0,  # Will be updated in _compute_model_observables
+            f_h=1.0,  # Will be updated in _compute_model_observables
             f_s=1.0,  # Will be updated in _compute_model_observables
             units_per_h=self.units_per_h,
             masses_are_log10=True,
@@ -875,7 +879,7 @@ class CSMFFitter:
         
         # Update profile rescaling factors
         self._halo_model.update_f(
-            f_c=params.get('f_c', 1.0),
+            f_h=params.get('f_h', 1.0),
             f_s=params.get('f_s', 1.0)
         )
         
@@ -1151,7 +1155,7 @@ class CSMFFitter:
 
         # Static map: nautilus free-param columns -> 10-slot theta vector.
         names = ['M0', 'M1', 'gamma1', 'gamma2', 'sigma_c', 'alpha_s',
-                 'b0', 'b1', 'f_c', 'f_s']
+                 'b0', 'b1', 'f_h', 'f_s']
         free_names = [n for n in names
                       if n in self.priors and self.priors[n].prior_type != 'fixed']
         free_idx = {n: i for i, n in enumerate(free_names)}
@@ -1162,7 +1166,7 @@ class CSMFFitter:
             if n in self.priors and self.priors[n].prior_type == 'fixed':
                 const_val[n] = float(self.priors[n].fixed_value)
             else:
-                const_val[n] = 1.0     # f_c / f_s absent entirely -> profile default
+                const_val[n] = 1.0     # f_h / f_s absent entirely -> profile default
         take_col = [free_idx.get(n, -1) for n in names]    # -1 == fixed constant
         consts = [const_val.get(n, 0.0) for n in names]
 
@@ -1688,7 +1692,7 @@ class CSMFFitter:
         
         prior = Prior()
         csmf_param_names = ['M0', 'M1', 'gamma1', 'gamma2', 'sigma_c', 'alpha_s', 'b0', 'b1']
-        optional_params = ['f_c', 'f_s']
+        optional_params = ['f_h', 'f_s']
         
         for name in csmf_param_names + optional_params:
             if name not in self.priors:
