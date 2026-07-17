@@ -44,6 +44,9 @@ from HOD_NRV.HOD_numerical.HOD import HaloOccupation
 from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import (
     HaloCenterLensingCache, TabulatedDeltaSigma,
 )
+from HOD_NRV.HOD_numerical.twopoint_calculator.tabulated_wgg import (
+    WggTabulation, TabulatedWgg,
+)
 
 # ============================================================================
 # Paths & global configuration (mirrors run_emulator_chains.py)
@@ -301,11 +304,22 @@ def run_case(case_name, fit_case, halo, tab, args):
     ax.errorbar(rp_all, rp_all * ds_all, yerr=rp_all * ds_err,
                 fmt='ko', ms=4, zorder=10, label='Flamingo ELG data')
 
+    # Joint wgg: needs `halo` (per case), so the predictor is built here.
+    # The likelihood becomes batched-jax DeltaSigma + a NumPy wgg loop
+    # (~1 s/point), so joint chains are much slower than DeltaSigma-only.
+    tab_wgg = None
+    wgg_tag = ""
+    if args.wgg_tab:
+        tab_wgg = TabulatedWgg(WggTabulation.load(args.wgg_tab), halo)
+        wgg_tag = "_wggjoint"
+        print(f"  Joint wgg fit: {tab_wgg} "
+              f"(rp_min_wgg={args.rp_min_wgg}, data={args.data_path})")
+
     bestfits = {}
     for rp_min, color in zip(args.rp_min_values, COLORS):
         print(f"\n  rp_min = {rp_min} Mpc/h")
         chain_path = os.path.join(args.output_dir,
-                                  f"chain_{case_name}_rmin{rp_min}.npz")
+                                  f"chain_{case_name}{wgg_tag}_rmin{rp_min}.npz")
 
         param_config = build_param_config(
             fit_case, assembly_bias=assembly_bias, gaussian_ab=args.gaussian_ab)
@@ -322,6 +336,9 @@ def run_case(case_name, fit_case, halo, tab, args):
             Ac_fiducial=AC_FIDUCIAL,
             **({"max_fsat": args.max_fsat, "hod_occupation": halo.HOD}
                if args.max_fsat is not None else {}),
+            **({"tabulated_wgg": tab_wgg, "data_path_wgg": args.data_path,
+                "rp_min_wgg": args.rp_min_wgg, "rp_max_wgg": args.rp_max_wgg}
+               if tab_wgg is not None else {}),
         )
         print(f"  {fitter.n_bins} bins in [{fitter.rp_obs[0]:.3f}, "
               f"{fitter.rp_obs[-1]:.2f}] Mpc/h, {fitter.n_params} free params")
@@ -342,8 +359,9 @@ def run_case(case_name, fit_case, halo, tab, args):
         else:
             print(f"  Running Nautilus (n_live={N_LIVE}, vectorized jit/vmap "
                   "likelihood, single process) ...")
-            checkpoint = os.path.join(args.output_dir,
-                                      f"checkpoint_{case_name}_rmin{rp_min}.h5")
+            checkpoint = os.path.join(
+                args.output_dir,
+                f"checkpoint_{case_name}{wgg_tag}_rmin{rp_min}.h5")
             points, weights, log_l, log_z = fitter.run(
                 n_eff=args.n_eff, n_live=N_LIVE, verbose=True,
                 vectorized=True, filepath=checkpoint,
@@ -355,7 +373,16 @@ def run_case(case_name, fit_case, halo, tab, args):
         ds_map = fitter.predict_at_obs(theta_best)
         residual = ds_map - fitter.ds_obs
         chi2 = float(residual @ fitter.cov_inv @ residual)
-        chi2_red = chi2 / (len(fitter.ds_obs) - fitter.n_params)
+        n_data_bins = len(fitter.ds_obs)
+        if tab_wgg is not None:
+            wgg_map = fitter.predict_wgg_at_obs(theta_best)
+            rw = wgg_map - fitter.wgg_obs
+            chi2_wgg = float(rw @ fitter.cov_inv_wgg @ rw)
+            print(f"  chi2_ds = {chi2:.2f} ({n_data_bins} bins), "
+                  f"chi2_wgg = {chi2_wgg:.2f} ({len(fitter.wgg_obs)} bins)")
+            chi2 += chi2_wgg
+            n_data_bins += len(fitter.wgg_obs)
+        chi2_red = chi2 / (n_data_bins - fitter.n_params)
         ds_map_full = fitter.predict_at_obs(theta_best, rp_eval=rp_all)
         Meff, fsat, ngal_ab = compute_meff_fsat(occupation_full, theta_best,
                                                 fitter, halo)
@@ -373,6 +400,7 @@ def run_case(case_name, fit_case, halo, tab, args):
                                             occupation_full, halo)
 
         bestfits[rp_min] = {
+            **({'wgg': wgg_map} if tab_wgg is not None else {}),
             'ds': ds_map_full, 'chi2_red': chi2_red,
             'Meff': Meff, 'fsat': fsat, 'ngal': ngal_ab,
             'ncen_med': ncen_med, 'ncen_sig': ncen_sig,
@@ -396,7 +424,8 @@ def run_case(case_name, fit_case, halo, tab, args):
     # scope filenames by rp_min when a single cut runs (jobs split per rp_min)
     rp_tag = ("" if len(args.rp_min_values) > 1 else
               f"_rmin{str(args.rp_min_values[0]).replace('.', 'p')}")
-    plot_path = os.path.join(args.output_dir, f"fit_{case_name}{rp_tag}.png")
+    plot_path = os.path.join(args.output_dir,
+                             f"fit_{case_name}{wgg_tag}{rp_tag}.png")
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
     print(f"\n  Plot saved: {plot_path}")
@@ -406,8 +435,8 @@ def run_case(case_name, fit_case, halo, tab, args):
                  for k in ('ncen_med', 'ncen_sig', 'nsat_med', 'nsat_sig')}
         for rp_min in bestfits
     }
-    plot_hod_profiles(case_name + rp_tag, logM_bins, profiles_by_rp_min,
-                      args.output_dir)
+    plot_hod_profiles(case_name + wgg_tag + rp_tag, logM_bins,
+                      profiles_by_rp_min, args.output_dir)
 
     return rp_all, bestfits, logM_bins
 
@@ -434,6 +463,12 @@ def parse_args():
     p.add_argument("--n_eff", type=int, default=N_EFF)
     p.add_argument("--rp_min_values", type=float, nargs="+",
                    default=RP_MIN_VALUES)
+    p.add_argument("--wgg_tab", default="",
+                   help="WggTabulation .npz whose fine rp grid nests the "
+                        "data's rp_bins_wgg — enables the joint wgg+DS fit "
+                        "(wgg data+cov read from --data_path).")
+    p.add_argument("--rp_min_wgg", type=float, default=None)
+    p.add_argument("--rp_max_wgg", type=float, default=None)
     p.add_argument("--max_fsat", type=float, default=None)
     p.add_argument("--gaussian_ab", action="store_true")
     p.add_argument("--postprocess", action="store_true",
@@ -484,6 +519,8 @@ def main():
 
     if all_bestfits_arrays:
         tag = names[0] if len(names) == 1 else "all"
+        if args.wgg_tab:
+            tag += "_wggjoint"
         if len(args.rp_min_values) == 1:
             tag += f"_rmin{str(args.rp_min_values[0]).replace('.', 'p')}"
         bestfits_path = os.path.join(args.output_dir, f"bestfits_{tag}.npz")

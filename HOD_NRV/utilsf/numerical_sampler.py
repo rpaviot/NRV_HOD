@@ -670,6 +670,10 @@ class TabulatedFitter(EmulatorFitter):
         max_fsat: Optional[float] = None,
         Ac_fiducial: float = 0.01,
         hod_occupation=None,
+        tabulated_wgg=None,
+        data_path_wgg: str = "",
+        rp_min_wgg: Optional[float] = None,
+        rp_max_wgg: Optional[float] = None,
     ):
         self.fit_case = FitCase(fit_case)
         self.M1_fixed = M1_fixed
@@ -714,7 +718,34 @@ class TabulatedFitter(EmulatorFitter):
             raise ValueError("Provide data_path or (ds_obs, cov_inv, rp_obs).")
 
         self._setup_interp()
+
+        # ── optional joint wgg (TabulatedWgg predictor + data on the same
+        # rp_bins; prediction is bin-averaged so no interpolation needed) ──
         self._fit_wgg = False
+        if tabulated_wgg is not None:
+            if not data_path_wgg:
+                raise ValueError("tabulated_wgg given but no data_path_wgg.")
+            self.tab_wgg = tabulated_wgg
+            wdata = np.load(data_path_wgg)
+            edges = wdata["rp_bins_wgg"] if "rp_bins_wgg" in wdata.files \
+                else wdata["rp_bins"]
+            wgg = wdata["wgg"]
+            cov = wdata["cov_wgg"]
+            centers = np.sqrt(edges[:-1] * edges[1:])
+            mask = np.ones(len(wgg), dtype=bool)
+            if rp_min_wgg is not None:
+                mask &= centers >= rp_min_wgg
+            if rp_max_wgg is not None:
+                mask &= centers <= rp_max_wgg
+            idx = np.nonzero(mask)[0]
+            if len(idx) == 0 or not np.all(np.diff(idx) == 1):
+                raise ValueError("wgg scale cut must select a contiguous, "
+                                 "non-empty rp range.")
+            self.rp_bins_wgg = edges[idx[0]:idx[-1] + 2]
+            self.wgg_obs = wgg[mask]
+            self.cov_inv_wgg = np.linalg.inv(cov[np.ix_(mask, mask)])
+            self.rp_obs_wgg = centers[mask]
+            self._fit_wgg = True
 
         if param_config is not None:
             priors, fixed = _parse_param_config(param_config)
@@ -766,6 +797,17 @@ class TabulatedFitter(EmulatorFitter):
         spl = CubicSpline(self._log_rp_emu, np.log(np.maximum(ds_pred, 1e-30)))
         return np.exp(spl(log_rp))
 
+    def predict_wgg_at_obs(self, free_dict, rp_bins=None):
+        """Tabulated wgg bin-averaged on the observed rp_bins (nested in
+        the wgg tabulation's fine grid — same bins as the data, so no
+        interpolation)."""
+        full = self.full_params(free_dict)
+        bins = self.rp_bins_wgg if rp_bins is None else rp_bins
+        _, wgg, _ = self.tab_wgg.predict(full, bins)
+        if not np.all(np.isfinite(wgg)):
+            raise ValueError("non-finite tabulated wgg prediction")
+        return wgg
+
     def log_likelihood(self, theta) -> float:
         if isinstance(theta, dict):
             free_dict = dict(theta)
@@ -793,7 +835,20 @@ class TabulatedFitter(EmulatorFitter):
             return -1e100
 
         residual = ds_at_obs - self.ds_obs
-        return -0.5 * float(residual @ self.cov_inv @ residual)
+        logL = -0.5 * float(residual @ self.cov_inv @ residual)
+
+        if self._fit_wgg:
+            try:
+                wgg = self.predict_wgg_at_obs(free_dict)
+            except Exception:
+                return -1e100
+            r = wgg - self.wgg_obs
+            chi2 = float(r @ self.cov_inv_wgg @ r)
+            if not np.isfinite(chi2):
+                return -1e100
+            logL -= 0.5 * chi2
+
+        return logL
 
     def build_batched_loglike(self, pad_to: int = 32, vmap_chunk: int = 8):
         """Build a jit-compiled batched log-likelihood for ``vectorized=True``.
@@ -908,4 +963,28 @@ class TabulatedFitter(EmulatorFitter):
                 points = np.vstack([points, np.repeat(points[-1:], n_pad, 0)])
             return np.asarray(compiled(jnp.asarray(points)))[:n]
 
-        return loglike_fn, free_names
+        if not self._fit_wgg:
+            return loglike_fn, free_names
+
+        # ── joint wgg: TabulatedWgg.predict has no jax twin, so add its
+        # chi2 as a NumPy loop on top of the batched DeltaSigma logL. Runs
+        # in the main process (jitted occupation calls are fork-unsafe, not
+        # main-process-unsafe). Points already rejected by the DeltaSigma
+        # term are skipped. ──
+        def joint_loglike_fn(points):
+            logl = np.array(loglike_fn(points))
+            pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
+            for k in range(len(pts)):
+                if logl[k] <= -1e99:
+                    continue
+                try:
+                    wgg = self.predict_wgg_at_obs(
+                        dict(zip(free_names, pts[k])))
+                    r = wgg - self.wgg_obs
+                    chi2 = float(r @ self.cov_inv_wgg @ r)
+                except Exception:
+                    chi2 = np.inf
+                logl[k] = logl[k] - 0.5 * chi2 if np.isfinite(chi2) else -1e100
+            return logl
+
+        return joint_loglike_fn, free_names
