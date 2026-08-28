@@ -32,6 +32,7 @@ import sys
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -119,14 +120,22 @@ def main():
     print(f"galaxies: {ngal:,}  (ngal = {ngal/LBOX**3:.3e} (Mpc/h)^-3)")
 
     # ---- particles (subsampled, mass-weighted) -----------------------------
-    p = pd.read_parquet(args.part_path, columns=["x", "y", "z", "mass"])
-    if args.particle_fraction < 1.0:
-        rng = np.random.default_rng(args.particle_seed)
-        keep = rng.random(len(p)) < args.particle_fraction
-        p = p[keep]
-    pos_p = np.ascontiguousarray(p[["x", "y", "z"]].values, dtype=np.float64)
-    w_p = None if args.no_mass_weight else \
-        np.ascontiguousarray(p["mass"].values, dtype=np.float64)
+    # Streamed so that only the subsample is ever materialised: reading all
+    # 233M rows to keep 2% costs ~15 GB of peak RSS for nothing.
+    rng = np.random.default_rng(args.particle_seed)
+    cols = ["x", "y", "z", "mass"]
+    chunks = []
+    pf = pq.ParquetFile(args.part_path)
+    for batch in pf.iter_batches(batch_size=5_000_000, columns=cols):
+        arr = np.column_stack([batch.column(c).to_numpy(zero_copy_only=False)
+                               for c in cols]).astype(np.float64)
+        if args.particle_fraction < 1.0:
+            arr = arr[rng.random(len(arr)) < args.particle_fraction]
+        chunks.append(arr)
+    p = np.concatenate(chunks); del chunks
+    pos_p = np.ascontiguousarray(p[:, :3])
+    w_p = None if args.no_mass_weight else np.ascontiguousarray(p[:, 3])
+    del p
     print(f"particles: {len(pos_p):,} "
           f"(fraction {args.particle_fraction}, "
           f"{'unweighted' if w_p is None else 'mass-weighted'})")
