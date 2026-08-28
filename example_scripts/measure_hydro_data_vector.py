@@ -67,6 +67,11 @@ def parse_args():
     p.add_argument("--chi_max", type=float, default=100.0,
                    help="DeltaSigma LOS projection half-length [Mpc/h] "
                         "(100 matches the tabulated forward model the fits use).")
+    p.add_argument("--rp_min", type=float, default=None,
+                   help="Override the reference rp binning (with --rp_max/--n_rp). "
+                        "Use 0.1/50/26 for the tabulation grid.")
+    p.add_argument("--rp_max", type=float, default=None)
+    p.add_argument("--n_rp", type=int, default=None, help="Number of bin EDGES.")
     p.add_argument("--gal_type", type=int, default=None,
                    help="Optional NISP 'type' selection (default: all galaxies).")
     p.add_argument("--no_mass_weight", action="store_true",
@@ -89,7 +94,10 @@ def main():
 
     # ---- reference binning + data ------------------------------------------
     ref = np.load(args.ref_path)
-    rp_bins = np.asarray(ref["rp_bins"])
+    if args.rp_min is not None:
+        rp_bins = np.geomspace(args.rp_min, args.rp_max, args.n_rp)
+    else:
+        rp_bins = np.asarray(ref["rp_bins"])
     rp_ref = np.asarray(ref["rp_centers"])
     ds_ref = np.asarray(ref["delta_sigma"])
     ds_err = np.asarray(ref["delta_sigma_err"])
