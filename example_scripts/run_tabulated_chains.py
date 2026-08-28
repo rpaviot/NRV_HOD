@@ -357,13 +357,13 @@ def run_case(case_name, fit_case, halo, tab, args):
             print(f"  Loaded saved chain: {chain_path} "
                   f"({len(points)} pts, logZ = {log_z:.2f})")
         else:
-            print(f"  Running Nautilus (n_live={N_LIVE}, vectorized jit/vmap "
+            print(f"  Running Nautilus (n_live={args.n_live}, vectorized jit/vmap "
                   "likelihood, single process) ...")
             checkpoint = os.path.join(
                 args.output_dir,
                 f"checkpoint_{case_name}{wgg_tag}_rmin{rp_min}.h5")
             points, weights, log_l, log_z = fitter.run(
-                n_eff=args.n_eff, n_live=N_LIVE, verbose=True,
+                n_eff=args.n_eff, n_live=args.n_live, verbose=True,
                 vectorized=True, filepath=checkpoint,
             )
             fitter.save_results(chain_path, points, weights, log_l, log_z)
@@ -461,6 +461,7 @@ def parse_args():
                    help="Unused (kept for CLI compatibility); sampling is "
                         "single-process vectorized")
     p.add_argument("--n_eff", type=int, default=N_EFF)
+    p.add_argument("--n_live", type=int, default=N_LIVE)
     p.add_argument("--rp_min_values", type=float, nargs="+",
                    default=RP_MIN_VALUES)
     p.add_argument("--wgg_tab", default="",
