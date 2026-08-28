@@ -98,12 +98,14 @@ def main():
         rp_bins = np.geomspace(args.rp_min, args.rp_max, args.n_rp)
     else:
         rp_bins = np.asarray(ref["rp_bins"])
+    custom_bins = args.rp_min is not None
+    rp_cen = np.sqrt(rp_bins[1:] * rp_bins[:-1])
     rp_ref = np.asarray(ref["rp_centers"])
     ds_ref = np.asarray(ref["delta_sigma"])
     ds_err = np.asarray(ref["delta_sigma_err"])
     wgg_ref = np.asarray(ref["wgg"])
     wgg_err = np.asarray(ref["wgg_err"])
-    print(f"reference binning: {len(rp_bins)-1} bins "
+    print(f"{'custom' if custom_bins else 'reference'} binning: {len(rp_bins)-1} bins "
           f"[{rp_bins[0]:.2f}, {rp_bins[-1]:.1f}] Mpc/h")
 
     # ---- galaxies ----------------------------------------------------------
@@ -161,13 +163,19 @@ def main():
               f"median|nsig| = {np.median(np.abs(nsig)):.2f}")
         return dev, nsig
 
-    ds_dev, _ = _report("DeltaSigma", ds_meas, ds_ref, ds_err)
-    wgg_dev, _ = _report("wgg", wgg_meas, wgg_ref, wgg_err)
+    if custom_bins:
+        print("\ncustom binning: skipping the reference comparison "
+              "(the reference is on a different grid)")
+        ds_dev = wgg_dev = None
+    else:
+        ds_dev, _ = _report("DeltaSigma", ds_meas, ds_ref, ds_err)
+        wgg_dev, _ = _report("wgg", wgg_meas, wgg_ref, wgg_err)
 
     # ---- save + plot -------------------------------------------------------
-    np.savez(args.output, rp_centers=rp_ref, rp_bins=rp_bins,
-             delta_sigma=ds_meas, wgg=wgg_meas,
-             delta_sigma_ref=ds_ref, wgg_ref=wgg_ref,
+    ref_fields = {} if custom_bins else {"delta_sigma_ref": ds_ref,
+                                         "wgg_ref": wgg_ref}
+    np.savez(args.output, rp_centers=rp_cen, rp_bins=rp_bins,
+             delta_sigma=ds_meas, wgg=wgg_meas, **ref_fields,
              particle_fraction=args.particle_fraction, pi_max=args.pi_max,
              chi_max=args.chi_max, ngal=ngal)
     print(f"\nSaved measured data vector -> {args.output}")
@@ -177,14 +185,16 @@ def main():
             (r"$\Delta\Sigma$", ds_meas, ds_ref, ds_err, ds_dev),
             (r"$w_{gg}$", wgg_meas, wgg_ref, wgg_err, wgg_dev)]):
         top, bot = axes[0, col], axes[1, col]
-        top.errorbar(rp_ref, rp_ref * refv, yerr=rp_ref * err, fmt="ko",
-                     ms=4, label="reference")
-        top.plot(rp_ref, rp_ref * meas, "r.-", label="measured (in box)")
+        if not custom_bins:
+            top.errorbar(rp_ref, rp_ref * refv, yerr=rp_ref * err, fmt="ko",
+                         ms=4, label="reference")
+        top.plot(rp_cen, rp_cen * meas, "r.-", label="measured (in box)")
         top.set_xscale("log"); top.set_ylabel(rf"$r_p\,${name}")
         top.legend(); top.set_title(name); top.grid(alpha=0.3, which="both", ls=":")
         bot.axhline(0, color="k", lw=0.8)
         bot.axhspan(-5, 5, color="green", alpha=0.1)
-        bot.plot(rp_ref, 100 * dev, "r.-")
+        if not custom_bins:
+            bot.plot(rp_ref, 100 * dev, "r.-")
         bot.set_xscale("log"); bot.set_xlabel(r"$r_p$ [Mpc/$h$]")
         bot.set_ylabel("dev [%]"); bot.grid(alpha=0.3, which="both", ls=":")
     fig.tight_layout()
