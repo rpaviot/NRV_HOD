@@ -337,7 +337,8 @@ def run_case(case_name, fit_case, halo, tab, args):
             **({"max_fsat": args.max_fsat, "hod_occupation": halo.HOD}
                if args.max_fsat is not None else {}),
             **({"tabulated_wgg": tab_wgg, "data_path_wgg": args.data_path,
-                "rp_min_wgg": args.rp_min_wgg, "rp_max_wgg": args.rp_max_wgg}
+                "rp_min_wgg": args.rp_min_wgg, "rp_max_wgg": args.rp_max_wgg,
+                "n_wgg_threads": args.n_wgg_threads}
                if tab_wgg is not None else {}),
         )
         print(f"  {fitter.n_bins} bins in [{fitter.rp_obs[0]:.3f}, "
@@ -358,7 +359,9 @@ def run_case(case_name, fit_case, halo, tab, args):
                   f"({len(points)} pts, logZ = {log_z:.2f})")
         else:
             print(f"  Running Nautilus (n_live={args.n_live}, vectorized jit/vmap "
-                  "likelihood, single process) ...")
+                  f"likelihood, single process"
+                  + (f", {args.n_wgg_threads} wgg threads" if tab_wgg is not None
+                     else "") + ") ...")
             checkpoint = os.path.join(
                 args.output_dir,
                 f"checkpoint_{case_name}{wgg_tag}_rmin{rp_min}.h5")
@@ -468,6 +471,12 @@ def parse_args():
                    help="WggTabulation .npz whose fine rp grid nests the "
                         "data's rp_bins_wgg — enables the joint wgg+DS fit "
                         "(wgg data+cov read from --data_path).")
+    p.add_argument("--n_wgg_threads", type=int,
+                   default=len(os.sched_getaffinity(0))
+                   if hasattr(os, "sched_getaffinity") else os.cpu_count(),
+                   help="Threads used for the per-point wgg chi2 of a "
+                        "vectorized batch (the DeltaSigma half is already "
+                        "threaded by XLA). Defaults to the allocated cores.")
     p.add_argument("--rp_min_wgg", type=float, default=None)
     p.add_argument("--rp_max_wgg", type=float, default=None)
     p.add_argument("--max_fsat", type=float, default=None)

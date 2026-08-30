@@ -698,6 +698,7 @@ class TabulatedFitter(EmulatorFitter):
         data_path_wgg: str = "",
         rp_min_wgg: Optional[float] = None,
         rp_max_wgg: Optional[float] = None,
+        n_wgg_threads: int = 1,
     ):
         self.fit_case = FitCase(fit_case)
         self.M1_fixed = M1_fixed
@@ -706,6 +707,7 @@ class TabulatedFitter(EmulatorFitter):
         self.rp_max = rp_max
 
         self.max_fsat = max_fsat
+        self.n_wgg_threads = n_wgg_threads
         self.Ac_fiducial = Ac_fiducial
         self.hod_occupation = hod_occupation
         if max_fsat is not None and hod_occupation is None:
@@ -994,23 +996,57 @@ class TabulatedFitter(EmulatorFitter):
             return loglike_fn, free_names
 
         # ── joint wgg: TabulatedWgg.predict has no jax twin, so add its
-        # chi2 as a NumPy loop on top of the batched DeltaSigma logL. Runs
-        # in the main process (jitted occupation calls are fork-unsafe, not
-        # main-process-unsafe). Points already rejected by the DeltaSigma
-        # term are skipped. ──
+        # chi2 on top of the batched DeltaSigma logL, one point at a time.
+        # The points of a batch are independent and TabulatedWgg.predict is
+        # NumPy (whose heavy kernels release the GIL), so they run on a
+        # thread pool: threads, not processes, because predict still calls
+        # the jitted occupation and JAX deadlocks after a fork — while it is
+        # fine from threads of the main process. Points already rejected by
+        # the DeltaSigma term are skipped. ──
+        import copy
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = (ThreadPoolExecutor(self.n_wgg_threads)
+                if self.n_wgg_threads > 1 else None)
+        _tls = threading.local()
+
+        def _thread_wgg():
+            """Per-thread TabulatedWgg clone.
+
+            Occupation.set_params stores the parameter vector on the
+            Occupation instance, so two threads predicting at once would
+            overwrite each other's parameters. The clones are shallow: the
+            tabulation and all per-halo arrays stay shared (read-only), only
+            the mutable Occupation is duplicated.
+            """
+            tw = getattr(_tls, "tab_wgg", None)
+            if tw is None:
+                tw = copy.copy(self.tab_wgg)
+                tw.halo = copy.copy(tw.halo)
+                tw.halo.HOD = copy.copy(tw.halo.HOD)
+                _tls.tab_wgg = tw
+            return tw
+
+        def _wgg_chi2(theta_row):
+            try:
+                full = self.full_params(dict(zip(free_names, theta_row)))
+                _, wgg, _ = _thread_wgg().predict(full, self.rp_bins_wgg)
+                if not np.all(np.isfinite(wgg)):
+                    return np.inf
+                r = wgg - self.wgg_obs
+                return float(r @ self.cov_inv_wgg @ r)
+            except Exception:
+                return np.inf
+
         def joint_loglike_fn(points):
             logl = np.array(loglike_fn(points))
             pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
-            for k in range(len(pts)):
-                if logl[k] <= -1e99:
-                    continue
-                try:
-                    wgg = self.predict_wgg_at_obs(
-                        dict(zip(free_names, pts[k])))
-                    r = wgg - self.wgg_obs
-                    chi2 = float(r @ self.cov_inv_wgg @ r)
-                except Exception:
-                    chi2 = np.inf
+            todo = [k for k in range(len(pts)) if logl[k] > -1e99]
+            if not todo:
+                return logl
+            mapper = pool.map if pool is not None else map
+            for k, chi2 in zip(todo, mapper(_wgg_chi2, [pts[k] for k in todo])):
                 logl[k] = logl[k] - 0.5 * chi2 if np.isfinite(chi2) else -1e100
             return logl
 
