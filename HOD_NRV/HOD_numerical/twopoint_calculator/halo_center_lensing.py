@@ -1035,31 +1035,27 @@ class TabulatedDeltaSigma:
         info = {'ngal': ngal, 'fsat': fsat, 'ds_cen': ds_cen, 'ds_sat': ds_sat}
         return rp_centers, ds_total, info
 
-    def make_predict_jax(self, n_sub_logM: int = 16, n_sub_fI: int = 4):
-        """Build a pure-JAX twin of :meth:`predict` for jit/vmap sampling.
+    def _occupation_cells(self, n_sub_logM: int = 16, n_sub_fI: int = 4):
+        """Fine (logM, fI) occupation grid nested in the cache tabulation bins.
 
-        Returns ``predict_fn(params) -> (ds_total, ngal, fsat)`` where
-        ``params`` is a dict of (traced) scalars. The satellite pipeline is
-        the exact jnp translation of :meth:`predict` (the scipy cubic-spline
-        stages are linear in their inputs and are precomputed as matrices by
-        probing the NumPy code with unit vectors). The centrals — exact
-        per-halo sums in :meth:`predict` — are tabulated on a fine
-        (n_m*n_sub_logM, n_f*n_sub_fI) occupation grid nested inside the
-        cache bins: profile sums are exact, only the occupation weight is
-        evaluated at the per-cell mean (logM, fI) instead of per halo.
-
-        The ngal/fsat catalog sums use the same fine grid. AB is supported
-        for ``ab_method`` 'mass' or 'direct' with a single AB property
-        (fI or fE); 'direct' uses exact per-cell means of sign(prop).
+        Shared by :meth:`make_predict_jax` and :meth:`make_ngal_fns`: halos are
+        binned into ``n_sub_logM * n_sub_fI`` sub-cells per cache bin so the
+        occupation can be evaluated at the per-cell mean (logM, fI) instead of
+        per halo. Returns the cell assignment, counts and per-cell means, plus
+        the assembly-bias property and the coefficient names that multiply it.
+        Cached per (n_sub_logM, n_sub_fI).
         """
-        import jax
-        import jax.numpy as jnp
-        from ..HOD_models import build_occupation_fn_jax
+        key = (n_sub_logM, n_sub_fI)
+        cache = getattr(self, '_occ_cells_cache', None)
+        if cache is None:
+            cache = self._occ_cells_cache = {}
+        if key in cache:
+            return cache[key]
 
         occ = self.halo.HOD
         if occ.assembly_bias and occ.ab_method not in ("mass", "direct"):
             raise NotImplementedError(
-                "make_predict_jax supports ab_method 'mass' or 'direct'.")
+                "occupation cells support ab_method 'mass' or 'direct'.")
 
         # ── AB property and the coefficient names that multiply it ──
         prop = None
@@ -1067,7 +1063,7 @@ class TabulatedDeltaSigma:
         if occ.assembly_bias:
             if occ.fI is not None and occ.fE is not None:
                 raise NotImplementedError(
-                    "make_predict_jax supports a single AB property (fI or fE).")
+                    "occupation cells support a single AB property (fI or fE).")
             if occ.fI is not None:
                 prop, cen_coef, sat_coef = np.asarray(occ.fI), "A_cent", "A_sat"
             else:
@@ -1116,6 +1112,92 @@ class TabulatedDeltaSigma:
         else:
             prop_cell = np.zeros(n_cells)
             sign_cell = np.zeros(n_cells)
+
+        cache[key] = dict(
+            prop=prop, cen_coef=cen_coef, sat_coef=sat_coef,
+            cell=cell, n_cells=n_cells, n_mc=n_mc, n_fc=n_fc,
+            n_sub_logM=n_sub_logM, n_sub_fI=n_sub_fI,
+            N_cell=N_cell, logM_cell=logM_cell,
+            prop_cell=prop_cell, sign_cell=sign_cell)
+        return cache[key]
+
+    def make_ngal_jax(self, n_sub_logM: int = 16, n_sub_fI: int = 4):
+        """Catalogue-sum ngal on the same fine cells as :meth:`make_predict_jax`.
+
+        Returns ``ngal_fn(params) -> ngal`` [(Mpc/h)^-3]: the jnp twin of the
+        ``(sum_C + sum_S) / Lbox^3`` that ``predict_fn`` reports, i.e. the halo
+        catalogue's own number density with assembly bias applied. Anchoring
+        the (Ac, As) rescale on this instead of an analytic mass function keeps
+        the rescale consistent with the catalogue the profiles are summed over.
+
+        Both occupations are linear in their amplitude (Ac for centrals, As for
+        satellites, see HOD_models), so ngal is linear in a common (Ac, As)
+        rescale factor and one division inverts it exactly — provided probC
+        stays below the ``min(probC, 1)`` clip and the 'direct' AB kink at 0.5,
+        which holds for the Ac ~ 1e-2 amplitudes used here.
+        """
+        import jax.numpy as jnp
+        from ..HOD_models import build_occupation_fn_jax
+
+        occ = self.halo.HOD
+        cells = self._occupation_cells(n_sub_logM, n_sub_fI)
+        cen_coef, sat_coef = cells['cen_coef'], cells['sat_coef']
+        n_mc, n_fc = cells['n_mc'], cells['n_fc']
+        j_logM_cell = jnp.asarray(cells['logM_cell'].reshape(n_mc, n_fc))
+        j_prop_cell = jnp.asarray(cells['prop_cell'].reshape(n_mc, n_fc))
+        j_sign_cell = jnp.asarray(cells['sign_cell'].reshape(n_mc, n_fc))
+        j_N_cell = jnp.asarray(cells['N_cell'].reshape(n_mc, n_fc))
+        occ_fn = build_occupation_fn_jax(occ)
+        Lbox3 = self.halo.Lbox ** 3
+        has_ab, ab_method = occ.assembly_bias, occ.ab_method
+
+        def ngal_fn(params):
+            cshift = sshift = 0.0
+            if has_ab and ab_method == "mass":
+                cshift = params.get(cen_coef, 0.0) * j_prop_cell
+                sshift = params.get(sat_coef, 0.0) * j_prop_cell
+            probC, probS = occ_fn(j_logM_cell, params, cshift, sshift)
+            if has_ab and ab_method == "direct":
+                ab_c = params.get(cen_coef, 0.0) * j_sign_cell
+                ab_s = params.get(sat_coef, 0.0) * j_sign_cell
+                probC = probC + ab_c * jnp.minimum(probC, 1.0 - probC)
+                probS = probS * (1.0 + ab_s)
+            probC = jnp.minimum(probC, 1.0)
+            return jnp.sum((probC + probS) * j_N_cell) / Lbox3
+
+        return ngal_fn
+
+    def make_predict_jax(self, n_sub_logM: int = 16, n_sub_fI: int = 4):
+        """Build a pure-JAX twin of :meth:`predict` for jit/vmap sampling.
+
+        Returns ``predict_fn(params) -> (ds_total, ngal, fsat)`` where
+        ``params`` is a dict of (traced) scalars. The satellite pipeline is
+        the exact jnp translation of :meth:`predict` (the scipy cubic-spline
+        stages are linear in their inputs and are precomputed as matrices by
+        probing the NumPy code with unit vectors). The centrals — exact
+        per-halo sums in :meth:`predict` — are tabulated on a fine
+        (n_m*n_sub_logM, n_f*n_sub_fI) occupation grid nested inside the
+        cache bins: profile sums are exact, only the occupation weight is
+        evaluated at the per-cell mean (logM, fI) instead of per halo.
+
+        The ngal/fsat catalog sums use the same fine grid. AB is supported
+        for ``ab_method`` 'mass' or 'direct' with a single AB property
+        (fI or fE); 'direct' uses exact per-cell means of sign(prop).
+        """
+        import jax
+        import jax.numpy as jnp
+        from ..HOD_models import build_occupation_fn_jax
+
+        occ = self.halo.HOD
+        cells = self._occupation_cells(n_sub_logM, n_sub_fI)
+        prop = cells['prop']
+        cen_coef, sat_coef = cells['cen_coef'], cells['sat_coef']
+        cell, n_cells = cells['cell'], cells['n_cells']
+        n_mc, n_fc = cells['n_mc'], cells['n_fc']
+        n_sub_fI = cells['n_sub_fI']
+        N_cell, logM_cell = cells['N_cell'], cells['logM_cell']
+        prop_cell, sign_cell = cells['prop_cell'], cells['sign_cell']
+
 
         n_rp = len(self.cache.rp_centers)
         D_cen = np.empty((n_cells, n_rp))
