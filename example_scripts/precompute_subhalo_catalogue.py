@@ -94,6 +94,14 @@ def main():
 
     t1 = time.time()
     print(f"Catalogue built in {t1-t0:.1f}s")
+
+    # An empty catalogue is a unit or threshold error, not a valid result, and
+    # it used to be written out with exit code 0 -- indistinguishable from
+    # success until the fits downstream came out nonsense.
+    if len(host_cat['mass']) == 0:
+        raise SystemExit(
+            f"No hosts above {args.mass_threshold:.1e} Msun/h. Check the SOAP "
+            f"mass units (swiftsimio returns the file's internal unit) and h.")
     print(f"  N_host = {len(host_cat['mass']):,}")
     print(f"  N_sub  = {len(sub_cat['cop']):,}")
     print(f"  max subhalos per host = {csr['max_subs']:,}")
