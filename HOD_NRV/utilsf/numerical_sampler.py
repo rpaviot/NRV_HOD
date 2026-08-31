@@ -650,6 +650,33 @@ def _solve_ngal_rescale(ngal_fn, merged, target_ngal, Ac_fiducial, n_iter=6):
     return rf
 
 
+def _make_ngal_mf_jax(occ):
+    """Analytic mass-function ngal: jnp twin of ``compute_ngal_``.
+
+    Trapezoid rather than ``compute_ngal_``'s CubicSpline + Gauss-Legendre so
+    the same callable serves ``full_params`` and the jit/vmap likelihood; on
+    the 1024-point logM grid the two agree far inside the ~8% the mass function
+    itself is off by.
+
+    No ``min(probC, 1)`` clip enters here (``_compute_prob_bins`` has none), so
+    ngal is exactly linear in a common (Ac, As) factor and the first division
+    in :func:`_solve_ngal_rescale` already inverts it — the fixed-point steps
+    are no-ops on this anchor.
+    """
+    import jax.numpy as jnp
+    from HOD_NRV.HOD_numerical.HOD_models import build_occupation_fn_jax
+
+    occ_fn = build_occupation_fn_jax(occ)
+    j_logM = jnp.asarray(np.asarray(occ.logM_bins))
+    j_mf = jnp.asarray(np.asarray(occ.mass_function))
+
+    def ngal_fn(params):
+        probC, probS = occ_fn(j_logM, params)
+        return jnp.trapezoid(j_mf * (probC + probS), j_logM)
+
+    return ngal_fn
+
+
 class TabulatedFitter(EmulatorFitter):
     """
     Nautilus sampler calling TabulatedDeltaSigma.predict() directly.
@@ -668,9 +695,24 @@ class TabulatedFitter(EmulatorFitter):
     tabulated_ds : TabulatedDeltaSigma
         Predictor built from a cache with xi_gm tabulation.
     occupation_rescale : Occupation
-        Kept for interface compatibility with the grid pipeline; the (Ac, As)
-        rescale is anchored on the halo catalogue sum (see full_params), so
-        this Occupation's mass function no longer enters the fit.
+        Supplies the analytic mass function used when
+        ``ngal_anchor="mass_function"`` (see that parameter); ignored under
+        the catalogue anchor.
+    ngal_anchor : {"catalogue", "mass_function"}
+        What the (Ac, As) -> ``target_ngal`` rescale is anchored on.
+
+        ``"mass_function"`` integrates ``occupation_rescale`` against its
+        analytic mass function (the grid-pipeline convention). Use it when the
+        assembly-bias amplitudes are *fixed at zero*: the occupation is then a
+        plain function of M, so an error in the mass function is absorbed
+        entirely into the absolute (Ac, As) -- which cancels out of DeltaSigma
+        and wgg, since both only see the Ac/As ratio.
+
+        ``"catalogue"`` sums the occupation over the tabulation's own halo
+        cells with assembly bias applied. Required when B_cent/B_sat are
+        sampled: AB reweights halos by their fI/fE split at fixed mass, which
+        no mass-function integral can see, so the analytic anchor would set
+        the wrong Ac/As ratio rather than just the wrong absolute scale.
     target_ngal : float
         Galaxy number density the (Ac, As) pair is rescaled to.
     Other arguments are as in EmulatorFitter (data_path / arrays, rp cuts,
@@ -693,6 +735,7 @@ class TabulatedFitter(EmulatorFitter):
         param_config: Optional[dict] = None,
         max_fsat: Optional[float] = None,
         Ac_fiducial: float = 0.01,
+        ngal_anchor: str = "catalogue",
         hod_occupation=None,
         tabulated_wgg=None,
         data_path_wgg: str = "",
@@ -712,6 +755,12 @@ class TabulatedFitter(EmulatorFitter):
         self.hod_occupation = hod_occupation
         if max_fsat is not None and hod_occupation is None:
             raise ValueError("max_fsat requires hod_occupation.")
+
+        if ngal_anchor not in ("catalogue", "mass_function"):
+            raise ValueError(
+                f"ngal_anchor must be 'catalogue' or 'mass_function', "
+                f"got {ngal_anchor!r}")
+        self.ngal_anchor = ngal_anchor
 
         self.tab = tabulated_ds
         self.occupation_rescale = occupation_rescale
@@ -803,21 +852,28 @@ class TabulatedFitter(EmulatorFitter):
 
     @property
     def ngal_fn(self):
-        """Catalogue-sum ngal on the tabulation's fine occupation cells."""
+        """ngal the (Ac, As) rescale is anchored on -- see ``ngal_anchor``.
+
+        Either the catalogue sum over the tabulation's fine occupation cells
+        (assembly bias included) or the analytic mass-function integral. Both
+        are jnp-traceable, so ``full_params`` and the jit/vmap likelihood
+        rescale identically by construction.
+        """
         fn = getattr(self, "_ngal_fn", None)
         if fn is None:
-            fn = self._ngal_fn = self.tab.make_ngal_jax()
+            fn = self._ngal_fn = (
+                _make_ngal_mf_jax(self.occupation_rescale)
+                if self.ngal_anchor == "mass_function"
+                else self.tab.make_ngal_jax())
         return fn
 
     def full_params(self, free_dict):
         """Merge free + fixed and rescale (Ac, As) to target_ngal.
 
-        The anchor is the halo catalogue's own number density (summed over the
-        tabulation's occupation cells, assembly bias included), not an analytic
-        mass function: the DeltaSigma and wgg predictions normalise by the same
-        catalogue sums, so a mass-function anchor only mis-sets the absolute
-        (Ac, As) — it cancels out of both observables. Both occupations are
-        linear in their amplitude, so the single division is exact.
+        Anchored on ``self.ngal_fn``, i.e. on the halo catalogue sum or on the
+        analytic mass function according to ``ngal_anchor``. Both occupations
+        are linear in their amplitude, so the single division is exact on the
+        unclipped branch.
         """
         merged = {**self.fixed_params_dict, **free_dict}
         merged.pop("Ac", None)
@@ -897,7 +953,7 @@ class TabulatedFitter(EmulatorFitter):
         ``(n, n_free)`` array (columns in ``free_names`` = nautilus prior
         order) to an ``(n,)`` numpy array of log-likelihoods. It is the
         batched twin of :meth:`log_likelihood`: the (Ac, As) -> target_ngal
-        rescale (anchored on the catalogue-sum ngal), the tabulated forward
+        rescale (anchored per ``ngal_anchor``), the tabulated forward
         pass and the log-log cubic interpolation onto the observed rp grid
         are all reproduced in pure jnp. The scipy cubic-spline rp
         interpolation is linear in its inputs and precomputed as a matrix
@@ -917,9 +973,9 @@ class TabulatedFitter(EmulatorFitter):
 
         predict_fn = self.tab.make_predict_jax()
 
-        # ── ngal rescale: anchored on the halo catalogue's own number
-        # density (same occupation cells the tabulated predict sums over),
-        # so no analytic mass function enters the fit ──
+        # ── ngal rescale: catalogue sum or analytic mass function, per
+        # ``ngal_anchor`` (the property hands back the matching jnp callable,
+        # the same one ``full_params`` uses) ──
         ngal_fn = self.ngal_fn
 
         # ── obs-grid interpolation: log-log CubicSpline is linear in
@@ -962,7 +1018,7 @@ class TabulatedFitter(EmulatorFitter):
                 fsat_gate = (jnp.trapezoid(j_mf_fs * pS, j_logMb_fs)
                              / jnp.trapezoid(j_mf_fs * (pC + pS), j_logMb_fs))
 
-            # (Ac, As) -> target_ngal rescale (catalogue-sum ngal, with AB)
+            # (Ac, As) -> target_ngal rescale (anchor per ngal_anchor)
             rf = _solve_ngal_rescale(ngal_fn, merged, target_ngal, Ac_fid)
             full = {**merged, "Ac": Ac_fid * rf, "As": merged["As"] * rf}
 

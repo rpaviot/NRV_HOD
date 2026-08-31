@@ -334,6 +334,13 @@ def run_case(case_name, fit_case, halo, tab, args):
             rp_max=None,
             param_config=param_config,
             Ac_fiducial=AC_FIDUCIAL,
+            # Without sampled AB the occupation is a plain function of M, so
+            # the mass function's ~8% error over the Flamingo M200m catalogue
+            # is absorbed into the absolute (Ac, As) and cancels out of both
+            # observables (they see only Ac/As). With AB sampled it would not:
+            # B_cent/B_sat reweight halos at fixed mass, which the analytic
+            # integral cannot see, so the anchor has to be the halo sum.
+            ngal_anchor="catalogue" if assembly_bias else "mass_function",
             **({"max_fsat": args.max_fsat, "hod_occupation": halo.HOD}
                if args.max_fsat is not None else {}),
             **({"tabulated_wgg": tab_wgg, "data_path_wgg": args.data_path,
