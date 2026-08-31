@@ -53,6 +53,10 @@ def parse_args():
                         "B_cent/B_sat fit convention.")
     p.add_argument("--n_logM_bins", type=int, default=40)
     p.add_argument("--n_fI_bins", type=int, default=8)
+    p.add_argument("--mass_weight", action="store_true",
+                   help="Weight particles by their 'mass' column. Required "
+                        "for a hydro particle set (DM/gas/star masses differ "
+                        "by orders of magnitude); a no-op for DMO.")
     return p.parse_args()
 
 
@@ -83,14 +87,17 @@ rp_bins = np.geomspace(0.1, 50.0, 26)
 # Helper
 # ============================================================================
 
-def subsample_array(positions, fraction, seed):
-    """Subsample positions array with sorted indices for cache locality."""
+def subsample_indices(n, fraction, seed):
+    """Sorted subsample indices (sorted for cache locality).
+
+    Returned rather than applied so that positions and masses are guaranteed
+    to be subsampled with the *same* draw.
+    """
     if fraction >= 1.0:
-        return positions
-    n_keep = int(len(positions) * fraction)
+        return None
+    n_keep = int(n * fraction)
     rng = np.random.RandomState(seed)
-    indices = np.sort(rng.choice(len(positions), n_keep, replace=False))
-    return positions[indices]
+    return np.sort(rng.choice(n, n_keep, replace=False))
 
 
 # ============================================================================
@@ -104,23 +111,32 @@ def main():
     print("=" * 60)
 
     # --- Load particles directly: only x,y,z, then subsample and free full array ---
-    print("\nLoading particle catalog (x,y,z only)...")
-    df_part = pd.read_parquet(args.particle_path, columns=['x', 'y', 'z'])
+    cols = ['x', 'y', 'z'] + (['mass'] if args.mass_weight else [])
+    print(f"\nLoading particle catalog ({','.join(cols)})...")
+    df_part = pd.read_parquet(args.particle_path, columns=cols)
     n_full = len(df_part)
     print(f"  {n_full:,} particles loaded")
 
     positions_part_full = df_part[['x', 'y', 'z']].to_numpy(dtype=np.float64)
+    masses_part_full = (df_part['mass'].to_numpy(dtype=np.float64)
+                        if args.mass_weight else None)
     del df_part
     gc.collect()
 
-    positions_part_sub = subsample_array(
-        positions_part_full, args.particle_fraction, args.particle_seed
-    )
+    keep = subsample_indices(n_full, args.particle_fraction, args.particle_seed)
+    positions_part_sub = (positions_part_full if keep is None
+                          else positions_part_full[keep])
+    masses_part_sub = None if masses_part_full is None else (
+        masses_part_full if keep is None else masses_part_full[keep])
     # Apply periodic boundary correction (mirrors HaloOccupation's treatment)
     positions_part_sub = (positions_part_sub + Lbox) % Lbox
     n_sub = len(positions_part_sub)
-    del positions_part_full
+    del positions_part_full, masses_part_full, keep
     gc.collect()
+    if masses_part_sub is not None:
+        print(f"  mass-weighted: m in [{masses_part_sub.min():.3e}, "
+              f"{masses_part_sub.max():.3e}] Msun/h, "
+              f"ratio {masses_part_sub.max()/masses_part_sub.min():.1f}")
 
     print(f"\nParticle downsampling:")
     print(f"  Full:         {n_full:,}")
@@ -167,6 +183,7 @@ def main():
     cache = precompute_halo_center_lensing(
         halo_positions=halo_positions,
         particle_positions=positions_part_sub,
+        particle_masses=masses_part_sub,
         Lbox=Lbox,
         rsd_axis=rsd_axis,
         RHO_M=RHO_M,

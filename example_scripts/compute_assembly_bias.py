@@ -16,6 +16,8 @@ Output: host_catalogue_ab.parquet — original catalog + 4 new columns:
     fs_norm    : log-normalized qr2 in [-1, 1]       (use as fB in HOD)
 """
 
+import argparse
+
 import numpy as np
 import pandas as pd
 from HOD_NRV.utilsf.fieldmesh import compute_assembly_bias_properties
@@ -28,13 +30,22 @@ HALO_PATH = "/Users/ler13nrv/Documents/flamingo_data/parquet_halo_catalogue_L100
 PARTICLE_PATH = "/Users/ler13nrv/Documents/flamingo_data/particle_catalogue_L1000N1800_downsampled.parquet"
 OUTPUT_PATH   = "/Users/ler13nrv/Documents/flamingo_data/parquet_halo_catalogue_L1000N1800_AB.parquet"
 
+_p = argparse.ArgumentParser(description=__doc__)
+_p.add_argument("--halo_path", default=HALO_PATH)
+_p.add_argument("--particle_path", default=PARTICLE_PATH)
+_p.add_argument("--output", default=OUTPUT_PATH)
+_p.add_argument("--threads", type=int, default=20)
+_args = _p.parse_args()
+HALO_PATH, PARTICLE_PATH, OUTPUT_PATH = (
+    _args.halo_path, _args.particle_path, _args.output)
+
 LBOX         = 681.0   # Mpc/h
 NMESH        = 256
 RVIR_FACTOR  = 2.25    # R_smooth = 2.25 * Rvir per halo
 R_MIN        = 0.5     # Mpc/h  (smoothing scale grid lower bound)
 R_MAX        = 6.0     # Mpc/h  (smoothing scale grid upper bound)
 DR           = 0.25    # Mpc/h  (grid step)
-THREADS      = 20
+THREADS      = _args.threads
 
 # ---------------------------------------------------------------------------
 # Compute

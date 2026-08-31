@@ -130,6 +130,7 @@ def _process_batch_prequeried(halo_indices):
     chi_max = s['chi_max']
     n_rp_bins = s['n_rp_bins']
     idx_lists = s['idx_lists']
+    particle_masses = s.get('particle_masses')
     n_comp_bins = len(bins_comp) - 1
 
     halo_bin_index = s.get('halo_bin_index')
@@ -148,7 +149,8 @@ def _process_batch_prequeried(halo_indices):
             delta = particle_positions[idx] - halo_positions[i]
             delta -= Lbox * np.round(delta / Lbox)
             r = np.sqrt(np.einsum('ij,ij->i', delta, delta))
-            counts, _ = np.histogram(r, bins=bins_comp)
+            w = None if particle_masses is None else particle_masses[idx]
+            counts, _ = np.histogram(r, bins=bins_comp, weights=w)
             xi_gm = (counts / shell_volumes / n_mean) - 1.0
 
         if tabulate:
@@ -179,6 +181,7 @@ def _process_batch_with_query(halo_indices):
     n_rp_bins = s['n_rp_bins']
     search_radius = s['search_radius']
     kdtree = s['kdtree']
+    particle_masses = s.get('particle_masses')
     n_comp_bins = len(bins_comp) - 1
 
     halo_bin_index = s.get('halo_bin_index')
@@ -206,7 +209,8 @@ def _process_batch_with_query(halo_indices):
                 delta = particle_positions[idx] - halo_positions[i]
                 delta -= Lbox * np.round(delta / Lbox)
                 r = np.sqrt(np.einsum('ij,ij->i', delta, delta))
-                counts, _ = np.histogram(r, bins=bins_comp)
+                w = None if particle_masses is None else particle_masses[idx]
+                counts, _ = np.histogram(r, bins=bins_comp, weights=w)
                 xi_gm = (counts / shell_volumes / n_mean) - 1.0
 
             if tabulate:
@@ -471,6 +475,7 @@ def precompute_halo_center_lensing(
     rsd_axis: str,
     RHO_M: float,
     rp_bins: np.ndarray,
+    particle_masses: Optional[np.ndarray] = None,
     bins_comp: Optional[np.ndarray] = None,
     verbose: bool = True,
     n_workers: int = -1,
@@ -494,6 +499,14 @@ def precompute_halo_center_lensing(
         Halo center positions [Mpc/h]
     particle_positions : np.ndarray, shape (N_particles, 3)
         Matter tracer positions [Mpc/h]
+    particle_masses : np.ndarray, shape (N_particles,), optional
+        Per-particle mass. Required for a hydro (multi-species) particle set,
+        where a gas or star particle must not count the same as a dark matter
+        one: the shell histogram is then mass-weighted and ``n_mean`` becomes
+        the mean *mass* density, so xi_gm is the matter overdensity DeltaSigma
+        needs. Leave as None for an equal-mass (DMO or baryonified-DMO) set --
+        the mass then factors out of numerator and denominator alike and the
+        weighted form reduces exactly to the number count.
     Lbox : float
         Simulation box size [Mpc/h]
     rsd_axis : str
@@ -557,7 +570,8 @@ def precompute_halo_center_lensing(
     if verbose:
         print(f"Precomputing DeltaSigma at {n_halos} halo centers...")
         print(f"  rp_bins: {n_rp_bins} bins from {rp_bins[0]:.3f} to {rp_bins[-1]:.1f} Mpc/h")
-        print(f"  Particles: {len(particle_positions)}")
+        print(f"  Particles: {len(particle_positions)}"
+              f"{' (mass-weighted)' if particle_masses is not None else ''}")
         print(f"  Mode: {'prequery_all' if prequery_all else 'per-worker query'}")
 
     # ── Phase 1: KD-tree build ──
@@ -573,7 +587,16 @@ def precompute_halo_center_lensing(
     volume_total = Lbox**3
     n_particles_total = len(particle_positions)
     shell_volumes = (4.0/3.0) * np.pi * (bins_comp[1:]**3 - bins_comp[:-1]**3)
-    n_mean = n_particles_total / volume_total
+    if particle_masses is None:
+        n_mean = n_particles_total / volume_total
+    else:
+        if len(particle_masses) != n_particles_total:
+            raise ValueError(
+                f"particle_masses has {len(particle_masses)} entries for "
+                f"{n_particles_total} particles.")
+        # Mean mass density, so counts / shell_volume / n_mean is 1 + delta
+        # of the matter field exactly as in the equal-mass case.
+        n_mean = float(np.sum(particle_masses)) / volume_total
 
     tabulate = halo_logM is not None
     if tabulate:
@@ -587,6 +610,7 @@ def precompute_halo_center_lensing(
 
     _shared.update({
         'particle_positions': particle_positions,
+        'particle_masses': particle_masses,
         'halo_positions': halo_positions,
         'bins_comp': bins_comp,
         'shell_volumes': shell_volumes,
@@ -660,6 +684,7 @@ def precompute_halo_center_lensing(
         'rsd_axis': rsd_axis,
         'n_particles': len(particle_positions),
         'chi_max': chi_max,
+        'mass_weighted': particle_masses is not None,
     }
 
     if tabulate:
