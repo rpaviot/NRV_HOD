@@ -283,6 +283,29 @@ def plot_hod_profiles(case_name, logM, profiles_by_rp_min, output_dir):
     print(f"  HOD profile plot saved: {path}")
 
 
+def _print_per_bin(name, rp, obs, model, cov_inv):
+    """Per-bin residuals, to see *which* scales a joint fit is failing on.
+
+    sigma is taken from the inverse of the diagonal of cov_inv (i.e. the
+    conditional error), so the quoted n_sigma is not the chi2 decomposition
+    when the covariance is strongly correlated -- the chi2 contribution
+    column is the honest per-bin number.
+    """
+    obs = np.asarray(obs); model = np.asarray(model)
+    resid = model - obs
+    # chi2 contribution of each bin: r_i * (C^-1 r)_i, sums to the full chi2
+    contrib = resid * (cov_inv @ resid)
+    sig = 1.0 / np.sqrt(np.diag(cov_inv))
+    print(f"\n  --- {name} per bin ---")
+    print(f"  {'rp':>8} {'data':>12} {'model':>12} {'dev%':>8} "
+          f"{'r/sig':>8} {'chi2_i':>9}")
+    for j in range(len(obs)):
+        dev = 100.0 * (model[j] / obs[j] - 1.0) if obs[j] != 0 else np.nan
+        print(f"  {rp[j]:8.3f} {obs[j]:12.4f} {model[j]:12.4f} {dev:8.2f} "
+              f"{resid[j]/sig[j]:8.2f} {contrib[j]:9.2f}")
+    print(f"  sum chi2_i = {contrib.sum():.2f}")
+
+
 # ============================================================================
 # Run one case
 # ============================================================================
@@ -390,6 +413,11 @@ def run_case(case_name, fit_case, halo, tab, args):
             chi2_wgg = float(rw @ fitter.cov_inv_wgg @ rw)
             print(f"  chi2_ds = {chi2:.2f} ({n_data_bins} bins), "
                   f"chi2_wgg = {chi2_wgg:.2f} ({len(fitter.wgg_obs)} bins)")
+            if args.per_bin:
+                _print_per_bin("DeltaSigma", fitter.rp_obs, fitter.ds_obs,
+                               ds_map, fitter.cov_inv)
+                _print_per_bin("wgg", fitter.rp_obs_wgg, fitter.wgg_obs,
+                               wgg_map, fitter.cov_inv_wgg)
             chi2 += chi2_wgg
             n_data_bins += len(fitter.wgg_obs)
         chi2_red = chi2 / (n_data_bins - fitter.n_params)
@@ -484,6 +512,10 @@ def parse_args():
                    help="Threads used for the per-point wgg chi2 of a "
                         "vectorized batch (the DeltaSigma half is already "
                         "threaded by XLA). Defaults to the allocated cores.")
+    p.add_argument("--per_bin", action="store_true",
+                   help="Print per-bin residuals and chi2 contributions for "
+                        "DeltaSigma and wgg (diagnostic; pairs with "
+                        "--postprocess to inspect a finished chain).")
     p.add_argument("--rp_min_wgg", type=float, default=None)
     p.add_argument("--rp_max_wgg", type=float, default=None)
     p.add_argument("--max_fsat", type=float, default=None)
