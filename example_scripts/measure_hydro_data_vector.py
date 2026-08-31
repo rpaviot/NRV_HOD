@@ -20,6 +20,14 @@ the joint fit.
 Both use the reference binning (rp_bins from the npz). Results are compared to
 the reference DeltaSigma and wgg.
 
+`--hod` switches to a third, independent measurement: the *truth* HOD of the
+same NISP sample, <N_cen>(M) and <N_sat>(M). The NISP catalogue carries the
+host M200m (Msun/h) and a central/satellite `type` flag, so the numerator is a
+direct histogram; the denominator is the host halo mass function, read from the
+hydro SOAP file (SOAP/HostHaloIndex == -1 selects hosts, SO/200_mean/TotalMass
+gives M200m). This is what the posterior HOD profiles of the chains should be
+compared against -- but note the two normalisation caveats printed by the run.
+
 Usage (cluster):
     python example_scripts/measure_hydro_data_vector.py \
         --particle_fraction 0.02 --pi_max 100 \
@@ -50,6 +58,11 @@ NISP_PATH = os.path.join(HYDRO_DIR, "NISP_catalogue_flamingo.parquet")
 PART_PATH = os.path.join(HYDRO_DIR,
                          "hydro_flamingo_0058_downsampled_0.1percent.parquet")
 REF_PATH = "/sps/euclid/Users/rpaviot/flamingo/data_bin0_finalbinning.npz"
+SOAP_PATH = os.path.join(HYDRO_DIR, "halo_properties_0058.hdf5")
+DMO_HOST_PATH = ("/sps/euclid/Users/rpaviot/flamingo/snapshots_DMO/"
+                 "host_catalogue_ab.parquet")
+HOST_MASS_CACHE = "/sps/euclid/Users/rpaviot/flamingo/hydro_host_mass.npz"
+MASS_THRESHOLD = 1e11          # same host cut as the DMO catalogue the fits use
 
 
 def parse_args():
@@ -77,11 +90,172 @@ def parse_args():
                    help="Optional NISP 'type' selection (default: all galaxies).")
     p.add_argument("--no_mass_weight", action="store_true",
                    help="Count particles unweighted (diagnostic).")
+    p.add_argument("--hod", action="store_true",
+                   help="Measure the truth HOD of the NISP sample instead of "
+                        "the (DeltaSigma, wgg) data vector.")
+    p.add_argument("--soap_path", default=SOAP_PATH,
+                   help="Hydro SOAP file, for the host halo mass function.")
+    p.add_argument("--host_mass_cache", default=HOST_MASS_CACHE,
+                   help="npz cache of the hydro host logM (written on first "
+                        "run; the SOAP pass costs ~30s).")
+    p.add_argument("--dmo_host_path", default=DMO_HOST_PATH,
+                   help="DMO host catalogue -- the halo population the "
+                        "forward model actually lives on.")
+    p.add_argument("--chain_bestfits", default=None,
+                   help="Optional bestfits_*.npz from run_tabulated_chains, "
+                        "overlaid (shape-matched) on the measured HOD.")
+    p.add_argument("--dlogM", type=float, default=0.1,
+                   help="HOD mass bin width [dex].")
     return p.parse_args()
+
+
+# ============================================================================
+# Truth HOD of the NISP sample
+# ============================================================================
+
+def _hydro_host_logM(args):
+    """Host M200m (log10, Msun/h) of every hydro halo above MASS_THRESHOLD.
+
+    SOAP/HostHaloIndex == -1 flags a host (a satellite points at its host), and
+    SO/200_mean/TotalMass is the M200m the NISP `mass` column was taken from.
+    Only those two columns are read, so the 214 GB file costs ~30s.
+    """
+    if args.host_mass_cache and os.path.exists(args.host_mass_cache):
+        print(f"host mass function from cache: {args.host_mass_cache}")
+        return np.load(args.host_mass_cache)["logM"].astype(np.float64)
+
+    import h5py
+    print(f"reading host masses from SOAP: {args.soap_path}")
+    with h5py.File(args.soap_path, "r") as f:
+        is_host = f["SOAP/HostHaloIndex"][:] == -1
+        mass = f["SO/200_mean/TotalMass"][:]
+    cosmo_h = COSMO_PARAMS["h"]
+    # SOAP TotalMass is in 1e10 Msun; the NISP/DMO catalogues are in Msun/h.
+    mass = cosmo_h * np.asarray(mass, dtype=np.float64) * 1e10
+    logM = np.log10(mass[is_host & (mass > MASS_THRESHOLD)])
+    del is_host, mass
+    if args.host_mass_cache:
+        np.savez(args.host_mass_cache, logM=logM.astype(np.float32))
+        print(f"  cached -> {args.host_mass_cache}")
+    return logM
+
+
+def measure_hod(args):
+    """<N_cen>(M), <N_sat>(M) of the NISP sample, measured in the hydro box."""
+    g = pd.read_parquet(args.nisp_path, columns=["mass", "type"])
+    if args.gal_type is not None:
+        g = g[g["type"] == args.gal_type]
+    logM_gal = np.log10(g["mass"].values)      # host M200m [Msun/h]
+    is_sat = g["type"].values == 1
+    ngal = len(g)
+    print(f"galaxies: {ngal:,}  ngal = {ngal/LBOX**3:.3e} (Mpc/h)^-3  "
+          f"fsat = {is_sat.mean():.4f}")
+
+    logM_host = _hydro_host_logM(args)
+    logM_dmo = np.log10(pd.read_parquet(
+        args.dmo_host_path, columns=["mass"])["mass"].values)
+    print(f"hosts: hydro {len(logM_host):,}  DMO {len(logM_dmo):,} "
+          f"(>{MASS_THRESHOLD:.0e} Msun/h)")
+
+    edges = np.arange(np.log10(MASS_THRESHOLD),
+                      max(logM_host.max(), logM_dmo.max()) + args.dlogM,
+                      args.dlogM)
+    logM = 0.5 * (edges[1:] + edges[:-1])
+    n_host, _ = np.histogram(logM_host, bins=edges)
+    n_dmo, _ = np.histogram(logM_dmo, bins=edges)
+    n_cen, _ = np.histogram(logM_gal[~is_sat], bins=edges)
+    n_sat, _ = np.histogram(logM_gal[is_sat], bins=edges)
+
+    def _occ(num, den):
+        out = np.full(len(num), np.nan)
+        ok = den > 0
+        out[ok] = num[ok] / den[ok]
+        return out
+
+    ncen, nsat = _occ(n_cen, n_host), _occ(n_sat, n_host)
+    ncen_dmo, nsat_dmo = _occ(n_cen, n_dmo), _occ(n_sat, n_dmo)
+
+    # Meff / fsat by direct galaxy sum -- no mass-function integral involved.
+    Meff = float(np.average(10.0**logM_gal[~is_sat]))
+    Meff_all = float(np.average(10.0**logM_gal))
+    fsat = float(is_sat.mean())
+
+    print(f"\n{'logM':>6} {'N_host':>9} {'N_cen':>8} {'N_sat':>8} "
+          f"{'<Ncen>':>9} {'<Nsat>':>9}")
+    for i in np.where(n_host > 0)[0]:
+        print(f"{logM[i]:6.2f} {n_host[i]:9d} {n_cen[i]:8d} {n_sat[i]:8d} "
+              f"{ncen[i]:9.4f} {nsat[i]:9.4f}")
+    print(f"\npeak <Ncen> = {np.nanmax(ncen):.4f} at "
+          f"logM = {logM[np.nanargmax(ncen)]:.2f}")
+    print(f"Meff(cen) = {Meff:.3e}   Meff(all) = {Meff_all:.3e}   "
+          f"fsat = {fsat:.4f}")
+    print(f"DMO denominator instead of hydro: peak <Ncen> = "
+          f"{np.nanmax(ncen_dmo):.4f}  ({100*(np.nanmax(ncen_dmo)/np.nanmax(ncen)-1):+.1f}%)")
+
+    print("\n--- normalisation caveats when comparing to a chain posterior ---")
+    print("  1. The fits target ngal = 2.3e-4, ten times below this sample's "
+          f"{ngal/LBOX**3:.2e}: Ac,As are divided by 10 by convention and "
+          "DeltaSigma/wgg only see the Ac/As ratio. Compare shapes at matched "
+          "ngal (or compare fsat and Meff), not absolute <N>.")
+    print("  2. This is measured against the *hydro* M200m function; the model "
+          "lives on the DMO one. That is the difference quoted just above.")
+
+    out = args.output
+    np.savez(out, logM=logM, logM_edges=edges, n_host=n_host, n_dmo=n_dmo,
+             n_cen=n_cen, n_sat=n_sat, ncen=ncen, nsat=nsat,
+             ncen_dmo=ncen_dmo, nsat_dmo=nsat_dmo,
+             ngal=ngal / LBOX**3, fsat=fsat, Meff_cen=Meff, Meff_all=Meff_all)
+    print(f"\nSaved measured HOD -> {out}")
+
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+    M = 10.0**logM
+    for ax, occ, occ_dmo, title in [
+            (axes[0], ncen, ncen_dmo, r"$\langle N_{\rm cen}\rangle(M)$"),
+            (axes[1], nsat, nsat_dmo, r"$\langle N_{\rm sat}\rangle(M)$")]:
+        ax.plot(M, occ, "k.-", lw=1.8, label="hydro truth (hydro halo MF)")
+        ax.plot(M, occ_dmo, color="tab:gray", ls="--", lw=1.2,
+                label="same galaxies / DMO halo MF")
+        ax.set_xscale("log"); ax.set_yscale("log")
+        ax.set_xlabel(r"$M_{\rm 200m}\;[M_\odot/h]$")
+        ax.set_ylabel(title)
+        ax.grid(alpha=0.3, which="both", ls=":")
+
+    if args.chain_bestfits:
+        d = np.load(args.chain_bestfits)
+        logM_fit = d["logM_bins"]
+        for key in [k for k in d.files if k.endswith("_ncen_med")]:
+            pre = key[:-9]
+            # The chain HOD is normalised to its own ngal; rescale it onto the
+            # measured ngal so the *shapes* are on the same axes (caveat 1).
+            scale = (ngal / LBOX**3) / float(d[f"{pre}_ngal"])
+            axes[0].plot(10.0**logM_fit, scale * d[key], lw=1.5,
+                         label=f"{pre} (x{scale:.1f})")
+            axes[1].plot(10.0**logM_fit, scale * d[f"{pre}_nsat_med"], lw=1.5,
+                         label=f"{pre} (x{scale:.1f})")
+            print(f"  {pre}: fsat = {float(d[f'{pre}_fsat']):.4f} "
+                  f"(truth {fsat:.4f})   Meff = {float(d[f'{pre}_Meff']):.3e} "
+                  f"(truth {Meff:.3e})")
+    for ax in axes:
+        ax.legend(fontsize=7)
+        ax.set_ylim(1e-4, 20)
+    fig.suptitle("NISP truth HOD in the Flamingo hydro box", fontsize=13)
+    fig.tight_layout()
+    plot_path = os.path.splitext(out)[0] + ".png"
+    fig.savefig(plot_path, dpi=150)
+    print(f"Saved HOD plot -> {plot_path}")
 
 
 def main():
     args = parse_args()
+
+    if args.hod:
+        default_out = os.path.join(os.path.dirname(REF_PATH),
+                                   "hydro_measured_data_vector.npz")
+        if args.output == default_out:
+            args.output = os.path.join(os.path.dirname(REF_PATH),
+                                       "hydro_measured_hod.npz")
+        measure_hod(args)
+        return
 
     # ---- cosmology (RHO_M, RSD factor) -------------------------------------
     cosmo = Cosmology(COSMO_PARAMS, mass_function="Tinker08",
