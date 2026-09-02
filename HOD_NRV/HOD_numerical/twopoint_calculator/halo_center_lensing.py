@@ -115,8 +115,9 @@ def compute_xigm_at_position(
 _shared = {}
 
 
-def _process_batch_prequeried(halo_indices):
+def _process_batch_prequeried(task):
     """Worker: compute xi_gm + DeltaSigma for halos with pre-queried indices."""
+    batch_id, halo_indices = task
     s = _shared
     particle_positions = s['particle_positions']
     halo_positions = s['halo_positions']
@@ -161,12 +162,13 @@ def _process_batch_prequeried(halo_indices):
         results[k] = calc.compute_deltasigma_averaged(rp_bins)
 
     if tabulate:
-        return results, xi_sum, xi_count
-    return results
+        return batch_id, results, xi_sum, xi_count
+    return batch_id, results
 
 
-def _process_batch_with_query(halo_indices):
+def _process_batch_with_query(task):
     """Worker: query KD-tree + compute xi_gm + DeltaSigma for halos."""
+    batch_id, halo_indices = task
     s = _shared
     particle_positions = s['particle_positions']
     halo_positions = s['halo_positions']
@@ -222,8 +224,8 @@ def _process_batch_with_query(halo_indices):
             ptr += 1
 
     if tabulate:
-        return results, xi_sum, xi_count
-    return results
+        return batch_id, results, xi_sum, xi_count
+    return batch_id, results
 
 
 class HaloCenterLensingCache:
@@ -649,21 +651,48 @@ def precompute_halo_center_lensing(
         print(f"  Computing xi_gm + DeltaSigma ({n_halos} halos, n_workers={n_workers})...")
     t0 = time.time()
 
+    # Many small batches rather than one per worker. Splitting into exactly
+    # n_workers giant batches makes pool.map wait on the slowest one, and a
+    # mass-ordered catalogue hands a single worker every massive halo -- the
+    # most expensive ones, since cost scales with the neighbour count. Finer
+    # chunks let the pool rebalance, and imap_unordered reports completions
+    # as they land: without that this phase is silent for ~20h, so a stall is
+    # indistinguishable from work (job 57402361 spent a 24h allocation before
+    # anyone could tell it was going to overrun).
     all_indices = np.arange(n_halos)
-    batches = [arr.tolist() for arr in np.array_split(all_indices, n_workers)]
+    splits = [arr for arr in np.array_split(all_indices, min(n_halos, n_workers * 32))
+              if len(arr)]
+    batches = list(enumerate(arr.tolist() for arr in splits))
+    n_batches = len(batches)
 
+    ordered = [None] * n_batches
+    if tabulate:
+        xi_sum = np.zeros((n_bins, len(bins_comp) - 1))
+        xi_count = np.zeros(n_bins)
+
+    n_done = 0
+    t_report = t0
     ctx = mp.get_context('fork')
     with ctx.Pool(n_workers) as pool:
-        results = pool.map(worker_fn, batches)
+        for out in pool.imap_unordered(worker_fn, batches):
+            ordered[out[0]] = out[1]
+            if tabulate:
+                xi_sum += out[2]
+                xi_count += out[3]
+            n_done += 1
+            elapsed = time.time() - t0
+            if verbose and (n_done == n_batches or time.time() - t_report >= 300):
+                frac = n_done / n_batches
+                print(f"    {n_done}/{n_batches} batches ({100 * frac:.1f}%), "
+                      f"{elapsed / 60:.1f} min elapsed, "
+                      f"~{elapsed / frac / 60:.1f} min projected total",
+                      flush=True)
+                t_report = time.time()
 
+    all_deltasigma = np.vstack(ordered)
     if tabulate:
-        all_deltasigma = np.vstack([r[0] for r in results])
-        xi_sum = np.sum([r[1] for r in results], axis=0)
-        xi_count = np.sum([r[2] for r in results], axis=0)
         xi_gm_bins = np.where(xi_count[:, None] > 0,
                               xi_sum / np.maximum(xi_count, 1)[:, None], 0.0)
-    else:
-        all_deltasigma = np.vstack(results)
 
     t_phase3 = time.time() - t0
     if verbose:
