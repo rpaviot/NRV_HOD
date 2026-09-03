@@ -14,9 +14,13 @@ Data: Flamingo L1000N1800
 """
 
 import argparse
-import ctypes
+import atexit
 import gc
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
 import time
 import numpy as np
 import pandas as pd
@@ -55,6 +59,8 @@ def parse_args():
                         "B_cent/B_sat fit convention.")
     p.add_argument("--n_logM_bins", type=int, default=40)
     p.add_argument("--n_fI_bins", type=int, default=8)
+    p.add_argument("--_dump_inputs", default=None,
+                   help=argparse.SUPPRESS)
     p.add_argument("--mass_weight", action="store_true",
                    help="Weight particles by their 'mass' column. Required "
                         "for a hydro particle set (DM/gas/star masses differ "
@@ -112,17 +118,15 @@ def _rss_gb() -> float:
         return float("nan")
 
 
-# ============================================================================
-# Main
-# ============================================================================
 
-def main():
-    args = parse_args()
-    print("=" * 60)
-    print("Precompute Halo-Center Lensing Cache")
-    print("=" * 60)
+def _dump_inputs(args, outdir):
+    """Load particles and halos, write them to `outdir`, and exit.
 
-    # --- Load particles directly: only x,y,z, then subsample and free full array ---
+    Runs as a child process launched by main(). Everything this touches --
+    pyarrow's decode pools, JAX's XLA backend (pulled in by HaloOccupation),
+    and the ~17 GB the parquet decode never returns to the OS -- dies with the
+    process instead of being carried into phase 3's fork(). See main().
+    """
     cols = ['x', 'y', 'z'] + (['mass'] if args.mass_weight else [])
     print(f"\nLoading particle catalog ({','.join(cols)})...")
     df_part = pd.read_parquet(args.particle_path, columns=cols)
@@ -142,40 +146,22 @@ def main():
         masses_part_full if keep is None else masses_part_full[keep])
     # Apply periodic boundary correction (mirrors HaloOccupation's treatment)
     positions_part_sub = (positions_part_sub + Lbox) % Lbox
-    n_sub = len(positions_part_sub)
     del positions_part_full, masses_part_full, keep
     gc.collect()
 
-    # Shrink the parent before phase 3 forks. pyarrow's memory pool keeps the
-    # arenas it used to decode the parquet instead of returning them to the OS,
-    # so dropping the DataFrame leaves RSS tens of GB high even though only a
-    # few GB of arrays are still live. Forking 30 workers off that footprint is
-    # what hung jobs 57402361 and 57598215 (both silent at the fork for their
-    # whole allocation); the identical code forked cleanly with a 2% particle
-    # subsample (job 57605010). Release the pool and hand the arenas back.
-    _rss_before = _rss_gb()
-    try:
-        import pyarrow as pa
-        pa.default_memory_pool().release_unused()
-    except Exception:
-        pass
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
-    gc.collect()
-    print(f"  parent RSS: {_rss_before:.1f} -> {_rss_gb():.1f} GB "
-          f"(released before fork)")
     if masses_part_sub is not None:
         print(f"  mass-weighted: m in [{masses_part_sub.min():.3e}, "
               f"{masses_part_sub.max():.3e}] Msun/h, "
-              f"ratio {masses_part_sub.max()/masses_part_sub.min():.1f}")
+              f"ratio {masses_part_sub.max() / masses_part_sub.min():.1f}")
+    print(f"  downsampled: {len(positions_part_sub):,} "
+          f"({args.particle_fraction * 100:.0f}%)")
 
-    print(f"\nParticle downsampling:")
-    print(f"  Full:         {n_full:,}")
-    print(f"  Downsampled:  {n_sub:,} ({args.particle_fraction*100:.0f}%)")
+    np.save(os.path.join(outdir, "positions_part.npy"), positions_part_sub)
+    if masses_part_sub is not None:
+        np.save(os.path.join(outdir, "masses_part.npy"), masses_part_sub)
+    del positions_part_sub, masses_part_sub
+    gc.collect()
 
-    # --- Load halos via HaloOccupation (no particle data) ---
     print("\nLoading halo catalog...")
     df_halo = pd.read_parquet(args.halo_path)
     print(f"  {len(df_halo)} halos loaded")
@@ -200,13 +186,81 @@ def main():
         do_test=False,
     )
 
-    halo_positions = np.array(halo.positions)
-    halo_logM = np.array(halo.logM) if args.tabulate else None
-    halo_fI = np.array(halo.fE) if use_ab else None
-    RHO_M = halo.RHO_M
-    rsd_axis = halo.rsd_axis
-    del halo, df_halo
-    gc.collect()
+    np.save(os.path.join(outdir, "halo_positions.npy"), np.asarray(halo.positions))
+    if args.tabulate:
+        np.save(os.path.join(outdir, "halo_logM.npy"), np.asarray(halo.logM))
+    if use_ab:
+        np.save(os.path.join(outdir, "halo_fI.npy"), np.asarray(halo.fE))
+    np.savez(os.path.join(outdir, "scalars.npz"),
+             RHO_M=halo.RHO_M, rsd_axis=halo.rsd_axis, n_full=n_full)
+    print(f"  inputs written to {outdir}")
+
+
+# ============================================================================
+# Main
+# ============================================================================
+
+def main():
+    args = parse_args()
+
+    if args._dump_inputs:
+        _dump_inputs(args, args._dump_inputs)
+        return
+
+    print("=" * 60)
+    print("Precompute Halo-Center Lensing Cache")
+    print("=" * 60)
+
+    # Load in a throwaway child, then memory-map what it wrote.
+    #
+    # Phase 3 forks 30 workers, and fork() clones only the calling thread: a
+    # lock held by any other thread at that instant is inherited locked with no
+    # owner, so the child hangs on its first malloc. pyarrow's decode pools and
+    # JAX's XLA backend both leave threads alive for the life of the process,
+    # and the decode leaves ~17 GB that pool-releasing does not hand back
+    # (measured: "19.1 -> 19.1 GB"). Jobs 57402361, 57598215, 57612102 and
+    # 57618410 all died silently at that fork -- only 53344937 ever got through,
+    # and capping every thread pool at 1 did not help either.
+    #
+    # Letting a child do the loading and exit returns its threads and its memory
+    # to the OS, so the parent reaches the fork single-threaded and small.
+    # ~2 GB of .npy at 25% particles: prefer node-local TMPDIR, else sit beside
+    # the output (a real filesystem) rather than risk a small /tmp.
+    scratch_root = os.environ.get("TMPDIR") or os.path.dirname(os.path.abspath(args.output))
+    scratch = tempfile.mkdtemp(prefix="hclc_inputs_", dir=scratch_root)
+    atexit.register(shutil.rmtree, scratch, ignore_errors=True)
+
+    print(f"\nLoading inputs in a child process (scratch: {scratch})...")
+    t_load = time.perf_counter()
+    subprocess.run(
+        [sys.executable, "-u", os.path.abspath(__file__), *sys.argv[1:],
+         "--_dump_inputs", scratch],
+        check=True,
+    )
+    print(f"  child exited after {time.perf_counter() - t_load:.1f}s; "
+          f"its threads and decode memory are gone")
+
+    def _mm(name):
+        path = os.path.join(scratch, name)
+        return np.load(path, mmap_mode="r") if os.path.exists(path) else None
+
+    positions_part_sub = _mm("positions_part.npy")
+    masses_part_sub = _mm("masses_part.npy")
+    halo_positions = _mm("halo_positions.npy")
+    halo_logM = _mm("halo_logM.npy")
+    halo_fI = _mm("halo_fI.npy")
+
+    scal = np.load(os.path.join(scratch, "scalars.npz"))
+    RHO_M = float(scal["RHO_M"])
+    rsd_axis = scal["rsd_axis"].item()
+    n_full = int(scal["n_full"])
+    n_sub = len(positions_part_sub)
+
+    print(f"\nParticle downsampling:")
+    print(f"  Full:         {n_full:,}")
+    print(f"  Downsampled:  {n_sub:,} ({args.particle_fraction * 100:.0f}%)")
+    print(f"  Halos:        {len(halo_positions):,}")
+    print(f"  parent RSS before fork: {_rss_gb():.2f} GB")
 
     # --- Precompute (GC disabled to avoid COW on Python object headers in workers) ---
     print(f"\nPrecomputing DeltaSigma at {len(halo_positions)} halo centers...")
