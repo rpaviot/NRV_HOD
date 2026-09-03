@@ -14,7 +14,9 @@ Data: Flamingo L1000N1800
 """
 
 import argparse
+import ctypes
 import gc
+import os
 import time
 import numpy as np
 import pandas as pd
@@ -100,6 +102,16 @@ def subsample_indices(n, fraction, seed):
     return np.sort(rng.choice(n, n_keep, replace=False))
 
 
+
+def _rss_gb() -> float:
+    """Resident set size of this process, in GB."""
+    try:
+        with open(f"/proc/{os.getpid()}/statm") as fh:
+            return int(fh.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1e9
+    except Exception:
+        return float("nan")
+
+
 # ============================================================================
 # Main
 # ============================================================================
@@ -133,6 +145,27 @@ def main():
     n_sub = len(positions_part_sub)
     del positions_part_full, masses_part_full, keep
     gc.collect()
+
+    # Shrink the parent before phase 3 forks. pyarrow's memory pool keeps the
+    # arenas it used to decode the parquet instead of returning them to the OS,
+    # so dropping the DataFrame leaves RSS tens of GB high even though only a
+    # few GB of arrays are still live. Forking 30 workers off that footprint is
+    # what hung jobs 57402361 and 57598215 (both silent at the fork for their
+    # whole allocation); the identical code forked cleanly with a 2% particle
+    # subsample (job 57605010). Release the pool and hand the arenas back.
+    _rss_before = _rss_gb()
+    try:
+        import pyarrow as pa
+        pa.default_memory_pool().release_unused()
+    except Exception:
+        pass
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+    gc.collect()
+    print(f"  parent RSS: {_rss_before:.1f} -> {_rss_gb():.1f} GB "
+          f"(released before fork)")
     if masses_part_sub is not None:
         print(f"  mass-weighted: m in [{masses_part_sub.min():.3e}, "
               f"{masses_part_sub.max():.3e}] Msun/h, "
