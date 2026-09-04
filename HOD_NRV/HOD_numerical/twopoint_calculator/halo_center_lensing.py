@@ -115,6 +115,34 @@ def compute_xigm_at_position(
 _shared = {}
 
 
+def _shell_sums(r, w, s):
+    """Sum particles (or their masses) into the comparison shells.
+
+    bins_comp is geomspace by construction, so the shell index is analytic --
+    floor((log r - log r0) / dlog) -- and one bincount finishes the job.
+    np.histogram cannot know that: handed explicit edges it sorts every
+    neighbour list, and argsorts it when weights are given, which at ~1.3M
+    neighbours per halo costs 67 ms against 4 ms here. Falls back to
+    np.histogram if a caller supplies bins that are not log-uniform.
+    """
+    if s['bin_inv_dlog'] is None:
+        counts, _ = np.histogram(r, bins=s['bins_comp'], weights=w)
+        return counts
+
+    n = s['n_comp_bins']
+    with np.errstate(divide='ignore'):
+        f = (np.log(r) - s['bin_log_lo']) * s['bin_inv_dlog']
+    # r == 0 gives -inf and r < bins_comp[0] gives f < 0; both fail this
+    # comparison, so nothing infinite ever reaches the cast. For f >= 0 the
+    # cast truncates towards zero, which is the floor. r never exceeds
+    # search_radius = bins_comp[-1], and the value that lands exactly on it
+    # belongs in the last shell -- np.histogram closes the final bin too.
+    keep = f >= 0.0
+    i = f[keep].astype(np.int64)
+    np.minimum(i, n - 1, out=i)
+    return np.bincount(i, weights=None if w is None else w[keep], minlength=n)
+
+
 def _process_batch_prequeried(task):
     """Worker: compute xi_gm + DeltaSigma for halos with pre-queried indices."""
     batch_id, halo_indices = task
@@ -151,7 +179,7 @@ def _process_batch_prequeried(task):
             delta -= Lbox * np.round(delta / Lbox)
             r = np.sqrt(np.einsum('ij,ij->i', delta, delta))
             w = None if particle_masses is None else particle_masses[idx]
-            counts, _ = np.histogram(r, bins=bins_comp, weights=w)
+            counts = _shell_sums(r, w, s)
             xi_gm = (counts / shell_volumes / n_mean) - 1.0
 
         if tabulate:
@@ -212,7 +240,7 @@ def _process_batch_with_query(task):
                 delta -= Lbox * np.round(delta / Lbox)
                 r = np.sqrt(np.einsum('ij,ij->i', delta, delta))
                 w = None if particle_masses is None else particle_masses[idx]
-                counts, _ = np.histogram(r, bins=bins_comp, weights=w)
+                counts = _shell_sums(r, w, s)
                 xi_gm = (counts / shell_volumes / n_mean) - 1.0
 
             if tabulate:
@@ -482,6 +510,7 @@ def precompute_halo_center_lensing(
     verbose: bool = True,
     n_workers: int = -1,
     prequery_all: bool = False,
+    checkpoint_dir: Optional[str] = None,
     chi_max: float = 100.0,
     halo_logM: Optional[np.ndarray] = None,
     halo_fI: Optional[np.ndarray] = None,
@@ -529,6 +558,12 @@ def precompute_halo_center_lensing(
         via fork COW. Uses more RAM (~18 GB for downsampled case).
         If False (Mode 2), each worker queries the shared KD-tree independently
         for its halos. Lower RAM, slightly less efficient KD-tree queries.
+    checkpoint_dir : str, optional
+        Directory for per-batch phase-3 checkpoints. Each batch is written as
+        it completes and read back on a rerun with the same directory, so a
+        walltime kill costs only the batches in flight. The batch split
+        depends on n_halos and n_workers; a rerun that changes either is
+        rejected rather than silently resumed against a different split.
     chi_max : float, default=100.0
         Maximum line-of-sight distance for the Sigma integral [Mpc/h]
     halo_logM : np.ndarray, optional, shape (N_halos,)
@@ -610,8 +645,18 @@ def precompute_halo_center_lensing(
             print(f"  Tabulating xi_gm in {n_bins} bins "
                   f"({n_logM_bins} logM x {n_fI_bins if halo_fI is not None else 1} fI)")
 
+    # Precompute the analytic shell index for _shell_sums. Uniform in log r
+    # is what geomspace gives; anything else falls back to np.histogram.
+    log_bins = np.log(bins_comp)
+    dlog = np.diff(log_bins)
+    log_uniform = bool(np.all(np.isfinite(log_bins))
+                       and np.allclose(dlog, dlog[0], rtol=1e-12, atol=0.0))
+
     _shared.update({
         'particle_positions': particle_positions,
+        'n_comp_bins': len(bins_comp) - 1,
+        'bin_log_lo': log_bins[0],
+        'bin_inv_dlog': (1.0 / dlog[0]) if log_uniform else None,
         'particle_masses': particle_masses,
         'halo_positions': halo_positions,
         'bins_comp': bins_comp,
@@ -670,22 +715,81 @@ def precompute_halo_center_lensing(
         xi_sum = np.zeros((n_bins, len(bins_comp) - 1))
         xi_count = np.zeros(n_bins)
 
-    n_done = 0
+    # Checkpoint each batch as it lands. This phase runs for days, holds
+    # everything in memory until the end, and a walltime kill therefore threw
+    # away the whole allocation -- twice. Batches are independent, so a
+    # completed one is worth keeping on its own. ~2.5 MB each.
+    def _ckpt_path(bid):
+        return os.path.join(checkpoint_dir, f"batch_{bid:06d}.npz")
+
+    pending = batches
+    if checkpoint_dir is not None:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        stamp = {'n_halos': n_halos, 'n_batches': n_batches,
+                 'n_rp_bins': n_rp_bins, 'n_bins': n_bins if tabulate else 0}
+        manifest = os.path.join(checkpoint_dir, "manifest.npz")
+        if os.path.exists(manifest):
+            prev = np.load(manifest)
+            bad = {k: (int(prev[k]), v) for k, v in stamp.items()
+                   if k in prev and int(prev[k]) != v}
+            if bad:
+                raise ValueError(
+                    f"checkpoint_dir {checkpoint_dir} was written by a "
+                    f"different run ({bad}, as saved vs now). Batch splits "
+                    f"depend on n_halos and n_workers, so resuming across a "
+                    f"change would mix incompatible halo ranges. Use a fresh "
+                    f"directory or restore the original settings.")
+        else:
+            np.savez(manifest, **stamp)
+
+        pending = []
+        for task in batches:
+            path = _ckpt_path(task[0])
+            if not os.path.exists(path):
+                pending.append(task)
+                continue
+            try:
+                with np.load(path) as ck:
+                    ordered[task[0]] = ck['results']
+                    if tabulate:
+                        xi_sum += ck['xi_sum']
+                        xi_count += ck['xi_count']
+            except Exception as exc:      # truncated by the kill mid-write
+                print(f"    discarding unreadable checkpoint {path}: {exc}")
+                ordered[task[0]] = None
+                pending.append(task)
+        if len(pending) < n_batches:
+            print(f"  resuming: {n_batches - len(pending)}/{n_batches} batches "
+                  f"read back from {checkpoint_dir}")
+
+    n_resumed = n_batches - len(pending)
+    n_done = n_resumed
+    proj = "projected total" if n_resumed == 0 else "projected for this run"
     t_report = t0
     ctx = mp.get_context('fork')
     with ctx.Pool(n_workers) as pool:
-        for out in pool.imap_unordered(worker_fn, batches):
+        for out in pool.imap_unordered(worker_fn, pending):
             ordered[out[0]] = out[1]
             if tabulate:
                 xi_sum += out[2]
                 xi_count += out[3]
+            if checkpoint_dir is not None:
+                path = _ckpt_path(out[0])
+                tmp = path + ".tmp"
+                payload = {'results': out[1]}
+                if tabulate:
+                    payload.update(xi_sum=out[2], xi_count=out[3])
+                with open(tmp, 'wb') as fh:   # a path would get .npz appended
+                    np.savez(fh, **payload)
+                os.replace(tmp, path)     # atomic: a kill leaves no half file
             n_done += 1
             elapsed = time.time() - t0
             if verbose and (n_done == n_batches or time.time() - t_report >= 300):
-                frac = n_done / n_batches
-                print(f"    {n_done}/{n_batches} batches ({100 * frac:.1f}%), "
+                frac = (n_done - n_resumed) / max(len(pending), 1)
+                print(f"    {n_done}/{n_batches} batches "
+                      f"({100 * n_done / n_batches:.1f}%), "
                       f"{elapsed / 60:.1f} min elapsed, "
-                      f"~{elapsed / frac / 60:.1f} min projected total",
+                      f"~{elapsed / frac / 60:.1f} min {proj}",
                       flush=True)
                 t_report = time.time()
 

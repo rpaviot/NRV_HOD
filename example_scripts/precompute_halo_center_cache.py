@@ -57,6 +57,11 @@ def parse_args():
                    help="AB environment column (e.g. fs_norm) for the fI "
                         "tabulation dimension; mapped as fE to match the "
                         "B_cent/B_sat fit convention.")
+    p.add_argument("--checkpoint_dir", default=None,
+                   help="Directory for per-batch phase-3 checkpoints. Rerun "
+                        "with the same value to resume a run that was cut "
+                        "short: completed batches are read back instead of "
+                        "recomputed. Costs ~2.5 GB at 25%% particles.")
     p.add_argument("--n_logM_bins", type=int, default=40)
     p.add_argument("--n_fI_bins", type=int, default=8)
     p.add_argument("--_dump_inputs", default=None,
@@ -240,21 +245,29 @@ def main():
     print(f"  child exited after {time.perf_counter() - t_load:.1f}s; "
           f"its threads and decode memory are gone")
 
-    def _mm(name):
+    # Read into RAM, not mmap_mode="r". The fork only ever needed the parent to
+    # be clean of foreign threads and pyarrow arenas, which the child already
+    # guarantees; ~2 GB of plain buffers costs the fork nothing. Mapping them
+    # instead made every worker fault its way through the file: job 57628352
+    # took 62.0s to build the KD-tree over data that took 28.8s in RAM
+    # (53344937), and phase 3 ran at 1.22 s/halo against 0.235 s/halo, with
+    # 1.3M random-row gathers per halo hitting the mapping.
+    def _read(name):
         path = os.path.join(scratch, name)
-        return np.load(path, mmap_mode="r") if os.path.exists(path) else None
+        return np.load(path) if os.path.exists(path) else None
 
-    positions_part_sub = _mm("positions_part.npy")
-    masses_part_sub = _mm("masses_part.npy")
-    halo_positions = _mm("halo_positions.npy")
-    halo_logM = _mm("halo_logM.npy")
-    halo_fI = _mm("halo_fI.npy")
+    positions_part_sub = _read("positions_part.npy")
+    masses_part_sub = _read("masses_part.npy")
+    halo_positions = _read("halo_positions.npy")
+    halo_logM = _read("halo_logM.npy")
+    halo_fI = _read("halo_fI.npy")
 
     scal = np.load(os.path.join(scratch, "scalars.npz"))
     RHO_M = float(scal["RHO_M"])
     rsd_axis = scal["rsd_axis"].item()
     n_full = int(scal["n_full"])
     n_sub = len(positions_part_sub)
+    shutil.rmtree(scratch, ignore_errors=True)
 
     print(f"\nParticle downsampling:")
     print(f"  Full:         {n_full:,}")
@@ -278,6 +291,7 @@ def main():
         verbose=True,
         n_workers=args.n_workers,
         prequery_all=False,
+        checkpoint_dir=args.checkpoint_dir,
         halo_logM=halo_logM,
         halo_fI=halo_fI,
         n_logM_bins=args.n_logM_bins,
