@@ -23,11 +23,16 @@ Public API
 """
 
 import gc
-from typing import Optional, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import numba
+
+
+def _radius_tag(R: float) -> str:
+    """Column suffix for a fixed smoothing radius: 0.5 -> 'R0p5'."""
+    return "R" + ("%g" % R).replace(".", "p").replace("-", "m")
 from numba import njit, prange
 from numpy import linalg as LA
 from scipy import stats
@@ -405,8 +410,17 @@ class AssemblyBiasEnvironment:
                                       r_min: float = 0.5,
                                       r_max: float = 6.0,
                                       dr: float = 0.25,
-                                      rvir_factor: float = 2.25) -> dict:
-        """Per-halo δ (and shear) at R = rvir_factor * r_vir via interpolation on a grid of R."""
+                                      rvir_factor: float = 2.25,
+                                      fixed_radii: Optional[Sequence[float]] = None) -> dict:
+        """Per-halo δ (and shear) at R = rvir_factor * r_vir via interpolation on a grid of R.
+
+        ``fixed_radii`` additionally extracts the same fields at a set of FIXED
+        smoothing scales. The grid over R is already built for the adaptive
+        interpolation, so each extra scale costs one interpolation and one
+        column — which makes a scan over R essentially free, and that matters
+        because the adaptive scale is only meaningful where the mesh resolves
+        it (cell = Lbox/Nmesh; a Gaussian at R < cell/2 filters nothing).
+        """
         R_arr = np.arange(r_min, r_max + dr / 2, dr).astype(np.float32)
         N_R = len(R_arr)
         N_halos = len(pos)
@@ -439,13 +453,28 @@ class AssemblyBiasEnvironment:
         t = (R_halo - R_arr[idx]) / (R_arr[idx + 1] - R_arr[idx])
         halo_idx = np.arange(N_halos)
         delta_rvir = (1 - t) * delta_grid[idx, halo_idx] + t * delta_grid[idx + 1, halo_idx]
-        del delta_grid
 
         results = {'delta_h': delta_rvir}
+
+        for R_fix in (fixed_radii or ()):
+            if not (R_arr[0] <= R_fix <= R_arr[-1]):
+                raise ValueError(f"fixed radius {R_fix} outside the grid "
+                                 f"[{R_arr[0]}, {R_arr[-1]}]")
+            j = int(np.clip(np.searchsorted(R_arr, R_fix) - 1, 0, N_R - 2))
+            tf = (R_fix - R_arr[j]) / (R_arr[j + 1] - R_arr[j])
+            tag = _radius_tag(R_fix)
+            results[f'delta_h_{tag}'] = ((1 - tf) * delta_grid[j]
+                                         + tf * delta_grid[j + 1])
+            if compute_shear:
+                results[f'qr2_{tag}'] = ((1 - tf) * qr2_grid[j]
+                                         + tf * qr2_grid[j + 1])
+            print(f"  fixed scale R = {R_fix} Mpc/h -> delta_h_{tag}")
+
         if compute_shear:
             qr2_rvir = (1 - t) * qr2_grid[idx, halo_idx] + t * qr2_grid[idx + 1, halo_idx]
-            del qr2_grid
             results['qr2'] = qr2_rvir
+            del qr2_grid
+        del delta_grid
         gc.collect()
 
         return results
@@ -460,7 +489,8 @@ class AssemblyBiasEnvironment:
                                          r_min: float = 0.5,
                                          r_max: float = 6.0,
                                          dr: float = 0.25,
-                                         rvir_factor: float = 2.25) -> dict:
+                                         rvir_factor: float = 2.25,
+                                         fixed_radii: Optional[Sequence[float]] = None) -> dict:
         """δ, q_R², and mass-binned rank-normalized (f_A, f_B) at halo positions."""
         if normalize_positions:
             pos = halo_positions.copy().astype(np.float32)
@@ -474,14 +504,14 @@ class AssemblyBiasEnvironment:
             deltak_base = self._compute_fourier_density(particle_positions, normalize_positions)
             ms = self.compute_multiscale_properties(
                 deltak_base, pos, halo_rvir, compute_shear,
-                r_min, r_max, dr, rvir_factor
+                r_min, r_max, dr, rvir_factor, fixed_radii
             )
             del deltak_base
             gc.collect()
             deltah = ms['delta_h']
-            results = {'delta_h': deltah}
-            if compute_shear:
-                results['qr2'] = ms['qr2']
+            results = dict(ms)
+            if not compute_shear:
+                results.pop('qr2', None)
             del ms
             gc.collect()
         else:
@@ -511,29 +541,39 @@ class AssemblyBiasEnvironment:
             _, _, bin_number = stats.binned_statistic(log_masses, log_masses,
                                                      statistic='count', bins=bins_mass)
 
-            delta_norm = np.zeros_like(deltah)
-            if compute_shear:
-                fs_norm = np.zeros_like(results['qr2'])
+            # Every raw field gets the same mass-binned normalisation, so the
+            # fixed-scale columns are directly comparable with delta_norm /
+            # fs_norm and can be dropped into an HOD as fE without further
+            # treatment. 'delta_h' -> 'delta_norm', 'qr2' -> 'fs_norm' keep
+            # their historical names; the fixed-scale ones carry the suffix.
+            raw_keys = [k for k in results
+                        if k.startswith('delta_h') or k.startswith('qr2')]
+
+            def _norm_name(k):
+                if k == 'delta_h':
+                    return 'delta_norm'
+                if k == 'qr2':
+                    return 'fs_norm'
+                return (k.replace('delta_h_', 'delta_norm_')
+                         .replace('qr2_', 'fs_norm_'))
+
+            normed = {}
+            for k in raw_keys:
+                normed[_norm_name(k)] = np.zeros_like(results[k])
 
             for n in range(len(bins_mass) - 1):
                 cond = bin_number == n + 1
                 if np.sum(cond) == 0:
                     continue
+                for k in raw_keys:
+                    sub = results[k][cond]
+                    if len(sub) != 0:
+                        normed[_norm_name(k)][cond] = \
+                            normalize_distribution(1 + sub)
 
-                subsample = deltah[cond]
-                if len(subsample) != 0:
-                    fdi = normalize_distribution(1 + subsample)
-                    delta_norm[cond] = fdi
-
-                if compute_shear:
-                    qri = results['qr2'][cond]
-                    if len(qri) != 0:
-                        fsi = normalize_distribution(1 + qri)
-                        fs_norm[cond] = fsi
-
-            results['delta_norm'] = delta_norm
-            if compute_shear:
-                results['fs_norm'] = fs_norm
+            results.update(normed)
+            print(f"  normalized {len(raw_keys)} field(s): "
+                  f"{', '.join(sorted(normed))}")
             del log_masses, bin_number, bins_mass
             gc.collect()
 
@@ -554,6 +594,7 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
                                      r_max: float = 6.0,
                                      dr: float = 0.25,
                                      rvir_factor: float = 2.25,
+                                     fixed_radii: Optional[Sequence[float]] = None,
                                      mass_bins: Union[int, np.ndarray] = 30,
                                      threads: int = 32) -> dict:
     """High-level wrapper: load halos/particles, compute (δ, q_R²) at halo positions, normalize."""
@@ -601,7 +642,8 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
         halo_rvir=halo_rvir,
         compute_shear=compute_shear,
         mass_bins=mass_bins,
-        r_min=r_min, r_max=r_max, dr=dr, rvir_factor=rvir_factor
+        r_min=r_min, r_max=r_max, dr=dr, rvir_factor=rvir_factor,
+        fixed_radii=fixed_radii
     )
     if isinstance(particle_positions, str):
         del particle_pos
