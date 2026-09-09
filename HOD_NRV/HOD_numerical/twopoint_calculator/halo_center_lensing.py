@@ -38,7 +38,8 @@ from typing import Dict, Optional, Tuple
 from scipy.spatial import cKDTree
 from scipy.interpolate import interp1d
 
-from HOD_NRV.utilsf.utils_functions import gauss_legendre_integration
+from HOD_NRV.utilsf.utils_functions import (gauss_legendre_integration,
+                                            SAT_RMAX_RVIR)
 from .standard_two_point_calculator import (
     compute_corr, DeltaSigmaCalculator, binavg_2D
 )
@@ -423,7 +424,7 @@ def satellite_radial_nodes(Rvir, conc, f_exp, tau, lambda_NFW,
     Mirrors NFW_jax sampling exactly: NFW component with Rs/lambda_NFW and
     c*lambda_NFW truncated at Rvir (inverse CDF on the same normalized
     radial grid as the sampler); exponential component
-    dN/dr ~ exp(-r/(tau*Rs)) truncated at 3*Rvir.
+    dN/dr ~ exp(-r/(tau*Rs)) truncated at SAT_RMAX_RVIR*Rvir.
 
     Rvir in Mpc/h. u_nodes/u_w are Gauss-Legendre nodes/weights on [0, 1];
     x_norm is the normalized radial grid.
@@ -437,7 +438,7 @@ def satellite_radial_nodes(Rvir, conc, f_exp, tau, lambda_NFW,
         cdf = cdf / cdf[-1]
         comps.append((np.interp(u_nodes, cdf, rbins), (1.0 - f_exp) * u_w))
     if f_exp > 0.0:
-        u_max = 1.0 - np.exp(-3.0 * Rvir / (tau * Rs))
+        u_max = 1.0 - np.exp(-SAT_RMAX_RVIR * Rvir / (tau * Rs))
         comps.append((-tau * Rs * np.log(1.0 - u_nodes * u_max), f_exp * u_w))
 
     r_all = np.concatenate([c[0] for c in comps])
@@ -983,7 +984,7 @@ class TabulatedDeltaSigma:
       is the miscentering convolution of Sigma with the projected
       satellite offset distribution. The radial profile (truncated NFW
       rescaled by lambda_NFW + exponential tail with f_exp, tau,
-      truncated at 3 Rvir) is analytic, so arbitrary profile parameters
+      truncated at SAT_RMAX_RVIR Rvir) is analytic, so arbitrary profile parameters
       are exact — no interpolation over profile parameters is needed
       (unlike TabCorr's spline over eta). The inverse-CDF quadrature
       mirrors NFW_jax sampling exactly, so the prediction is the
@@ -1070,7 +1071,7 @@ class TabulatedDeltaSigma:
         # ── Tabulate Sigma(R) per bin from mean xi_gm (rho_m units) ──
         r_centers = np.sqrt(cache.bins_comp[:-1] * cache.bins_comp[1:])
         xi = cache.xi_gm_bins
-        R_max = cache.rp_bins[-1] + 3.5 * self.Rvir_m.max()
+        R_max = cache.rp_bins[-1] + (SAT_RMAX_RVIR + 0.5) * self.Rvir_m.max()
         self.R_sigma = np.geomspace(5e-3, min(R_max, chi_max), n_sigma_grid)
 
         t_chi, w_chi = np.polynomial.legendre.leggauss(200)
@@ -1488,7 +1489,7 @@ class TabulatedDeltaSigma:
                 cdf = jnp.log1p(x) - x / (1.0 + x)
                 cdf = cdf / cdf[-1]
                 r_nfw = jnp.interp(j_u_nodes, cdf, j_x_norm * Rvir)
-                u_max = 1.0 - jnp.exp(-3.0 * Rvir / (tau * Rs))
+                u_max = 1.0 - jnp.exp(-SAT_RMAX_RVIR * Rvir / (tau * Rs))
                 r_exp = -tau * Rs * jnp.log1p(-j_u_nodes * u_max)
                 r_all = jnp.concatenate([r_nfw, r_exp])
                 w_r = jnp.concatenate([(1.0 - f_exp) * j_u_w, f_exp * j_u_w])

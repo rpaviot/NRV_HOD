@@ -7,6 +7,15 @@ from scipy.special import roots_legendre
 from functools import partial
 import pandas as pd
 
+# Outer truncation of the satellite exponential component, in units of Rvir.
+# The MC sampler (NFW_jax.sample_satellite_positions*) and the tabulated
+# predictor (halo_center_lensing.satellite_radial_nodes and its JAX twin) must
+# use the SAME value or the tabulated DeltaSigma stops being the expectation of
+# the population step. Rocher+23 apply no truncation at all; 4 Rvir keeps the
+# integral finite while reaching the 36.5% of measured satellites that sit
+# beyond Rvir.
+SAT_RMAX_RVIR = 4.0
+
 #Precision for integration.
 n_legendre = 200
 x_legendre, w_legendre = roots_legendre(n_legendre)
