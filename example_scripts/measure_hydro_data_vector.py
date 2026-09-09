@@ -210,6 +210,17 @@ def parse_args():
                    help="Mass-bin width the control permutes within. Narrow "
                         "enough that N(M) is preserved, wide enough that the "
                         "permutation has halos to work with.")
+    p.add_argument("--shuffle_within", nargs="+", default=[],
+                   metavar="COL",
+                   help="Halo columns to hold FIXED alongside mass when "
+                        "permuting the truth counts. Each one asks: if an HOD "
+                        "could depend on mass AND this property, how much of "
+                        "the measured assembly bias could it reach? The "
+                        "answer decides whether a given AB column is worth "
+                        "tabulating on at all.")
+    p.add_argument("--n_prop_bins", type=int, default=5,
+                   help="Quantiles of each --shuffle_within column, taken "
+                        "WITHIN each mass bin.")
     p.add_argument("--truth_profile", type=float, nargs=3,
                    metavar=("F_EXP", "TAU", "LAMBDA_NFW"),
                    default=(0.0, 5.0, 1.0),
@@ -462,8 +473,8 @@ def predict_truth_deltasigma(args):
     => the fault is upstream of the occupation, in the halo catalogue or the
     galaxy-halo link.
     """
-    halo_df = pd.read_parquet(args.hydro_host_path, columns=["x", "y", "z",
-                                                             "mass", "rvir"])
+    cols = ["x", "y", "z", "mass", "rvir"] + list(args.shuffle_within)
+    halo_df = pd.read_parquet(args.hydro_host_path, columns=cols)
     gal = pd.read_parquet(args.nisp_path, columns=["x", "y", "z", "type"])
     print(f"hosts: {len(halo_df):,}   galaxies: {len(gal):,}")
 
@@ -508,13 +519,19 @@ def predict_truth_deltasigma(args):
             f"halo row mismatch: HaloOccupation has {len(halo.logM):,} rows, "
             f"the parquet {n_halo:,} -- the per-halo counts cannot be aligned "
             f"with the cache.")
+    # Tolerance is set by float32: the catalogues store mass in single
+    # precision and HaloOccupation keeps logM in whatever dtype the column
+    # had, so a *correctly aligned* pair still differs by ~1e-5 dex. A
+    # permutation of 9M rows spanning logM 11-15 would differ by O(1) dex, so
+    # 1e-3 separates the two by three orders of magnitude either way.
     dmax = float(np.abs(np.asarray(halo.logM, dtype=np.float64) - logM_h).max())
-    if dmax > 1e-6:
+    if dmax > 1e-3:
         raise SystemExit(
-            f"halo ROW ORDER mismatch: max |logM difference| = {dmax:.4f} dex "
+            f"halo ROW ORDER mismatch: max |logM difference| = {dmax:.3e} dex "
             f"between the parquet and HaloOccupation -- every per-halo count "
             f"would land on the wrong halo.")
-    print(f"row alignment verified: max |dlogM| = {dmax:.2e} dex")
+    print(f"row alignment verified: max |dlogM| = {dmax:.2e} dex "
+          f"(float32 round-trip; a permutation would give O(1))")
     tab = TabulatedDeltaSigma(cache, halo)
     f_exp, tau, lambda_NFW = args.truth_profile
     print(f"satellite profile: f_exp={f_exp} tau={tau} lambda_NFW={lambda_NFW}")
@@ -583,6 +600,37 @@ def predict_truth_deltasigma(args):
         print(f"  mass-only chi2 = {chi2_shuf.mean():.2f} +/- "
               f"{chi2_shuf.std():.2f}  (truth {chi2_truth:.2f})")
 
+        # ---- conditional controls: mass AND one halo property held fixed --
+        # The mass-only control is the floor (no secondary information) and
+        # the truth is the ceiling (all of it). Permuting within (mass,
+        # property) cells asks how much of the gap a property recovers, which
+        # is exactly what an HOD that depends on that property could reach.
+        ladder = {}
+        for col in args.shuffle_within:
+            prop = np.asarray(halo_df[col].values, dtype=np.float64)
+            cells = []
+            for g in groups:
+                if len(g) < 10 * args.n_prop_bins:
+                    cells.append(g)
+                    continue
+                q = np.quantile(prop[g],
+                                np.linspace(0, 1, args.n_prop_bins + 1)[1:-1])
+                b = np.searchsorted(q, prop[g], side="right")
+                for k in range(args.n_prop_bins):
+                    sub = g[b == k]
+                    if len(sub) > 1:
+                        cells.append(sub)
+            ds_c = np.empty((args.n_shuffle, fitter.n_bins))
+            for r in range(args.n_shuffle):
+                rng = np.random.default_rng(2000 + r)
+                nc, ns = N_cen.copy(), N_sat.copy()
+                for c in cells:
+                    nc[c] = N_cen[rng.permutation(c)]
+                    ns[c] = N_sat[rng.permutation(c)]
+                ds_c[r], _ = _predict(nc, ns, f"mass+{col} {r + 1}")
+            ladder[col] = ds_c.mean(axis=0)
+            print(f"  mass+{col}: {len(cells):,} cells")
+
         ratio = ds_truth / ds_mean
         big = fitter.rp_obs > 3.0
         print(f"\n  {'rp':>8} {'truth':>12} {'mass-only':>12} "
@@ -599,13 +647,30 @@ def predict_truth_deltasigma(args):
         print("  The first number is what a mass-only HOD cannot buy; the "
               "second is what is left over once the true occupation is used.")
 
+        if ladder:
+            gap = (ds_truth - ds_mean)[big]
+            print(f"\n  --- how much of the gap each property recovers "
+                  f"(rp > 3) ---")
+            print(f"  {'property':>14} {'ratio to mass-only':>20} "
+                  f"{'fraction of truth':>19}")
+            for col, dsc in ladder.items():
+                rec = (dsc - ds_mean)[big]
+                frac = float(np.sum(rec) / np.sum(gap))
+                rat = float(np.mean(dsc[big] / ds_mean[big]))
+                print(f"  {col:>14} {rat:20.4f} {100 * frac:18.1f}%")
+            print("  100% means an HOD in (mass, that property) could reach "
+                  "the measured amplitude; ~0% means it is the wrong "
+                  "variable and no B_cent/B_sat on it will help.")
+
     out = args.output
     np.savez(out, rp=fitter.rp_obs, ds_obs=fitter.ds_obs, ds_truth=ds_truth,
              ds_shuffled=ds_shuf if ds_shuf is not None else np.zeros(0),
              N_cen=N_cen.astype(np.int32), N_sat=N_sat.astype(np.int32),
              chi2_truth=chi2_truth, logM=logM_h.astype(np.float32),
              shuffle_dlogM=args.shuffle_dlogM,
-             profile=np.asarray(args.truth_profile))
+             profile=np.asarray(args.truth_profile),
+             **{f"ds_cond_{c}": v for c, v in
+                (ladder.items() if args.n_shuffle > 0 else [])})
     print(f"\nSaved -> {out}")
 
 
