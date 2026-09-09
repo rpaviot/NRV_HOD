@@ -25,6 +25,7 @@ Usage (cluster):
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -520,12 +521,75 @@ def parse_args():
     p.add_argument("--rp_max_wgg", type=float, default=None)
     p.add_argument("--max_fsat", type=float, default=None)
     p.add_argument("--gaussian_ab", action="store_true")
+    p.add_argument("--predict", default=None, metavar="JSON",
+                   help="Skip sampling: evaluate the forward model at an "
+                        "EXPLICIT parameter set and print the per-bin "
+                        "comparison against the data. Takes a JSON dict, or a "
+                        "list of dicts each optionally carrying a \"label\". "
+                        "No ngal rescaling is applied -- the parameters are "
+                        "used as given -- and DeltaSigma depends only on the "
+                        "Ac/As ratio, so the divided-by-10 amplitude "
+                        "convention makes no difference here. Used to ask "
+                        "whether the model reproduces the data at the "
+                        "MEASURED truth occupation, which separates a "
+                        "forward-model error from a fitting artefact.")
     p.add_argument("--postprocess", action="store_true",
                    help="Skip sampling: load the saved chain_*.npz and "
                         "(re)compute Meff/fsat/chi2, plots, and the aggregate. "
                         "Use to recover the outputs when a run crashed in "
                         "post-processing after the chains were saved.")
     return p.parse_args()
+
+
+def predict_at(case_name, fit_case, halo, tab, args):
+    """Forward model at an explicit parameter set, against the data.
+
+    The chains answer "what parameters fit the data"; this answers the
+    complementary question, "does the model fit the data at the parameters we
+    independently know to be true". A model that misses the data at the
+    measured truth occupation has a forward-model error; one that matches it
+    there but is pulled elsewhere by the likelihood has a fitting problem.
+    """
+    specs = json.loads(args.predict)
+    if isinstance(specs, dict):
+        specs = [specs]
+
+    param_config = build_param_config(
+        fit_case, assembly_bias=case_name.endswith("_AB"),
+        gaussian_ab=args.gaussian_ab)
+
+    for rp_min in args.rp_min_values:
+        fitter = TabulatedFitter(
+            tabulated_ds=tab,
+            occupation_rescale=_make_rescale_occupation(halo, fit_case),
+            target_ngal=TARGET_NGAL, fit_case=fit_case,
+            data_path=args.data_path, rp_min=rp_min, rp_max=None,
+            param_config=param_config, Ac_fiducial=AC_FIDUCIAL,
+            ngal_anchor="mass_function",
+        )
+        print(f"\n  rp_min = {rp_min}: {fitter.n_bins} bins in "
+              f"[{fitter.rp_obs[0]:.3f}, {fitter.rp_obs[-1]:.2f}] Mpc/h")
+
+        for spec in specs:
+            spec = dict(spec)
+            label = spec.pop("label", "model")
+            rp_full, ds_full, info = tab.predict(spec)
+            sel = np.isin(np.round(rp_full, 8), np.round(fitter.rp_obs, 8))
+            ds = np.asarray(ds_full)[sel]
+            if len(ds) != fitter.n_bins:
+                raise SystemExit(
+                    f"bin mismatch: model {len(ds)} vs fitter "
+                    f"{fitter.n_bins}; the cache rp_bins and the data rp "
+                    f"binning have to agree")
+            resid = ds - fitter.ds_obs
+            chi2 = float(resid @ fitter.cov_inv @ resid)
+            _print_per_bin(label, fitter.rp_obs, fitter.ds_obs, ds,
+                           fitter.cov_inv)
+            print(f"  {label}: chi2 = {chi2:.2f} over {fitter.n_bins} bins "
+                  f"(chi2/N = {chi2 / fitter.n_bins:.3f}, no free parameters)")
+            print(f"  {label}: ngal = {info['ngal']:.4e}, "
+                  f"fsat = {info['fsat']:.4f}")
+            print(f"  {label}: params = {spec}")
 
 
 def main():
@@ -536,6 +600,15 @@ def main():
     if not cache.has_tabulation:
         raise SystemExit("Cache has no xi_gm tabulation — regenerate with "
                          "precompute_halo_center_cache.py --tabulate.")
+
+    if args.predict:
+        for case_name in names:
+            fit_case = FIT_CASE_OF[_base_name(case_name)]
+            print(f"\nLoading halo catalogue for case {case_name} ...")
+            halo = build_halo_occupation(fit_case, args.halo_path)
+            predict_at(case_name, fit_case, halo,
+                       TabulatedDeltaSigma(cache, halo), args)
+        return
 
     all_bestfits_arrays = {}
     rp_centers_saved = None
