@@ -625,7 +625,7 @@ def predict_truth_deltasigma(args):
         # the truth is the ceiling (all of it). Permuting within (mass,
         # property) cells asks how much of the gap a property recovers, which
         # is exactly what an HOD that depends on that property could reach.
-        ladder = {}
+        ladder, ladder_real = {}, {}
         for col in args.shuffle_within:
             prop = np.asarray(prop_df[col].values, dtype=np.float64)
             cells = []
@@ -649,6 +649,9 @@ def predict_truth_deltasigma(args):
                     ns[c] = N_sat[rng.permutation(c)]
                 ds_c[r], _ = _predict(nc, ns, f"mass+{col} {r + 1}")
             ladder[col] = ds_c.mean(axis=0)
+            ladder_real[col] = ds_c          # keep every realisation: the
+            # spread across them is the only honest error bar on the score,
+            # and without it a number above 100% cannot be told from noise
             print(f"  mass+{col}: {len(cells):,} cells")
 
         ratio = ds_truth / ds_mean
@@ -671,13 +674,21 @@ def predict_truth_deltasigma(args):
             gap = (ds_truth - ds_mean)[big]
             print(f"\n  --- how much of the gap each property recovers "
                   f"(rp > 3) ---")
-            print(f"  {'property':>14} {'ratio to mass-only':>20} "
-                  f"{'fraction of truth':>19}")
+            print(f"  {'property':>18} {'ratio to mass-only':>20} "
+                  f"{'fraction of truth':>24}")
             for col, dsc in ladder.items():
                 rec = (dsc - ds_mean)[big]
                 frac = float(np.sum(rec) / np.sum(gap))
                 rat = float(np.mean(dsc[big] / ds_mean[big]))
-                print(f"  {col:>14} {rat:20.4f} {100 * frac:18.1f}%")
+                # scatter over realisations, propagated to both numbers
+                per = ladder_real[col]
+                fr = np.array([float(np.sum((per[r] - ds_mean)[big])
+                                     / np.sum(gap)) for r in range(len(per))])
+                ra = np.array([float(np.mean(per[r][big] / ds_mean[big]))
+                               for r in range(len(per))])
+                n = max(len(per), 2)
+                print(f"  {col:>18} {rat:12.4f} +/-{ra.std(ddof=1)/np.sqrt(n):.4f} "
+                      f"{100 * frac:16.1f}% +/-{100*fr.std(ddof=1)/np.sqrt(n):.1f}%")
             print("  100% means an HOD in (mass, that property) could reach "
                   "the measured amplitude; ~0% means it is the wrong "
                   "variable and no B_cent/B_sat on it will help.")
@@ -690,7 +701,9 @@ def predict_truth_deltasigma(args):
              shuffle_dlogM=args.shuffle_dlogM,
              profile=np.asarray(args.truth_profile),
              **{f"ds_cond_{c}": v for c, v in
-                (ladder.items() if args.n_shuffle > 0 else [])})
+                (ladder.items() if args.n_shuffle > 0 else [])},
+             **{f"ds_cond_real_{c}": v for c, v in
+                (ladder_real.items() if args.n_shuffle > 0 else [])})
     print(f"\nSaved -> {out}")
 
 
