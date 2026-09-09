@@ -20,6 +20,7 @@ changing --halo_fraction / --particle_fraction / bin counts).
 """
 
 import argparse
+import json
 import os
 import time
 import numpy as np
@@ -76,6 +77,23 @@ def parse_args():
     p.add_argument("--jax", action="store_true",
                    help="Validate the pure-JAX predict/loglike (make_predict_jax"
                         " + build_batched_loglike) against the NumPy path")
+    p.add_argument("--direct", action="store_true",
+                   help="Validate an EXISTING cache against a direct "
+                        "galaxy x particle pair count. Unlike the default "
+                        "check, this shares nothing with the cache -- see "
+                        "run_direct_check.")
+    p.add_argument("--halo_path", default=HALO_PATH)
+    p.add_argument("--particle_path", default=PARTICLE_PATH)
+    p.add_argument("--params_json", default=None,
+                   help="HOD parameters for --direct, as JSON.")
+    p.add_argument("--ab_column", default=None,
+                   help="Map this column as fE (needed when the cache carries "
+                        "an fI tabulation dimension).")
+    p.add_argument("--chi_max", type=float, default=100.0)
+    p.add_argument("--particle_seed", type=int, default=42)
+    p.add_argument("--no_mass_weight", action="store_true",
+                   help="Count particles unweighted. The hydro particle set is "
+                        "multi-species, so this is a diagnostic only.")
     p.add_argument("--jax_n_points", type=int, default=64,
                    help="Random prior draws per case for --jax validation")
     p.add_argument("--n_logM_bins_wgg", type=int, default=24,
@@ -326,9 +344,142 @@ def run_wgg_check(args, halo, cases):
     print(f"OVERALL: {'PASS' if all_pass else 'FAIL'}")
 
 
+def run_direct_check(args):
+    """Validate an EXISTING cache against a direct galaxy x particle pair count.
+
+    The default cross-check above compares ``TabulatedDeltaSigma.predict``
+    with ``compute_galaxy_lensing_optimized``, and that pair shares the cache:
+    the "MC" side looks its central profiles up in the very same cache. The
+    halo-centre DeltaSigma values therefore cancel out of both sides, so that
+    test validates the occupation weighting and the satellite offset
+    convolution but is structurally incapable of catching an error in the
+    cache itself.
+
+    This mode closes that hole. It populates the box at a fixed HOD and
+    measures DeltaSigma with the standalone pycorr path -- the same
+    ``compute_galaxy_lensing`` call, mass weights, chi_max and bins_comp that
+    produced the measured data vector -- and compares against the cache's
+    prediction at the same parameters. Nothing is shared between the two
+    sides except the halo catalogue and the particles.
+    """
+    import pandas as pd
+    import pyarrow.parquet as pq
+    from HOD_NRV.HOD_numerical.HOD import HaloOccupation
+    from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import (
+        HaloCenterLensingCache, TabulatedDeltaSigma)
+    from HOD_NRV.HOD_numerical.twopoint_calculator.standard_two_point_calculator import (
+        compute_galaxy_lensing)
+
+    if not args.cache_path:
+        raise SystemExit("--direct needs --cache_path pointing at the cache "
+                         "under test")
+    cache = HaloCenterLensingCache.load(args.cache_path)
+    rp_bins = np.asarray(cache.rp_bins)
+    RHO_M_cache = float(cache.metadata.get("RHO_M", 0.0))
+    print(f"cache metadata: {dict(cache.metadata)}")
+
+    params = json.loads(args.params_json) if args.params_json else dict(BASE_PARAMS)
+    print(f"HOD under test: {params}")
+
+    print(f"\nLoading halo catalogue {args.halo_path} ...")
+    df = pd.read_parquet(args.halo_path)
+    print(f"  {len(df):,} halos")
+    if len(df) != len(cache.positions):
+        raise SystemExit(f"halo count {len(df):,} != cache {len(cache.positions):,}"
+                         " -- the cache must be the one built from this catalogue")
+
+    cmap = dict(COLUMN_MAPPING)
+    if args.ab_column:
+        cmap["fE"] = args.ab_column
+    halo = HaloOccupation(
+        cosmology=COSMO_PARAMS, zeff=ZEFF, Lbox=LBOX,
+        column_mapping=cmap, mass_definition=MASS_DEFINITION,
+        DataFrame=df, DataFrame_part=None,
+        assembly_bias=bool(args.ab_column), apply_rsd=False, do_test=False,
+        population_backend="numba",
+    )
+    halo.set_halo_model("ELG_mHMQ", elg_satellite=True)
+    if RHO_M_cache and abs(halo.RHO_M / RHO_M_cache - 1) > 1e-3:
+        raise SystemExit(f"RHO_M mismatch: halo {halo.RHO_M:.6e} vs cache "
+                         f"{RHO_M_cache:.6e} -- DeltaSigma is linear in it, so "
+                         f"this alone would fake an amplitude offset")
+    print(f"  RHO_M {halo.RHO_M:.6e} matches the cache")
+
+    # ---- particles, streamed so only the subsample is materialised ---------
+    print(f"\nStreaming particles from {args.particle_path} "
+          f"({args.particle_fraction:.1%}) ...")
+    rng = np.random.default_rng(args.particle_seed)
+    cols = ["x", "y", "z"] + ([] if args.no_mass_weight else ["mass"])
+    chunks = []
+    for batch in pq.ParquetFile(args.particle_path).iter_batches(
+            batch_size=5_000_000, columns=cols):
+        arr = np.column_stack([batch.column(c).to_numpy(zero_copy_only=False)
+                               for c in cols]).astype(np.float64)
+        if args.particle_fraction < 1.0:
+            arr = arr[rng.random(len(arr)) < args.particle_fraction]
+        chunks.append(arr)
+    part = np.concatenate(chunks); del chunks
+    pos_p = np.ascontiguousarray(part[:, :3])
+    w_p = None if args.no_mass_weight else np.ascontiguousarray(part[:, 3])
+    del part
+    print(f"  {len(pos_p):,} particles"
+          + ("" if w_p is None else " (mass-weighted)"))
+
+    # ---- tabulated prediction ----------------------------------------------
+    tab = TabulatedDeltaSigma(cache, halo)
+    rp, ds_tab, info = tab.predict(params)
+    print(f"\ntabulated: ngal {info['ngal']:.4e}, fsat {info['fsat']:.4f}")
+
+    # ---- direct measurement, N realisations --------------------------------
+    ds_mc, ngal_mc, fsat_mc = [], [], []
+    for i in range(args.n_real):
+        t0 = time.time()
+        halo.populate_haloes(params, random_seed=1000 + i)
+        pos_g = np.ascontiguousarray(np.asarray(halo.positions_gal),
+                                     dtype=np.float64)
+        _, ds_i = compute_galaxy_lensing(
+            pos_g, pos_p, LBOX, halo.rsd_axis, halo.RHO_M, rp_bins,
+            weights_part=w_p, chi_max=args.chi_max,
+            bins_comp=np.geomspace(5e-3, 120, 201))
+        ds_mc.append(np.asarray(ds_i))
+        ngal_mc.append(len(pos_g) / LBOX ** 3)
+        fsat_mc.append(float(halo.satellite_fraction))
+        print(f"  realisation {i+1}/{args.n_real}: {len(pos_g):,} galaxies, "
+              f"fsat {fsat_mc[-1]:.4f}  ({time.time()-t0:.0f}s)")
+    ds_mc = np.array(ds_mc)
+    mc = ds_mc.mean(axis=0)
+    se = (ds_mc.std(axis=0, ddof=1) / np.sqrt(args.n_real)
+          if args.n_real > 1 else np.full_like(mc, np.nan))
+
+    print(f"\ndirect: ngal {np.mean(ngal_mc):.4e}, fsat {np.mean(fsat_mc):.4f}")
+    print(f"\n{'rp':>9} {'direct':>11} {'tabulated':>11} {'tab/dir-1':>10} "
+          f"{'SE%':>7}")
+    dev = ds_tab / mc - 1.0
+    for j in range(len(rp)):
+        print(f"{rp[j]:9.3f} {mc[j]:11.4f} {ds_tab[j]:11.4f} "
+              f"{100*dev[j]:9.2f}% {100*se[j]/abs(mc[j]):7.2f}")
+    big = rp > 3.0
+    print(f"\nmax|dev| = {100*np.abs(dev).max():.2f}%   "
+          f"mean dev over rp>3 = {100*np.mean(dev[big]):+.2f}%")
+    print("The chains' model is 17% BELOW the measured data at rp>3. If the "
+          "deviation above is ~0, the cache is")
+    print("faithful and that 17% is physical; if it is ~-15%, the cache "
+          "itself is the problem.")
+
+    out = os.path.join(args.output_dir, "cache_direct_check.npz")
+    np.savez(out, rp=rp, ds_tab=ds_tab, ds_direct=mc, se=se, dev=dev,
+             ds_real=ds_mc, params=json.dumps(params),
+             cache_path=args.cache_path)
+    print(f"\nSaved -> {out}")
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
+
+    if args.direct:
+        run_direct_check(args)
+        return
 
     if args.jax:
         # float64 parity with the NumPy path; must precede any JAX array use
@@ -346,7 +497,7 @@ def main():
         column_mapping["fI"] = "fs_norm"
 
     print(f"Loading halo catalog ({args.halo_fraction:.0%} subsample)...")
-    df = pd.read_parquet(HALO_PATH)
+    df = pd.read_parquet(args.halo_path)
     rng = np.random.default_rng(42)
     keep = rng.random(len(df)) < args.halo_fraction
     df = df[keep].reset_index(drop=True)
@@ -362,7 +513,7 @@ def main():
         cosmology=COSMO_PARAMS, zeff=ZEFF, Lbox=LBOX,
         column_mapping=column_mapping, mass_definition=MASS_DEFINITION,
         DataFrame=df,
-        DataFrame_part=pd.read_parquet(PARTICLE_PATH) if need_particles else None,
+        DataFrame_part=pd.read_parquet(args.particle_path) if need_particles else None,
         assembly_bias=args.assembly_bias, apply_rsd=True, do_test=False,
         particle_fraction=args.particle_fraction,
         population_backend="numba", mass_function="Despali16",
