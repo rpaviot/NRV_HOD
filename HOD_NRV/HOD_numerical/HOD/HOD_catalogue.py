@@ -260,8 +260,7 @@ class HaloOccupation:
             test_satellites.run_all_tests()
 
     def set_halo_model(self, hod_type: str, conformity: bool = False,
-                       elg_satellite: bool = False, ab_method: str = "direct"
-):
+                       elg_satellite: bool = False, ab_method: str = "mass"):
         """
         Configure the Halo Occupation Distribution model.
 
@@ -282,6 +281,19 @@ class HaloOccupation:
             When True, uses: <N_sat> = As * (M/M1)^alpha * exp(-Mcut/M) * exp(-M/Mmax).
             Required dict_params keys: {"Ac", "Mmin", "sig_M", "As", "M1", "alpha", "Mcut", "Mmax"}.
             Ignored when conformity=True (conformity takes precedence).
+        ab_method : str, default="mass"
+            How the assembly-bias property enters the occupation:
+            - "mass"   : shift the mass thresholds, logMmin += A_cent*fI +
+              B_cent*fE and logM1 += A_sat*fI + B_sat*fE. Uses the CONTINUOUS
+              ranking, so A/B are in dex.
+            - "direct" : Hearin-style step. fI/fE are replaced by their SIGN,
+              so only which side of the median a halo falls on survives and
+              the ranking is discarded. That both caps how much of a real
+              assembly-bias signal the parametrisation can reach and imprints
+              the smoothing scale of the environment field on the prediction.
+            - "variant": paper Eq. 12-13 with continuous fE.
+            "mass" matches the default of the underlying Occupation; this
+            argument used to default to "direct" and silently override it.
 
         Examples
         --------
