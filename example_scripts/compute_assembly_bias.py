@@ -74,6 +74,7 @@ results = compute_assembly_bias_properties(
     mass_column="mass",
     mass_bins=bins_mass,
     rvir_column="rvir",       # column name in host_catalogue.parquet
+    rvir_scale=1e-3,          # that column is kpc/h; r_min/r_max are Mpc/h
     rvir_factor=RVIR_FACTOR,
     r_min=R_MIN,
     r_max=R_MAX,

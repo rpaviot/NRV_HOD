@@ -426,7 +426,15 @@ class AssemblyBiasEnvironment:
                 qr2_grid[i] = self.compute_shear_field(deltak_R, pos)
             del deltak_R
 
-        R_halo = np.clip(rvir_factor * halo_rvir, R_arr[0], R_arr[-1]).astype(np.float32)
+        R_want = rvir_factor * halo_rvir
+        R_halo = np.clip(R_want, R_arr[0], R_arr[-1]).astype(np.float32)
+        n_clip = int(((R_want < R_arr[0]) | (R_want > R_arr[-1])).sum())
+        print(f"  R = {rvir_factor} x Rvir: median {np.median(R_want):.3f} "
+              f"Mpc/h, {100 * n_clip / len(R_want):.1f}% clipped to "
+              f"[{R_arr[0]}, {R_arr[-1]}]")
+        if n_clip > 0.5 * len(R_want):
+            print("  WARNING: most halos clipped -- is rvir in kpc/h? "
+                  "pass rvir_scale=1e-3")
         idx = np.clip(np.searchsorted(R_arr, R_halo) - 1, 0, N_R - 2)
         t = (R_halo - R_arr[idx]) / (R_arr[idx + 1] - R_arr[idx])
         halo_idx = np.arange(N_halos)
@@ -541,6 +549,7 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
                                      position_columns: Tuple[str, str, str] = ('x', 'y', 'z'),
                                      mass_column: str = 'mass',
                                      rvir_column: Optional[str] = None,
+                                     rvir_scale: float = 1.0,
                                      r_min: float = 0.5,
                                      r_max: float = 6.0,
                                      dr: float = 0.25,
@@ -562,7 +571,12 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
     ])
 
     halo_masses = df_halo[mass_column].values if mass_column in df_halo.columns else None
-    halo_rvir = df_halo[rvir_column].values if rvir_column is not None else None
+    # r_min/r_max/dr are Mpc/h; the host catalogues written by
+    # subhalo_catalogue.save_catalogues store rvir in kpc/h, so pass
+    # rvir_scale=1e-3 with those or every halo clips to r_max and the
+    # "adaptive 2.25 Rvir" smoothing silently becomes a fixed r_max.
+    halo_rvir = (df_halo[rvir_column].values * rvir_scale
+                 if rvir_column is not None else None)
     if isinstance(halo_catalogue, str):
         del df_halo
         gc.collect()
