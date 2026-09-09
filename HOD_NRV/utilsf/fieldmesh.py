@@ -623,14 +623,21 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
         gc.collect()
 
     if isinstance(particle_positions, str):
-        df_part = pd.read_parquet(particle_positions)
-        particle_pos = np.column_stack([
-            df_part[position_columns[0]].values,
-            df_part[position_columns[1]].values,
-            df_part[position_columns[2]].values
-        ])
-        del df_part
-        gc.collect()
+        # One column at a time, straight into a preallocated float32 array.
+        # These catalogues are ~233M rows of float64: reading the frame whole
+        # costs 9.3 GB for the five columns, and column_stack then makes a
+        # second float64 copy of three of them before the cast to float32 --
+        # ~15 GB of peak for 2.8 GB of data, on top of the mesh. Filling in
+        # place holds one column (1.9 GB) above the output.
+        particle_pos = None
+        for i, col in enumerate(position_columns):
+            v = pd.read_parquet(particle_positions, columns=[col])[col].values
+            if particle_pos is None:
+                particle_pos = np.empty((len(v), 3), dtype=np.float32)
+            particle_pos[:, i] = v
+            del v
+            gc.collect()
+        print(f"  particles: {len(particle_pos):,}")
     else:
         particle_pos = particle_positions
 
