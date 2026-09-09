@@ -1135,6 +1135,58 @@ class TabulatedDeltaSigma:
         delta_sigma : np.ndarray [Msun h/pc^2]
         info : dict with ngal, fsat, ds_cen, ds_sat
         """
+        probC, probS = self.halo.HOD.compute_HOD_occupation(
+            np.asarray(self.halo.logM), dict_params
+        )
+        # Bernoulli sampling in populate_centrals clips probC at 1 implicitly
+        probC = np.minimum(np.asarray(probC, dtype=np.float64), 1.0)
+
+        return self.predict_occupation(
+            probC, probS,
+            f_exp=float(dict_params.get('f_exp', 0.0)),
+            tau=float(dict_params.get('tau', 6.0)),
+            lambda_NFW=float(dict_params.get('lambda_NFW', 1.0)),
+            rp_bins=rp_bins,
+        )
+
+    def predict_occupation(
+        self,
+        probC: np.ndarray,
+        probS: np.ndarray,
+        f_exp: float = 0.0,
+        tau: float = 6.0,
+        lambda_NFW: float = 1.0,
+        rp_bins: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict]:
+        """
+        Predict DeltaSigma from an EXPLICIT per-halo occupation.
+
+        :meth:`predict` is this method with (probC, probS) evaluated from an
+        HOD, i.e. from halo mass (plus the assembly-bias property) alone.
+        Passing the arrays directly lifts that restriction: they can be the
+        *measured* per-halo galaxy counts, so the prediction is made at the
+        occupation the simulation actually realised, secondary dependences and
+        all. Comparing the two answers whether a mass-only occupation is
+        capable of the measured lensing amplitude at all.
+
+        Only the ratio matters — DeltaSigma is normalised by the occupation
+        sums — so raw integer counts and mean occupation numbers are
+        interchangeable.
+
+        Parameters
+        ----------
+        probC, probS : np.ndarray
+            Per-halo central and satellite occupation, aligned with the cache
+            halo rows. Not clipped: pass what you mean.
+        f_exp, tau, lambda_NFW : float
+            Satellite radial profile parameters.
+        rp_bins : np.ndarray, optional
+            Projected bin edges; defaults to (and must match) cache.rp_bins.
+
+        Returns
+        -------
+        rp_centers, delta_sigma, info
+        """
         if rp_bins is None:
             rp_bins = self.cache.rp_bins
         elif not np.allclose(rp_bins, self.cache.rp_bins):
@@ -1142,16 +1194,12 @@ class TabulatedDeltaSigma:
                              "are pre-averaged on that binning).")
         rp_centers = self.cache.rp_centers
 
-        f_exp = float(dict_params.get('f_exp', 0.0))
-        tau = float(dict_params.get('tau', 6.0))
-        lambda_NFW = float(dict_params.get('lambda_NFW', 1.0))
-
-        probC, probS = self.halo.HOD.compute_HOD_occupation(
-            np.asarray(self.halo.logM), dict_params
-        )
-        # Bernoulli sampling in populate_centrals clips probC at 1 implicitly
-        probC = np.minimum(np.asarray(probC, dtype=np.float64), 1.0)
+        probC = np.asarray(probC, dtype=np.float64)
         probS = np.asarray(probS, dtype=np.float64)
+        if len(probC) != len(self.cache.positions) or len(probS) != len(probC):
+            raise ValueError(
+                f"occupation arrays ({len(probC)}, {len(probS)}) must have one "
+                f"entry per cache halo ({len(self.cache.positions)}).")
 
         sum_C, sum_S = probC.sum(), probS.sum()
         ngal = (sum_C + sum_S) / self.halo.Lbox ** 3
