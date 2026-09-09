@@ -218,6 +218,15 @@ def parse_args():
                         "the measured assembly bias could it reach? The "
                         "answer decides whether a given AB column is worth "
                         "tabulating on at all.")
+    p.add_argument("--shuffle_within_path", default=None,
+                   help="Read the --shuffle_within columns from THIS "
+                        "catalogue instead of --hydro_host_path. Needed "
+                        "whenever the candidate columns live in a rebuilt "
+                        "catalogue: the halo model must keep using the file "
+                        "the CACHE was tabulated on (its fI bin edges were "
+                        "built from that file's fs_norm), while the shuffle "
+                        "grouping has nothing to do with the cache. Rows must "
+                        "correspond one to one.")
     p.add_argument("--n_prop_bins", type=int, default=5,
                    help="Quantiles of each --shuffle_within column, taken "
                         "WITHIN each mass bin.")
@@ -473,8 +482,19 @@ def predict_truth_deltasigma(args):
     => the fault is upstream of the occupation, in the halo catalogue or the
     galaxy-halo link.
     """
-    cols = ["x", "y", "z", "mass", "rvir"] + list(args.shuffle_within)
-    halo_df = pd.read_parquet(args.hydro_host_path, columns=cols)
+    own = [] if args.shuffle_within_path else list(args.shuffle_within)
+    halo_df = pd.read_parquet(args.hydro_host_path,
+                              columns=["x", "y", "z", "mass", "rvir"] + own)
+    prop_df = halo_df
+    if args.shuffle_within_path:
+        prop_df = pd.read_parquet(args.shuffle_within_path,
+                                  columns=list(args.shuffle_within))
+        if len(prop_df) != len(halo_df):
+            raise SystemExit(
+                f"{args.shuffle_within_path} has {len(prop_df):,} rows but "
+                f"{args.hydro_host_path} has {len(halo_df):,} -- the "
+                f"candidate columns cannot be matched to the halos.")
+        print(f"candidate columns from {args.shuffle_within_path}")
     gal = pd.read_parquet(args.nisp_path, columns=["x", "y", "z", "type"])
     print(f"hosts: {len(halo_df):,}   galaxies: {len(gal):,}")
 
@@ -607,7 +627,7 @@ def predict_truth_deltasigma(args):
         # is exactly what an HOD that depends on that property could reach.
         ladder = {}
         for col in args.shuffle_within:
-            prop = np.asarray(halo_df[col].values, dtype=np.float64)
+            prop = np.asarray(prop_df[col].values, dtype=np.float64)
             cells = []
             for g in groups:
                 if len(g) < 10 * args.n_prop_bins:
