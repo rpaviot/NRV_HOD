@@ -218,6 +218,9 @@ def parse_args():
                         "the measured assembly bias could it reach? The "
                         "answer decides whether a given AB column is worth "
                         "tabulating on at all.")
+    p.add_argument("--ab_column", default=None,
+                   help="Column mapped as fE for the halo model; must match "
+                        "what --cache_path was tabulated on.")
     p.add_argument("--shuffle_within_path", default=None,
                    help="Read the --shuffle_within columns from THIS "
                         "catalogue instead of --hydro_host_path. Needed "
@@ -528,7 +531,8 @@ def predict_truth_deltasigma(args):
     cache = HaloCenterLensingCache.load(args.cache_path)
     if not cache.has_tabulation:
         raise SystemExit("Cache has no xi_gm tabulation.")
-    halo = build_halo_occupation(FitCase.EXTENDED_PROFILE, args.hydro_host_path)
+    halo = build_halo_occupation(FitCase.EXTENDED_PROFILE, args.hydro_host_path,
+                                 getattr(args, "ab_column", None))
 
     # The counts are indexed by parquet row; the cache and the HaloOccupation
     # must be the same rows in the same order or every weight lands on the

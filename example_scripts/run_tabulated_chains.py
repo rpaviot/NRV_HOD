@@ -99,8 +99,14 @@ PRIOR_RANGES = {
     "f_exp":      (0.0,   0.9),
     "tau":        (1.0,   10.0),
     "kappa_EE":   (0.5,   1.0),
-    "B_cent":     (-0.5,  0.5),
-    "B_sat":      (-0.5,  0.5),
+    # B_cent/B_sat shift logMmin and logM1 by B*fE under ab_method="mass", so
+    # these are DEX, not the occupation amplitudes they were under "direct".
+    # The direct-vs-tabulated null test (job 58367900) calibrates the lever:
+    # B = -0.3 buys +7.3% of large-scale amplitude through centrals and +2.9%
+    # through satellites, and closing the 19.3% mass-only deficit therefore
+    # needs of order -0.8 dex. (-0.5, 0.5) could not reach it.
+    "B_cent":     (-1.0,  1.0),
+    "B_sat":      (-1.0,  1.0),
 }
 
 FIXED_DEFAULTS = {
@@ -155,14 +161,14 @@ def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False):
 # Model builders
 # ============================================================================
 
-def build_halo_occupation(fit_case, halo_path):
-    """HaloOccupation with fs_norm mapped as fE — matches the FULL grid runs.
+def build_halo_occupation(fit_case, halo_path, ab_column=None):
+    """HaloOccupation with the assembly-bias column mapped as fE.
 
     assembly_bias is always on so the fI tabulation bins resolve; non-AB
     cases simply fix B_cent = B_sat = 0.
     """
     cmap = dict(COLUMN_MAPPING)
-    cmap["fE"] = AB_COLUMN
+    cmap["fE"] = ab_column or AB_COLUMN
     halo = HaloOccupation(
         cosmology=COSMO_PARAMS,
         zeff=ZEFF,
@@ -513,6 +519,14 @@ def parse_args():
                    help="Threads used for the per-point wgg chi2 of a "
                         "vectorized batch (the DeltaSigma half is already "
                         "threaded by XLA). Defaults to the allocated cores.")
+    p.add_argument("--ab_column", default=AB_COLUMN,
+                   help="Halo column mapped as fE. MUST be the column the "
+                        "--cache_path tabulation was built on: the cache's fI "
+                        "bin edges come from it, so a mismatch silently bins "
+                        "halos against the wrong property. The measured "
+                        "ranking of proxies is fs_norm_R1 (tidal shear at 1 "
+                        "Mpc/h, 118.7%% of the assembly bias in DeltaSigma) > "
+                        "delta_norm_R3 (89%%) > fs_norm at 6 Mpc/h (36%%).")
     p.add_argument("--per_bin", action="store_true",
                    help="Print per-bin residuals and chi2 contributions for "
                         "DeltaSigma and wgg (diagnostic; pairs with "
@@ -605,7 +619,8 @@ def main():
         for case_name in names:
             fit_case = FIT_CASE_OF[_base_name(case_name)]
             print(f"\nLoading halo catalogue for case {case_name} ...")
-            halo = build_halo_occupation(fit_case, args.halo_path)
+            halo = build_halo_occupation(fit_case, args.halo_path,
+                                         args.ab_column)
             predict_at(case_name, fit_case, halo,
                        TabulatedDeltaSigma(cache, halo), args)
         return
@@ -617,7 +632,8 @@ def main():
     for case_name in names:
         fit_case = FIT_CASE_OF[_base_name(case_name)]
         print(f"\nLoading halo catalogue for case {case_name} ...")
-        halo = build_halo_occupation(fit_case, args.halo_path)
+        halo = build_halo_occupation(fit_case, args.halo_path,
+                                     args.ab_column)
         tab = TabulatedDeltaSigma(cache, halo)
         print(f"  {tab}")
 
