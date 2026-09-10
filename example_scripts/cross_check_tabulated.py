@@ -378,8 +378,13 @@ def run_direct_check(args):
     RHO_M_cache = float(cache.metadata.get("RHO_M", 0.0))
     print(f"cache metadata: {dict(cache.metadata)}")
 
-    params = json.loads(args.params_json) if args.params_json else dict(BASE_PARAMS)
-    print(f"HOD under test: {params}")
+    specs = json.loads(args.params_json) if args.params_json else dict(BASE_PARAMS)
+    if isinstance(specs, dict):
+        specs = [specs]
+    # One cache load and one particle stream serve every parameter set: with
+    # 233M particles to subsample, running the script once per set would spend
+    # nearly all of its time re-reading the same inputs.
+    print(f"{len(specs)} parameter set(s) under test")
 
     print(f"\nLoading halo catalogue {args.halo_path} ...")
     df = pd.read_parquet(args.halo_path)
@@ -399,6 +404,9 @@ def run_direct_check(args):
         population_backend="numba",
     )
     halo.set_halo_model("ELG_mHMQ", elg_satellite=True)
+    print(f"  assembly_bias={halo.assembly_bias}"
+          + (f", ab_method={halo.HOD.ab_method!r}, column={args.ab_column!r}"
+             if halo.assembly_bias else ""))
     if RHO_M_cache and abs(halo.RHO_M / RHO_M_cache - 1) > 1e-3:
         raise SystemExit(f"RHO_M mismatch: halo {halo.RHO_M:.6e} vs cache "
                          f"{RHO_M_cache:.6e} -- DeltaSigma is linear in it, so "
@@ -425,51 +433,77 @@ def run_direct_check(args):
     print(f"  {len(pos_p):,} particles"
           + ("" if w_p is None else " (mass-weighted)"))
 
-    # ---- tabulated prediction ----------------------------------------------
     tab = TabulatedDeltaSigma(cache, halo)
-    rp, ds_tab, info = tab.predict(params)
-    print(f"\ntabulated: ngal {info['ngal']:.4e}, fsat {info['fsat']:.4f}")
+    saved, summary = {}, []
 
-    # ---- direct measurement, N realisations --------------------------------
-    ds_mc, ngal_mc, fsat_mc = [], [], []
-    for i in range(args.n_real):
-        t0 = time.time()
-        halo.populate_haloes(params, random_seed=1000 + i)
-        pos_g = np.ascontiguousarray(np.asarray(halo.positions_gal),
-                                     dtype=np.float64)
-        _, ds_i = compute_galaxy_lensing(
-            pos_g, pos_p, LBOX, halo.rsd_axis, halo.RHO_M, rp_bins,
-            weights_part=w_p, chi_max=args.chi_max,
-            bins_comp=np.geomspace(5e-3, 120, 201))
-        ds_mc.append(np.asarray(ds_i))
-        ngal_mc.append(len(pos_g) / LBOX ** 3)
-        fsat_mc.append(float(halo.satellite_fraction))
-        print(f"  realisation {i+1}/{args.n_real}: {len(pos_g):,} galaxies, "
-              f"fsat {fsat_mc[-1]:.4f}  ({time.time()-t0:.0f}s)")
-    ds_mc = np.array(ds_mc)
-    mc = ds_mc.mean(axis=0)
-    se = (ds_mc.std(axis=0, ddof=1) / np.sqrt(args.n_real)
-          if args.n_real > 1 else np.full_like(mc, np.nan))
+    for spec in specs:
+        spec = dict(spec)
+        label = spec.pop("label", "model")
+        print(f"\n{'='*66}\n  {label}: {spec}\n{'='*66}")
 
-    print(f"\ndirect: ngal {np.mean(ngal_mc):.4e}, fsat {np.mean(fsat_mc):.4f}")
-    print(f"\n{'rp':>9} {'direct':>11} {'tabulated':>11} {'tab/dir-1':>10} "
-          f"{'SE%':>7}")
-    dev = ds_tab / mc - 1.0
-    for j in range(len(rp)):
-        print(f"{rp[j]:9.3f} {mc[j]:11.4f} {ds_tab[j]:11.4f} "
-              f"{100*dev[j]:9.2f}% {100*se[j]/abs(mc[j]):7.2f}")
-    big = rp > 3.0
-    print(f"\nmax|dev| = {100*np.abs(dev).max():.2f}%   "
-          f"mean dev over rp>3 = {100*np.mean(dev[big]):+.2f}%")
-    print("The chains' model is 17% BELOW the measured data at rp>3. If the "
-          "deviation above is ~0, the cache is")
-    print("faithful and that 17% is physical; if it is ~-15%, the cache "
-          "itself is the problem.")
+        # ---- tabulated prediction ------------------------------------------
+        rp, ds_tab, info = tab.predict(spec)
+        print(f"tabulated: ngal {info['ngal']:.4e}, fsat {info['fsat']:.4f}")
+
+        # ---- direct measurement, N realisations ----------------------------
+        ds_mc, ngal_mc, fsat_mc = [], [], []
+        for i in range(args.n_real):
+            t0 = time.time()
+            halo.populate_haloes(spec, random_seed=1000 + i)
+            pos_g = np.ascontiguousarray(np.asarray(halo.positions_gal),
+                                         dtype=np.float64)
+            _, ds_i = compute_galaxy_lensing(
+                pos_g, pos_p, LBOX, halo.rsd_axis, halo.RHO_M, rp_bins,
+                weights_part=w_p, chi_max=args.chi_max,
+                bins_comp=np.geomspace(5e-3, 120, 201))
+            ds_mc.append(np.asarray(ds_i))
+            ngal_mc.append(len(pos_g) / LBOX ** 3)
+            fsat_mc.append(float(halo.satellite_fraction))
+            print(f"  realisation {i+1}/{args.n_real}: {len(pos_g):,} galaxies, "
+                  f"fsat {fsat_mc[-1]:.4f}  ({time.time()-t0:.0f}s)")
+        ds_mc = np.array(ds_mc)
+        mc = ds_mc.mean(axis=0)
+        se = (ds_mc.std(axis=0, ddof=1) / np.sqrt(args.n_real)
+              if args.n_real > 1 else np.full_like(mc, np.nan))
+
+        print(f"\ndirect: ngal {np.mean(ngal_mc):.4e}, "
+              f"fsat {np.mean(fsat_mc):.4f}")
+        print(f"\n{'rp':>9} {'direct':>11} {'tabulated':>11} {'tab/dir-1':>10} "
+              f"{'SE%':>7}")
+        dev = ds_tab / mc - 1.0
+        for j in range(len(rp)):
+            print(f"{rp[j]:9.3f} {mc[j]:11.4f} {ds_tab[j]:11.4f} "
+                  f"{100*dev[j]:9.2f}% {100*se[j]/abs(mc[j]):7.2f}")
+        big = rp > 3.0
+        print(f"\nmax|dev| = {100*np.abs(dev).max():.2f}%   "
+              f"mean dev over rp>3 = {100*np.mean(dev[big]):+.2f}%")
+        summary.append((label, float(100 * np.mean(dev[big])),
+                        float(100 * np.abs(dev).max()),
+                        float(np.mean(fsat_mc)), info['fsat']))
+        for k, v in (("rp", rp), ("ds_tab", ds_tab), ("ds_direct", mc),
+                     ("se", se), ("dev", dev), ("ds_real", ds_mc)):
+            saved[f"{label}_{k}"] = v
+
+    # ---- what the whole run is for -----------------------------------------
+    # The tabulated predictor keeps per-halo lensing profiles for CENTRALS but
+    # bins halos into the cache's (logM, fI) cells for SATELLITES, so it can
+    # only carry the part of the assembly-bias signal that binning resolves.
+    # The direct side has no such limitation: it puts galaxies on the actual
+    # halos and pair-counts them. Turning B_cent and B_sat on one at a time
+    # therefore measures the tabulation's AB error, separately per population,
+    # against a baseline that is known to agree to 0.20% with AB off.
+    print(f"\n{'='*66}\n  SUMMARY: tabulated vs direct pair count\n{'='*66}")
+    print(f"  {'case':>22} {'dev rp>3':>10} {'max|dev|':>10} "
+          f"{'fsat dir':>9} {'fsat tab':>9}")
+    for label, d3, dmax, fs_d, fs_t in summary:
+        print(f"  {label:>22} {d3:+9.2f}% {dmax:9.2f}% {fs_d:9.4f} {fs_t:9.4f}")
+    print("\n  A deviation that appears only when B_sat is switched on is the "
+          "satellite\n  binning; one that appears with B_cent too would be "
+          "something else entirely.")
 
     out = os.path.join(args.output_dir, "cache_direct_check.npz")
-    np.savez(out, rp=rp, ds_tab=ds_tab, ds_direct=mc, se=se, dev=dev,
-             ds_real=ds_mc, params=json.dumps(params),
-             cache_path=args.cache_path)
+    np.savez(out, params=json.dumps(specs), cache_path=args.cache_path,
+             labels=np.array([s[0] for s in summary]), **saved)
     print(f"\nSaved -> {out}")
 
 
