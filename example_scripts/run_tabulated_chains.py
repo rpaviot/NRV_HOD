@@ -128,8 +128,29 @@ def _base_name(case_name):
     return case_name[:-3] if case_name.endswith("_AB") else case_name
 
 
-def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False):
-    """Same prior structure as run_emulator_chains.py --full_bb (elg_satellite)."""
+def _fix_tag(args):
+    """Output-name suffix recording which parameters were pinned by --fix.
+
+    Without it a --fix run would silently overwrite the free-parameter chain
+    of the same case and rp_min, which is exactly the run it has to be
+    compared against.
+    """
+    fix_map = getattr(args, "fix_map", None)
+    if not fix_map:
+        return ""
+    return "_fix" + "-".join(sorted(fix_map))
+
+
+def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False, fixed=None):
+    """Same prior structure as run_emulator_chains.py --full_bb (elg_satellite).
+
+    ``fixed`` is a {name: value} override applied last: a scalar in
+    ``param_config`` pins the parameter (see ``_parse_param_config``), so this
+    turns a sampled parameter into a fixed one. The value is deliberately NOT
+    clipped to PRIOR_RANGES -- the point of pinning a parameter is often to
+    hold it at an independently measured value that the sampling prior
+    excludes (the measured satellite tau, for one).
+    """
     cfg = dict(FIXED_DEFAULTS)
     active = ["As", "Mmin", "sig_M", "gamma", "alpha", "Mcut", "lambda_NFW"]
 
@@ -154,6 +175,13 @@ def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False):
 
     for name in active:
         cfg[name] = PRIOR_RANGES[name]
+
+    for name, value in (fixed or {}).items():
+        if name not in cfg:
+            raise KeyError(
+                f"--fix {name}: not a parameter of this case. Known: "
+                + ", ".join(sorted(cfg)))
+        cfg[name] = float(value)
     return cfg
 
 
@@ -338,10 +366,13 @@ def run_case(case_name, fit_case, halo, tab, args):
     # The likelihood becomes batched-jax DeltaSigma + a NumPy wgg loop
     # (~1 s/point), so joint chains are much slower than DeltaSigma-only.
     tab_wgg = None
-    wgg_tag = ""
+    wgg_tag = _fix_tag(args)
+    if wgg_tag:
+        print(f"  Pinned parameters: "
+              + ", ".join(f"{k}={v:g}" for k, v in sorted(args.fix_map.items())))
     if args.wgg_tab:
         tab_wgg = TabulatedWgg(WggTabulation.load(args.wgg_tab), halo)
-        wgg_tag = "_wggjoint"
+        wgg_tag += "_wggjoint"
         print(f"  Joint wgg fit: {tab_wgg} "
               f"(rp_min_wgg={args.rp_min_wgg}, data={args.data_path})")
 
@@ -352,7 +383,8 @@ def run_case(case_name, fit_case, halo, tab, args):
                                   f"chain_{case_name}{wgg_tag}_rmin{rp_min}.npz")
 
         param_config = build_param_config(
-            fit_case, assembly_bias=assembly_bias, gaussian_ab=args.gaussian_ab)
+            fit_case, assembly_bias=assembly_bias, gaussian_ab=args.gaussian_ab,
+            fixed=args.fix_map)
 
         fitter = TabulatedFitter(
             tabulated_ds=tab,
@@ -547,12 +579,32 @@ def parse_args():
                         "whether the model reproduces the data at the "
                         "MEASURED truth occupation, which separates a "
                         "forward-model error from a fitting artefact.")
+    p.add_argument("--fix", nargs="+", default=[], metavar="NAME=VALUE",
+                   help="Pin a parameter instead of sampling it, e.g. "
+                        "--fix f_exp=0.681 tau=5.74 lambda_NFW=0.334. The "
+                        "value is not clipped to PRIOR_RANGES, so an "
+                        "independently measured value outside the sampling "
+                        "prior is allowed. Each pinned name drops one "
+                        "dimension from the chain and is appended to the "
+                        "output tag so the run does not overwrite the free "
+                        "one.")
     p.add_argument("--postprocess", action="store_true",
                    help="Skip sampling: load the saved chain_*.npz and "
                         "(re)compute Meff/fsat/chi2, plots, and the aggregate. "
                         "Use to recover the outputs when a run crashed in "
                         "post-processing after the chains were saved.")
-    return p.parse_args()
+    args = p.parse_args()
+
+    args.fix_map = {}
+    for item in args.fix:
+        if "=" not in item:
+            p.error(f"--fix expects NAME=VALUE, got {item!r}")
+        name, _, value = item.partition("=")
+        try:
+            args.fix_map[name.strip()] = float(value)
+        except ValueError:
+            p.error(f"--fix {item!r}: {value!r} is not a number")
+    return args
 
 
 def predict_at(case_name, fit_case, halo, tab, args):
@@ -570,7 +622,7 @@ def predict_at(case_name, fit_case, halo, tab, args):
 
     param_config = build_param_config(
         fit_case, assembly_bias=case_name.endswith("_AB"),
-        gaussian_ab=args.gaussian_ab)
+        gaussian_ab=args.gaussian_ab, fixed=args.fix_map)
 
     for rp_min in args.rp_min_values:
         fitter = TabulatedFitter(
@@ -644,7 +696,8 @@ def main():
             logM_bins_saved = logM_bins
 
         for rp_min, vals in bestfits.items():
-            prefix = f"{case_name}_rmin{str(rp_min).replace('.', 'p')}"
+            prefix = (f"{case_name}{_fix_tag(args)}"
+                      f"_rmin{str(rp_min).replace('.', 'p')}")
             all_bestfits_arrays[f"{prefix}_ds"]       = vals['ds']
             all_bestfits_arrays[f"{prefix}_chi2_red"] = np.array(vals['chi2_red'])
             all_bestfits_arrays[f"{prefix}_Meff"]     = np.array(vals['Meff'])
@@ -657,6 +710,7 @@ def main():
 
     if all_bestfits_arrays:
         tag = names[0] if len(names) == 1 else "all"
+        tag += _fix_tag(args)
         if args.wgg_tab:
             tag += "_wggjoint"
         if len(args.rp_min_values) == 1:
