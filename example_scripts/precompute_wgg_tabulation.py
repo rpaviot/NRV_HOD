@@ -10,9 +10,17 @@ The tabulation is *field-independent* — it depends only on the halo catalogue
 (positions, velocities, logM, fs_norm), not on the matter field — so a single
 wgg tabulation is reused for BOTH the DMO and baryonified DeltaSigma joint fits.
 
-The fI dimension bins by ``halo.fE`` (the fs_norm environment column, mapped as
-fE exactly as in precompute_halo_center_cache.py), so the fI-quantile bins match
-the DeltaSigma cache and the fitter's AB convention.
+The fI dimension bins by ``halo.fE`` (the environment column named by
+--ab_column, mapped as fE exactly as in precompute_halo_center_cache.py), so the
+fI-quantile bins match the DeltaSigma cache and the fitter's AB convention.
+
+--ab_column MUST name the same column the DeltaSigma cache was tabulated on.
+The quantile edges are derived from that column's values, and TabulatedWgg
+digitizes the halos' fE into them with no check: pairing a wgg tabulation built
+on one column with a cache built on another silently mis-assigns every halo on
+the AB axis. (wgg_tabulation_HYDRO.npz is built on fs_norm and belongs with
+tabulated_cache_HYDRO.h5; tabulated_cache_HYDRO_R1.h5 is on fs_norm_R1 and
+needs its own.)
 
 Usage (cluster):
     python example_scripts/precompute_wgg_tabulation.py \
@@ -28,7 +36,7 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from example_scripts.run_tabulated_chains import (
-    build_halo_occupation, HALO_PATH_DEFAULT, FLAMINGO_DIR, LBOX)
+    build_halo_occupation, HALO_PATH_DEFAULT, FLAMINGO_DIR, LBOX, AB_COLUMN)
 from HOD_NRV.utilsf.numerical_sampler import FitCase
 from HOD_NRV.HOD_numerical.twopoint_calculator.tabulated_wgg import (
     precompute_wgg_tabulation, refine_rp_edges)
@@ -45,6 +53,12 @@ def parse_args():
     # geomspace(0.1,50,26)) so both observables share one (logM, fI, rp) grid.
     # NOTE: TabulatedWgg.predict requires the fit rp_bins to be nested in this
     # grid, so the wgg DATA must be (re)measured on geomspace(0.1,50,26) too.
+    p.add_argument("--ab_column", default=AB_COLUMN,
+                   help="Halo column binned as the assembly-bias axis (fE). "
+                        "MUST match the --ab_column of the DeltaSigma cache "
+                        "this tabulation will be fitted alongside, or the fI "
+                        "quantile edges refer to a different quantity and "
+                        "every halo is silently mis-binned.")
     p.add_argument("--n_logM_bins", type=int, default=40)
     p.add_argument("--n_fI_bins", type=int, default=8)
     p.add_argument("--no_ab", action="store_true",
@@ -61,7 +75,8 @@ def main():
     args = parse_args()
 
     print(f"Loading halo catalogue: {args.halo_path}")
-    halo = build_halo_occupation(FitCase.STANDARD_NFW, args.halo_path)
+    halo = build_halo_occupation(FitCase.STANDARD_NFW, args.halo_path,
+                                 ab_column=args.ab_column)
 
     # RSD halo centers: shift centers by v_los * rsd_factor, periodic-wrap.
     # (Kaiser enters the tabulation; centrals inherit this exactly, satellite
@@ -71,12 +86,13 @@ def main():
     pos_rsd[:, ax] += np.asarray(halo.velocities)[:, ax] * halo.rsd_factor
     pos_rsd = (pos_rsd + LBOX) % LBOX
 
-    # bin the fI dimension on halo.fE (= fs_norm), matching the DeltaSigma cache
+    # bin the fI dimension on halo.fE (= args.ab_column), matching the cache
     halo_fI = None if args.no_ab else np.asarray(halo.fE)
     rp_bins = np.geomspace(args.rp_min, args.rp_max, args.n_rp)
     pi_bins = np.linspace(0.0, args.pi_max, args.n_pi)
 
     print(f"  {len(halo.logM):,} halos, Lbox={LBOX}, rsd_axis={halo.rsd_axis}")
+    print(f"  ab_column: {args.ab_column}")
     print(f"  bins: {args.n_logM_bins} logM x "
           f"{1 if args.no_ab else args.n_fI_bins} fI; "
           f"rp {args.rp_min}-{args.rp_max} ({args.n_rp}), pi_max={args.pi_max}")
