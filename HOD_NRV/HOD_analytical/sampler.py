@@ -507,9 +507,15 @@ class CSMFFitter:
         beta_nl_kwargs: Optional[Dict] = None,
         k_array: Optional = None,
         units_per_h: bool = True,
-        verbose: bool = True
+        verbose: bool = True,
+        halo_model_kwargs: Optional[Dict] = None,
     ):
         self.observables = observables or ['DeltaSigma']
+        # Halo-model ingredient overrides forwarded to HaloModel/Cosmology
+        # (mass_definition, concentration, halo_bias, mass_function).
+        # Defaults: Tinker08 HMF (below) + the Cosmology defaults
+        # (MassDef200c, Duffy08, Tinker10 bias).
+        self.halo_model_kwargs = dict(halo_model_kwargs or {})
         self.rp_min = rp_min
         self.rp_max = rp_max
         self.rp_min_wgg = rp_min_wgg if rp_min_wgg is not None else rp_min
@@ -557,6 +563,8 @@ class CSMFFitter:
             print(f"  β^NL correction: {'enabled' if include_beta_nl else 'disabled'}")
             print(f"  rp range (DS): [{rp_min}, {rp_max}]")
             print(f"  rp range (WGG): [{self.rp_min_wgg}, {self.rp_max_wgg}]")
+            if self.halo_model_kwargs:
+                print(f"  halo model overrides: {self.halo_model_kwargs}")
     #dsigma_wgg_pip_lowscales_LRG_
     def _get_file_pattern(self, sample_type: SampleType) -> str:
         """Get the file pattern for a given sample type."""
@@ -815,7 +823,8 @@ class CSMFFitter:
             include_beta_nl=self.include_beta_nl,
             beta_nl_kwargs=beta_nl_kwargs,
             verbose=self.verbose,
-            k_array=self.k_array,mass_function='Tinker08'
+            k_array=self.k_array,
+            **{'mass_function': 'Tinker08', **self.halo_model_kwargs},
         )
         
         # Set initial HOD parameters
