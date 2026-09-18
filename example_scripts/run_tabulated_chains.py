@@ -25,6 +25,7 @@ Usage (cluster):
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -43,6 +44,9 @@ from HOD_NRV.HOD_numerical.HOD_models import Occupation, rescale_Ac_to_target_ng
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
 from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import (
     HaloCenterLensingCache, TabulatedDeltaSigma,
+)
+from HOD_NRV.HOD_numerical.twopoint_calculator.tabulated_wgg import (
+    WggTabulation, TabulatedWgg,
 )
 
 # ============================================================================
@@ -95,8 +99,14 @@ PRIOR_RANGES = {
     "f_exp":      (0.0,   0.9),
     "tau":        (1.0,   10.0),
     "kappa_EE":   (0.5,   1.0),
-    "B_cent":     (-0.5,  0.5),
-    "B_sat":      (-0.5,  0.5),
+    # B_cent/B_sat shift logMmin and logM1 by B*fE under ab_method="mass", so
+    # these are DEX, not the occupation amplitudes they were under "direct".
+    # The direct-vs-tabulated null test (job 58367900) calibrates the lever:
+    # B = -0.3 buys +7.3% of large-scale amplitude through centrals and +2.9%
+    # through satellites, and closing the 19.3% mass-only deficit therefore
+    # needs of order -0.8 dex. (-0.5, 0.5) could not reach it.
+    "B_cent":     (-1.0,  1.0),
+    "B_sat":      (-1.0,  1.0),
 }
 
 FIXED_DEFAULTS = {
@@ -118,8 +128,29 @@ def _base_name(case_name):
     return case_name[:-3] if case_name.endswith("_AB") else case_name
 
 
-def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False):
-    """Same prior structure as run_emulator_chains.py --full_bb (elg_satellite)."""
+def _fix_tag(args):
+    """Output-name suffix recording which parameters were pinned by --fix.
+
+    Without it a --fix run would silently overwrite the free-parameter chain
+    of the same case and rp_min, which is exactly the run it has to be
+    compared against.
+    """
+    fix_map = getattr(args, "fix_map", None)
+    if not fix_map:
+        return ""
+    return "_fix" + "-".join(sorted(fix_map))
+
+
+def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False, fixed=None):
+    """Same prior structure as run_emulator_chains.py --full_bb (elg_satellite).
+
+    ``fixed`` is a {name: value} override applied last: a scalar in
+    ``param_config`` pins the parameter (see ``_parse_param_config``), so this
+    turns a sampled parameter into a fixed one. The value is deliberately NOT
+    clipped to PRIOR_RANGES -- the point of pinning a parameter is often to
+    hold it at an independently measured value that the sampling prior
+    excludes (the measured satellite tau, for one).
+    """
     cfg = dict(FIXED_DEFAULTS)
     active = ["As", "Mmin", "sig_M", "gamma", "alpha", "Mcut", "lambda_NFW"]
 
@@ -144,6 +175,13 @@ def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False):
 
     for name in active:
         cfg[name] = PRIOR_RANGES[name]
+
+    for name, value in (fixed or {}).items():
+        if name not in cfg:
+            raise KeyError(
+                f"--fix {name}: not a parameter of this case. Known: "
+                + ", ".join(sorted(cfg)))
+        cfg[name] = float(value)
     return cfg
 
 
@@ -151,14 +189,14 @@ def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False):
 # Model builders
 # ============================================================================
 
-def build_halo_occupation(fit_case, halo_path):
-    """HaloOccupation with fs_norm mapped as fE — matches the FULL grid runs.
+def build_halo_occupation(fit_case, halo_path, ab_column=None):
+    """HaloOccupation with the assembly-bias column mapped as fE.
 
     assembly_bias is always on so the fI tabulation bins resolve; non-AB
     cases simply fix B_cent = B_sat = 0.
     """
     cmap = dict(COLUMN_MAPPING)
-    cmap["fE"] = AB_COLUMN
+    cmap["fE"] = ab_column or AB_COLUMN
     halo = HaloOccupation(
         cosmology=COSMO_PARAMS,
         zeff=ZEFF,
@@ -280,6 +318,29 @@ def plot_hod_profiles(case_name, logM, profiles_by_rp_min, output_dir):
     print(f"  HOD profile plot saved: {path}")
 
 
+def _print_per_bin(name, rp, obs, model, cov_inv):
+    """Per-bin residuals, to see *which* scales a joint fit is failing on.
+
+    sigma is taken from the inverse of the diagonal of cov_inv (i.e. the
+    conditional error), so the quoted n_sigma is not the chi2 decomposition
+    when the covariance is strongly correlated -- the chi2 contribution
+    column is the honest per-bin number.
+    """
+    obs = np.asarray(obs); model = np.asarray(model)
+    resid = model - obs
+    # chi2 contribution of each bin: r_i * (C^-1 r)_i, sums to the full chi2
+    contrib = resid * (cov_inv @ resid)
+    sig = 1.0 / np.sqrt(np.diag(cov_inv))
+    print(f"\n  --- {name} per bin ---")
+    print(f"  {'rp':>8} {'data':>12} {'model':>12} {'dev%':>8} "
+          f"{'r/sig':>8} {'chi2_i':>9}")
+    for j in range(len(obs)):
+        dev = 100.0 * (model[j] / obs[j] - 1.0) if obs[j] != 0 else np.nan
+        print(f"  {rp[j]:8.3f} {obs[j]:12.4f} {model[j]:12.4f} {dev:8.2f} "
+              f"{resid[j]/sig[j]:8.2f} {contrib[j]:9.2f}")
+    print(f"  sum chi2_i = {contrib.sum():.2f}")
+
+
 # ============================================================================
 # Run one case
 # ============================================================================
@@ -301,14 +362,29 @@ def run_case(case_name, fit_case, halo, tab, args):
     ax.errorbar(rp_all, rp_all * ds_all, yerr=rp_all * ds_err,
                 fmt='ko', ms=4, zorder=10, label='Flamingo ELG data')
 
+    # Joint wgg: needs `halo` (per case), so the predictor is built here.
+    # The likelihood becomes batched-jax DeltaSigma + a NumPy wgg loop
+    # (~1 s/point), so joint chains are much slower than DeltaSigma-only.
+    tab_wgg = None
+    wgg_tag = _fix_tag(args)
+    if wgg_tag:
+        print(f"  Pinned parameters: "
+              + ", ".join(f"{k}={v:g}" for k, v in sorted(args.fix_map.items())))
+    if args.wgg_tab:
+        tab_wgg = TabulatedWgg(WggTabulation.load(args.wgg_tab), halo)
+        wgg_tag += "_wggjoint"
+        print(f"  Joint wgg fit: {tab_wgg} "
+              f"(rp_min_wgg={args.rp_min_wgg}, data={args.data_path})")
+
     bestfits = {}
     for rp_min, color in zip(args.rp_min_values, COLORS):
         print(f"\n  rp_min = {rp_min} Mpc/h")
         chain_path = os.path.join(args.output_dir,
-                                  f"chain_{case_name}_rmin{rp_min}.npz")
+                                  f"chain_{case_name}{wgg_tag}_rmin{rp_min}.npz")
 
         param_config = build_param_config(
-            fit_case, assembly_bias=assembly_bias, gaussian_ab=args.gaussian_ab)
+            fit_case, assembly_bias=assembly_bias, gaussian_ab=args.gaussian_ab,
+            fixed=args.fix_map)
 
         fitter = TabulatedFitter(
             tabulated_ds=tab,
@@ -320,8 +396,19 @@ def run_case(case_name, fit_case, halo, tab, args):
             rp_max=None,
             param_config=param_config,
             Ac_fiducial=AC_FIDUCIAL,
+            # Without sampled AB the occupation is a plain function of M, so
+            # the mass function's ~8% error over the Flamingo M200m catalogue
+            # is absorbed into the absolute (Ac, As) and cancels out of both
+            # observables (they see only Ac/As). With AB sampled it would not:
+            # B_cent/B_sat reweight halos at fixed mass, which the analytic
+            # integral cannot see, so the anchor has to be the halo sum.
+            ngal_anchor="catalogue" if assembly_bias else "mass_function",
             **({"max_fsat": args.max_fsat, "hod_occupation": halo.HOD}
                if args.max_fsat is not None else {}),
+            **({"tabulated_wgg": tab_wgg, "data_path_wgg": args.data_path,
+                "rp_min_wgg": args.rp_min_wgg, "rp_max_wgg": args.rp_max_wgg,
+                "n_wgg_threads": args.n_wgg_threads}
+               if tab_wgg is not None else {}),
         )
         print(f"  {fitter.n_bins} bins in [{fitter.rp_obs[0]:.3f}, "
               f"{fitter.rp_obs[-1]:.2f}] Mpc/h, {fitter.n_params} free params")
@@ -340,12 +427,15 @@ def run_case(case_name, fit_case, halo, tab, args):
             print(f"  Loaded saved chain: {chain_path} "
                   f"({len(points)} pts, logZ = {log_z:.2f})")
         else:
-            print(f"  Running Nautilus (n_live={N_LIVE}, vectorized jit/vmap "
-                  "likelihood, single process) ...")
-            checkpoint = os.path.join(args.output_dir,
-                                      f"checkpoint_{case_name}_rmin{rp_min}.h5")
+            print(f"  Running Nautilus (n_live={args.n_live}, vectorized jit/vmap "
+                  f"likelihood, single process"
+                  + (f", {args.n_wgg_threads} wgg threads" if tab_wgg is not None
+                     else "") + ") ...")
+            checkpoint = os.path.join(
+                args.output_dir,
+                f"checkpoint_{case_name}{wgg_tag}_rmin{rp_min}.h5")
             points, weights, log_l, log_z = fitter.run(
-                n_eff=args.n_eff, n_live=N_LIVE, verbose=True,
+                n_eff=args.n_eff, n_live=args.n_live, verbose=True,
                 vectorized=True, filepath=checkpoint,
             )
             fitter.save_results(chain_path, points, weights, log_l, log_z)
@@ -355,7 +445,21 @@ def run_case(case_name, fit_case, halo, tab, args):
         ds_map = fitter.predict_at_obs(theta_best)
         residual = ds_map - fitter.ds_obs
         chi2 = float(residual @ fitter.cov_inv @ residual)
-        chi2_red = chi2 / (len(fitter.ds_obs) - fitter.n_params)
+        n_data_bins = len(fitter.ds_obs)
+        if tab_wgg is not None:
+            wgg_map = fitter.predict_wgg_at_obs(theta_best)
+            rw = wgg_map - fitter.wgg_obs
+            chi2_wgg = float(rw @ fitter.cov_inv_wgg @ rw)
+            print(f"  chi2_ds = {chi2:.2f} ({n_data_bins} bins), "
+                  f"chi2_wgg = {chi2_wgg:.2f} ({len(fitter.wgg_obs)} bins)")
+            if args.per_bin:
+                _print_per_bin("DeltaSigma", fitter.rp_obs, fitter.ds_obs,
+                               ds_map, fitter.cov_inv)
+                _print_per_bin("wgg", fitter.rp_obs_wgg, fitter.wgg_obs,
+                               wgg_map, fitter.cov_inv_wgg)
+            chi2 += chi2_wgg
+            n_data_bins += len(fitter.wgg_obs)
+        chi2_red = chi2 / (n_data_bins - fitter.n_params)
         ds_map_full = fitter.predict_at_obs(theta_best, rp_eval=rp_all)
         Meff, fsat, ngal_ab = compute_meff_fsat(occupation_full, theta_best,
                                                 fitter, halo)
@@ -373,6 +477,7 @@ def run_case(case_name, fit_case, halo, tab, args):
                                             occupation_full, halo)
 
         bestfits[rp_min] = {
+            **({'wgg': wgg_map} if tab_wgg is not None else {}),
             'ds': ds_map_full, 'chi2_red': chi2_red,
             'Meff': Meff, 'fsat': fsat, 'ngal': ngal_ab,
             'ncen_med': ncen_med, 'ncen_sig': ncen_sig,
@@ -396,7 +501,8 @@ def run_case(case_name, fit_case, halo, tab, args):
     # scope filenames by rp_min when a single cut runs (jobs split per rp_min)
     rp_tag = ("" if len(args.rp_min_values) > 1 else
               f"_rmin{str(args.rp_min_values[0]).replace('.', 'p')}")
-    plot_path = os.path.join(args.output_dir, f"fit_{case_name}{rp_tag}.png")
+    plot_path = os.path.join(args.output_dir,
+                             f"fit_{case_name}{wgg_tag}{rp_tag}.png")
     fig.savefig(plot_path, dpi=150)
     plt.close(fig)
     print(f"\n  Plot saved: {plot_path}")
@@ -406,8 +512,8 @@ def run_case(case_name, fit_case, halo, tab, args):
                  for k in ('ncen_med', 'ncen_sig', 'nsat_med', 'nsat_sig')}
         for rp_min in bestfits
     }
-    plot_hod_profiles(case_name + rp_tag, logM_bins, profiles_by_rp_min,
-                      args.output_dir)
+    plot_hod_profiles(case_name + wgg_tag + rp_tag, logM_bins,
+                      profiles_by_rp_min, args.output_dir)
 
     return rp_all, bestfits, logM_bins
 
@@ -432,16 +538,124 @@ def parse_args():
                    help="Unused (kept for CLI compatibility); sampling is "
                         "single-process vectorized")
     p.add_argument("--n_eff", type=int, default=N_EFF)
+    p.add_argument("--n_live", type=int, default=N_LIVE)
     p.add_argument("--rp_min_values", type=float, nargs="+",
                    default=RP_MIN_VALUES)
+    p.add_argument("--wgg_tab", default="",
+                   help="WggTabulation .npz whose fine rp grid nests the "
+                        "data's rp_bins_wgg — enables the joint wgg+DS fit "
+                        "(wgg data+cov read from --data_path).")
+    p.add_argument("--n_wgg_threads", type=int,
+                   default=len(os.sched_getaffinity(0))
+                   if hasattr(os, "sched_getaffinity") else os.cpu_count(),
+                   help="Threads used for the per-point wgg chi2 of a "
+                        "vectorized batch (the DeltaSigma half is already "
+                        "threaded by XLA). Defaults to the allocated cores.")
+    p.add_argument("--ab_column", default=AB_COLUMN,
+                   help="Halo column mapped as fE. MUST be the column the "
+                        "--cache_path tabulation was built on: the cache's fI "
+                        "bin edges come from it, so a mismatch silently bins "
+                        "halos against the wrong property. The measured "
+                        "ranking of proxies is fs_norm_R1 (tidal shear at 1 "
+                        "Mpc/h, 118.7%% of the assembly bias in DeltaSigma) > "
+                        "delta_norm_R3 (89%%) > fs_norm at 6 Mpc/h (36%%).")
+    p.add_argument("--per_bin", action="store_true",
+                   help="Print per-bin residuals and chi2 contributions for "
+                        "DeltaSigma and wgg (diagnostic; pairs with "
+                        "--postprocess to inspect a finished chain).")
+    p.add_argument("--rp_min_wgg", type=float, default=None)
+    p.add_argument("--rp_max_wgg", type=float, default=None)
     p.add_argument("--max_fsat", type=float, default=None)
     p.add_argument("--gaussian_ab", action="store_true")
+    p.add_argument("--predict", default=None, metavar="JSON",
+                   help="Skip sampling: evaluate the forward model at an "
+                        "EXPLICIT parameter set and print the per-bin "
+                        "comparison against the data. Takes a JSON dict, or a "
+                        "list of dicts each optionally carrying a \"label\". "
+                        "No ngal rescaling is applied -- the parameters are "
+                        "used as given -- and DeltaSigma depends only on the "
+                        "Ac/As ratio, so the divided-by-10 amplitude "
+                        "convention makes no difference here. Used to ask "
+                        "whether the model reproduces the data at the "
+                        "MEASURED truth occupation, which separates a "
+                        "forward-model error from a fitting artefact.")
+    p.add_argument("--fix", nargs="+", default=[], metavar="NAME=VALUE",
+                   help="Pin a parameter instead of sampling it, e.g. "
+                        "--fix f_exp=0.681 tau=5.74 lambda_NFW=0.334. The "
+                        "value is not clipped to PRIOR_RANGES, so an "
+                        "independently measured value outside the sampling "
+                        "prior is allowed. Each pinned name drops one "
+                        "dimension from the chain and is appended to the "
+                        "output tag so the run does not overwrite the free "
+                        "one.")
     p.add_argument("--postprocess", action="store_true",
                    help="Skip sampling: load the saved chain_*.npz and "
                         "(re)compute Meff/fsat/chi2, plots, and the aggregate. "
                         "Use to recover the outputs when a run crashed in "
                         "post-processing after the chains were saved.")
-    return p.parse_args()
+    args = p.parse_args()
+
+    args.fix_map = {}
+    for item in args.fix:
+        if "=" not in item:
+            p.error(f"--fix expects NAME=VALUE, got {item!r}")
+        name, _, value = item.partition("=")
+        try:
+            args.fix_map[name.strip()] = float(value)
+        except ValueError:
+            p.error(f"--fix {item!r}: {value!r} is not a number")
+    return args
+
+
+def predict_at(case_name, fit_case, halo, tab, args):
+    """Forward model at an explicit parameter set, against the data.
+
+    The chains answer "what parameters fit the data"; this answers the
+    complementary question, "does the model fit the data at the parameters we
+    independently know to be true". A model that misses the data at the
+    measured truth occupation has a forward-model error; one that matches it
+    there but is pulled elsewhere by the likelihood has a fitting problem.
+    """
+    specs = json.loads(args.predict)
+    if isinstance(specs, dict):
+        specs = [specs]
+
+    param_config = build_param_config(
+        fit_case, assembly_bias=case_name.endswith("_AB"),
+        gaussian_ab=args.gaussian_ab, fixed=args.fix_map)
+
+    for rp_min in args.rp_min_values:
+        fitter = TabulatedFitter(
+            tabulated_ds=tab,
+            occupation_rescale=_make_rescale_occupation(halo, fit_case),
+            target_ngal=TARGET_NGAL, fit_case=fit_case,
+            data_path=args.data_path, rp_min=rp_min, rp_max=None,
+            param_config=param_config, Ac_fiducial=AC_FIDUCIAL,
+            ngal_anchor="mass_function",
+        )
+        print(f"\n  rp_min = {rp_min}: {fitter.n_bins} bins in "
+              f"[{fitter.rp_obs[0]:.3f}, {fitter.rp_obs[-1]:.2f}] Mpc/h")
+
+        for spec in specs:
+            spec = dict(spec)
+            label = spec.pop("label", "model")
+            rp_full, ds_full, info = tab.predict(spec)
+            sel = np.isin(np.round(rp_full, 8), np.round(fitter.rp_obs, 8))
+            ds = np.asarray(ds_full)[sel]
+            if len(ds) != fitter.n_bins:
+                raise SystemExit(
+                    f"bin mismatch: model {len(ds)} vs fitter "
+                    f"{fitter.n_bins}; the cache rp_bins and the data rp "
+                    f"binning have to agree")
+            resid = ds - fitter.ds_obs
+            chi2 = float(resid @ fitter.cov_inv @ resid)
+            _print_per_bin(label, fitter.rp_obs, fitter.ds_obs, ds,
+                           fitter.cov_inv)
+            print(f"  {label}: chi2 = {chi2:.2f} over {fitter.n_bins} bins "
+                  f"(chi2/N = {chi2 / fitter.n_bins:.3f}, no free parameters)")
+            print(f"  {label}: ngal = {info['ngal']:.4e}, "
+                  f"fsat = {info['fsat']:.4f}")
+            print(f"  {label}: params = {spec}")
 
 
 def main():
@@ -453,6 +667,16 @@ def main():
         raise SystemExit("Cache has no xi_gm tabulation — regenerate with "
                          "precompute_halo_center_cache.py --tabulate.")
 
+    if args.predict:
+        for case_name in names:
+            fit_case = FIT_CASE_OF[_base_name(case_name)]
+            print(f"\nLoading halo catalogue for case {case_name} ...")
+            halo = build_halo_occupation(fit_case, args.halo_path,
+                                         args.ab_column)
+            predict_at(case_name, fit_case, halo,
+                       TabulatedDeltaSigma(cache, halo), args)
+        return
+
     all_bestfits_arrays = {}
     rp_centers_saved = None
     logM_bins_saved = None
@@ -460,7 +684,8 @@ def main():
     for case_name in names:
         fit_case = FIT_CASE_OF[_base_name(case_name)]
         print(f"\nLoading halo catalogue for case {case_name} ...")
-        halo = build_halo_occupation(fit_case, args.halo_path)
+        halo = build_halo_occupation(fit_case, args.halo_path,
+                                     args.ab_column)
         tab = TabulatedDeltaSigma(cache, halo)
         print(f"  {tab}")
 
@@ -471,7 +696,8 @@ def main():
             logM_bins_saved = logM_bins
 
         for rp_min, vals in bestfits.items():
-            prefix = f"{case_name}_rmin{str(rp_min).replace('.', 'p')}"
+            prefix = (f"{case_name}{_fix_tag(args)}"
+                      f"_rmin{str(rp_min).replace('.', 'p')}")
             all_bestfits_arrays[f"{prefix}_ds"]       = vals['ds']
             all_bestfits_arrays[f"{prefix}_chi2_red"] = np.array(vals['chi2_red'])
             all_bestfits_arrays[f"{prefix}_Meff"]     = np.array(vals['Meff'])
@@ -484,6 +710,9 @@ def main():
 
     if all_bestfits_arrays:
         tag = names[0] if len(names) == 1 else "all"
+        tag += _fix_tag(args)
+        if args.wgg_tab:
+            tag += "_wggjoint"
         if len(args.rp_min_values) == 1:
             tag += f"_rmin{str(args.rp_min_values[0]).replace('.', 'p')}"
         bestfits_path = os.path.join(args.output_dir, f"bestfits_{tag}.npz")

@@ -38,7 +38,8 @@ from typing import Dict, Optional, Tuple
 from scipy.spatial import cKDTree
 from scipy.interpolate import interp1d
 
-from HOD_NRV.utilsf.utils_functions import gauss_legendre_integration
+from HOD_NRV.utilsf.utils_functions import (gauss_legendre_integration,
+                                            SAT_RMAX_RVIR)
 from .standard_two_point_calculator import (
     compute_corr, DeltaSigmaCalculator, binavg_2D
 )
@@ -115,8 +116,37 @@ def compute_xigm_at_position(
 _shared = {}
 
 
-def _process_batch_prequeried(halo_indices):
+def _shell_sums(r, w, s):
+    """Sum particles (or their masses) into the comparison shells.
+
+    bins_comp is geomspace by construction, so the shell index is analytic --
+    floor((log r - log r0) / dlog) -- and one bincount finishes the job.
+    np.histogram cannot know that: handed explicit edges it sorts every
+    neighbour list, and argsorts it when weights are given, which at ~1.3M
+    neighbours per halo costs 67 ms against 4 ms here. Falls back to
+    np.histogram if a caller supplies bins that are not log-uniform.
+    """
+    if s['bin_inv_dlog'] is None:
+        counts, _ = np.histogram(r, bins=s['bins_comp'], weights=w)
+        return counts
+
+    n = s['n_comp_bins']
+    with np.errstate(divide='ignore'):
+        f = (np.log(r) - s['bin_log_lo']) * s['bin_inv_dlog']
+    # r == 0 gives -inf and r < bins_comp[0] gives f < 0; both fail this
+    # comparison, so nothing infinite ever reaches the cast. For f >= 0 the
+    # cast truncates towards zero, which is the floor. r never exceeds
+    # search_radius = bins_comp[-1], and the value that lands exactly on it
+    # belongs in the last shell -- np.histogram closes the final bin too.
+    keep = f >= 0.0
+    i = f[keep].astype(np.int64)
+    np.minimum(i, n - 1, out=i)
+    return np.bincount(i, weights=None if w is None else w[keep], minlength=n)
+
+
+def _process_batch_prequeried(task):
     """Worker: compute xi_gm + DeltaSigma for halos with pre-queried indices."""
+    batch_id, halo_indices = task
     s = _shared
     particle_positions = s['particle_positions']
     halo_positions = s['halo_positions']
@@ -130,6 +160,7 @@ def _process_batch_prequeried(halo_indices):
     chi_max = s['chi_max']
     n_rp_bins = s['n_rp_bins']
     idx_lists = s['idx_lists']
+    particle_masses = s.get('particle_masses')
     n_comp_bins = len(bins_comp) - 1
 
     halo_bin_index = s.get('halo_bin_index')
@@ -148,7 +179,8 @@ def _process_batch_prequeried(halo_indices):
             delta = particle_positions[idx] - halo_positions[i]
             delta -= Lbox * np.round(delta / Lbox)
             r = np.sqrt(np.einsum('ij,ij->i', delta, delta))
-            counts, _ = np.histogram(r, bins=bins_comp)
+            w = None if particle_masses is None else particle_masses[idx]
+            counts = _shell_sums(r, w, s)
             xi_gm = (counts / shell_volumes / n_mean) - 1.0
 
         if tabulate:
@@ -159,12 +191,13 @@ def _process_batch_prequeried(halo_indices):
         results[k] = calc.compute_deltasigma_averaged(rp_bins)
 
     if tabulate:
-        return results, xi_sum, xi_count
-    return results
+        return batch_id, results, xi_sum, xi_count
+    return batch_id, results
 
 
-def _process_batch_with_query(halo_indices):
+def _process_batch_with_query(task):
     """Worker: query KD-tree + compute xi_gm + DeltaSigma for halos."""
+    batch_id, halo_indices = task
     s = _shared
     particle_positions = s['particle_positions']
     halo_positions = s['halo_positions']
@@ -179,6 +212,7 @@ def _process_batch_with_query(halo_indices):
     n_rp_bins = s['n_rp_bins']
     search_radius = s['search_radius']
     kdtree = s['kdtree']
+    particle_masses = s.get('particle_masses')
     n_comp_bins = len(bins_comp) - 1
 
     halo_bin_index = s.get('halo_bin_index')
@@ -206,7 +240,8 @@ def _process_batch_with_query(halo_indices):
                 delta = particle_positions[idx] - halo_positions[i]
                 delta -= Lbox * np.round(delta / Lbox)
                 r = np.sqrt(np.einsum('ij,ij->i', delta, delta))
-                counts, _ = np.histogram(r, bins=bins_comp)
+                w = None if particle_masses is None else particle_masses[idx]
+                counts = _shell_sums(r, w, s)
                 xi_gm = (counts / shell_volumes / n_mean) - 1.0
 
             if tabulate:
@@ -218,8 +253,8 @@ def _process_batch_with_query(halo_indices):
             ptr += 1
 
     if tabulate:
-        return results, xi_sum, xi_count
-    return results
+        return batch_id, results, xi_sum, xi_count
+    return batch_id, results
 
 
 class HaloCenterLensingCache:
@@ -389,7 +424,7 @@ def satellite_radial_nodes(Rvir, conc, f_exp, tau, lambda_NFW,
     Mirrors NFW_jax sampling exactly: NFW component with Rs/lambda_NFW and
     c*lambda_NFW truncated at Rvir (inverse CDF on the same normalized
     radial grid as the sampler); exponential component
-    dN/dr ~ exp(-r/(tau*Rs)) truncated at 3*Rvir.
+    dN/dr ~ exp(-r/(tau*Rs)) truncated at SAT_RMAX_RVIR*Rvir.
 
     Rvir in Mpc/h. u_nodes/u_w are Gauss-Legendre nodes/weights on [0, 1];
     x_norm is the normalized radial grid.
@@ -403,7 +438,7 @@ def satellite_radial_nodes(Rvir, conc, f_exp, tau, lambda_NFW,
         cdf = cdf / cdf[-1]
         comps.append((np.interp(u_nodes, cdf, rbins), (1.0 - f_exp) * u_w))
     if f_exp > 0.0:
-        u_max = 1.0 - np.exp(-3.0 * Rvir / (tau * Rs))
+        u_max = 1.0 - np.exp(-SAT_RMAX_RVIR * Rvir / (tau * Rs))
         comps.append((-tau * Rs * np.log(1.0 - u_nodes * u_max), f_exp * u_w))
 
     r_all = np.concatenate([c[0] for c in comps])
@@ -471,10 +506,12 @@ def precompute_halo_center_lensing(
     rsd_axis: str,
     RHO_M: float,
     rp_bins: np.ndarray,
+    particle_masses: Optional[np.ndarray] = None,
     bins_comp: Optional[np.ndarray] = None,
     verbose: bool = True,
     n_workers: int = -1,
     prequery_all: bool = False,
+    checkpoint_dir: Optional[str] = None,
     chi_max: float = 100.0,
     halo_logM: Optional[np.ndarray] = None,
     halo_fI: Optional[np.ndarray] = None,
@@ -494,6 +531,14 @@ def precompute_halo_center_lensing(
         Halo center positions [Mpc/h]
     particle_positions : np.ndarray, shape (N_particles, 3)
         Matter tracer positions [Mpc/h]
+    particle_masses : np.ndarray, shape (N_particles,), optional
+        Per-particle mass. Required for a hydro (multi-species) particle set,
+        where a gas or star particle must not count the same as a dark matter
+        one: the shell histogram is then mass-weighted and ``n_mean`` becomes
+        the mean *mass* density, so xi_gm is the matter overdensity DeltaSigma
+        needs. Leave as None for an equal-mass (DMO or baryonified-DMO) set --
+        the mass then factors out of numerator and denominator alike and the
+        weighted form reduces exactly to the number count.
     Lbox : float
         Simulation box size [Mpc/h]
     rsd_axis : str
@@ -514,6 +559,12 @@ def precompute_halo_center_lensing(
         via fork COW. Uses more RAM (~18 GB for downsampled case).
         If False (Mode 2), each worker queries the shared KD-tree independently
         for its halos. Lower RAM, slightly less efficient KD-tree queries.
+    checkpoint_dir : str, optional
+        Directory for per-batch phase-3 checkpoints. Each batch is written as
+        it completes and read back on a rerun with the same directory, so a
+        walltime kill costs only the batches in flight. The batch split
+        depends on n_halos and n_workers; a rerun that changes either is
+        rejected rather than silently resumed against a different split.
     chi_max : float, default=100.0
         Maximum line-of-sight distance for the Sigma integral [Mpc/h]
     halo_logM : np.ndarray, optional, shape (N_halos,)
@@ -557,7 +608,8 @@ def precompute_halo_center_lensing(
     if verbose:
         print(f"Precomputing DeltaSigma at {n_halos} halo centers...")
         print(f"  rp_bins: {n_rp_bins} bins from {rp_bins[0]:.3f} to {rp_bins[-1]:.1f} Mpc/h")
-        print(f"  Particles: {len(particle_positions)}")
+        print(f"  Particles: {len(particle_positions)}"
+              f"{' (mass-weighted)' if particle_masses is not None else ''}")
         print(f"  Mode: {'prequery_all' if prequery_all else 'per-worker query'}")
 
     # ── Phase 1: KD-tree build ──
@@ -573,7 +625,16 @@ def precompute_halo_center_lensing(
     volume_total = Lbox**3
     n_particles_total = len(particle_positions)
     shell_volumes = (4.0/3.0) * np.pi * (bins_comp[1:]**3 - bins_comp[:-1]**3)
-    n_mean = n_particles_total / volume_total
+    if particle_masses is None:
+        n_mean = n_particles_total / volume_total
+    else:
+        if len(particle_masses) != n_particles_total:
+            raise ValueError(
+                f"particle_masses has {len(particle_masses)} entries for "
+                f"{n_particles_total} particles.")
+        # Mean mass density, so counts / shell_volume / n_mean is 1 + delta
+        # of the matter field exactly as in the equal-mass case.
+        n_mean = float(np.sum(particle_masses)) / volume_total
 
     tabulate = halo_logM is not None
     if tabulate:
@@ -585,8 +646,19 @@ def precompute_halo_center_lensing(
             print(f"  Tabulating xi_gm in {n_bins} bins "
                   f"({n_logM_bins} logM x {n_fI_bins if halo_fI is not None else 1} fI)")
 
+    # Precompute the analytic shell index for _shell_sums. Uniform in log r
+    # is what geomspace gives; anything else falls back to np.histogram.
+    log_bins = np.log(bins_comp)
+    dlog = np.diff(log_bins)
+    log_uniform = bool(np.all(np.isfinite(log_bins))
+                       and np.allclose(dlog, dlog[0], rtol=1e-12, atol=0.0))
+
     _shared.update({
         'particle_positions': particle_positions,
+        'n_comp_bins': len(bins_comp) - 1,
+        'bin_log_lo': log_bins[0],
+        'bin_inv_dlog': (1.0 / dlog[0]) if log_uniform else None,
+        'particle_masses': particle_masses,
         'halo_positions': halo_positions,
         'bins_comp': bins_comp,
         'shell_volumes': shell_volumes,
@@ -625,21 +697,107 @@ def precompute_halo_center_lensing(
         print(f"  Computing xi_gm + DeltaSigma ({n_halos} halos, n_workers={n_workers})...")
     t0 = time.time()
 
+    # Many small batches rather than one per worker. Splitting into exactly
+    # n_workers giant batches makes pool.map wait on the slowest one, and a
+    # mass-ordered catalogue hands a single worker every massive halo -- the
+    # most expensive ones, since cost scales with the neighbour count. Finer
+    # chunks let the pool rebalance, and imap_unordered reports completions
+    # as they land: without that this phase is silent for ~20h, so a stall is
+    # indistinguishable from work (job 57402361 spent a 24h allocation before
+    # anyone could tell it was going to overrun).
     all_indices = np.arange(n_halos)
-    batches = [arr.tolist() for arr in np.array_split(all_indices, n_workers)]
+    splits = [arr for arr in np.array_split(all_indices, min(n_halos, n_workers * 32))
+              if len(arr)]
+    batches = list(enumerate(arr.tolist() for arr in splits))
+    n_batches = len(batches)
 
+    ordered = [None] * n_batches
+    if tabulate:
+        xi_sum = np.zeros((n_bins, len(bins_comp) - 1))
+        xi_count = np.zeros(n_bins)
+
+    # Checkpoint each batch as it lands. This phase runs for days, holds
+    # everything in memory until the end, and a walltime kill therefore threw
+    # away the whole allocation -- twice. Batches are independent, so a
+    # completed one is worth keeping on its own. ~2.5 MB each.
+    def _ckpt_path(bid):
+        return os.path.join(checkpoint_dir, f"batch_{bid:06d}.npz")
+
+    pending = batches
+    if checkpoint_dir is not None:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        stamp = {'n_halos': n_halos, 'n_batches': n_batches,
+                 'n_rp_bins': n_rp_bins, 'n_bins': n_bins if tabulate else 0}
+        manifest = os.path.join(checkpoint_dir, "manifest.npz")
+        if os.path.exists(manifest):
+            prev = np.load(manifest)
+            bad = {k: (int(prev[k]), v) for k, v in stamp.items()
+                   if k in prev and int(prev[k]) != v}
+            if bad:
+                raise ValueError(
+                    f"checkpoint_dir {checkpoint_dir} was written by a "
+                    f"different run ({bad}, as saved vs now). Batch splits "
+                    f"depend on n_halos and n_workers, so resuming across a "
+                    f"change would mix incompatible halo ranges. Use a fresh "
+                    f"directory or restore the original settings.")
+        else:
+            np.savez(manifest, **stamp)
+
+        pending = []
+        for task in batches:
+            path = _ckpt_path(task[0])
+            if not os.path.exists(path):
+                pending.append(task)
+                continue
+            try:
+                with np.load(path) as ck:
+                    ordered[task[0]] = ck['results']
+                    if tabulate:
+                        xi_sum += ck['xi_sum']
+                        xi_count += ck['xi_count']
+            except Exception as exc:      # truncated by the kill mid-write
+                print(f"    discarding unreadable checkpoint {path}: {exc}")
+                ordered[task[0]] = None
+                pending.append(task)
+        if len(pending) < n_batches:
+            print(f"  resuming: {n_batches - len(pending)}/{n_batches} batches "
+                  f"read back from {checkpoint_dir}")
+
+    n_resumed = n_batches - len(pending)
+    n_done = n_resumed
+    proj = "projected total" if n_resumed == 0 else "projected for this run"
+    t_report = t0
     ctx = mp.get_context('fork')
     with ctx.Pool(n_workers) as pool:
-        results = pool.map(worker_fn, batches)
+        for out in pool.imap_unordered(worker_fn, pending):
+            ordered[out[0]] = out[1]
+            if tabulate:
+                xi_sum += out[2]
+                xi_count += out[3]
+            if checkpoint_dir is not None:
+                path = _ckpt_path(out[0])
+                tmp = path + ".tmp"
+                payload = {'results': out[1]}
+                if tabulate:
+                    payload.update(xi_sum=out[2], xi_count=out[3])
+                with open(tmp, 'wb') as fh:   # a path would get .npz appended
+                    np.savez(fh, **payload)
+                os.replace(tmp, path)     # atomic: a kill leaves no half file
+            n_done += 1
+            elapsed = time.time() - t0
+            if verbose and (n_done == n_batches or time.time() - t_report >= 300):
+                frac = (n_done - n_resumed) / max(len(pending), 1)
+                print(f"    {n_done}/{n_batches} batches "
+                      f"({100 * n_done / n_batches:.1f}%), "
+                      f"{elapsed / 60:.1f} min elapsed, "
+                      f"~{elapsed / frac / 60:.1f} min {proj}",
+                      flush=True)
+                t_report = time.time()
 
+    all_deltasigma = np.vstack(ordered)
     if tabulate:
-        all_deltasigma = np.vstack([r[0] for r in results])
-        xi_sum = np.sum([r[1] for r in results], axis=0)
-        xi_count = np.sum([r[2] for r in results], axis=0)
         xi_gm_bins = np.where(xi_count[:, None] > 0,
                               xi_sum / np.maximum(xi_count, 1)[:, None], 0.0)
-    else:
-        all_deltasigma = np.vstack(results)
 
     t_phase3 = time.time() - t0
     if verbose:
@@ -660,6 +818,7 @@ def precompute_halo_center_lensing(
         'rsd_axis': rsd_axis,
         'n_particles': len(particle_positions),
         'chi_max': chi_max,
+        'mass_weighted': particle_masses is not None,
     }
 
     if tabulate:
@@ -825,7 +984,7 @@ class TabulatedDeltaSigma:
       is the miscentering convolution of Sigma with the projected
       satellite offset distribution. The radial profile (truncated NFW
       rescaled by lambda_NFW + exponential tail with f_exp, tau,
-      truncated at 3 Rvir) is analytic, so arbitrary profile parameters
+      truncated at SAT_RMAX_RVIR Rvir) is analytic, so arbitrary profile parameters
       are exact — no interpolation over profile parameters is needed
       (unlike TabCorr's spline over eta). The inverse-CDF quadrature
       mirrors NFW_jax sampling exactly, so the prediction is the
@@ -912,7 +1071,7 @@ class TabulatedDeltaSigma:
         # ── Tabulate Sigma(R) per bin from mean xi_gm (rho_m units) ──
         r_centers = np.sqrt(cache.bins_comp[:-1] * cache.bins_comp[1:])
         xi = cache.xi_gm_bins
-        R_max = cache.rp_bins[-1] + 3.5 * self.Rvir_m.max()
+        R_max = cache.rp_bins[-1] + (SAT_RMAX_RVIR + 0.5) * self.Rvir_m.max()
         self.R_sigma = np.geomspace(5e-3, min(R_max, chi_max), n_sigma_grid)
 
         t_chi, w_chi = np.polynomial.legendre.leggauss(200)
@@ -977,6 +1136,58 @@ class TabulatedDeltaSigma:
         delta_sigma : np.ndarray [Msun h/pc^2]
         info : dict with ngal, fsat, ds_cen, ds_sat
         """
+        probC, probS = self.halo.HOD.compute_HOD_occupation(
+            np.asarray(self.halo.logM), dict_params
+        )
+        # Bernoulli sampling in populate_centrals clips probC at 1 implicitly
+        probC = np.minimum(np.asarray(probC, dtype=np.float64), 1.0)
+
+        return self.predict_occupation(
+            probC, probS,
+            f_exp=float(dict_params.get('f_exp', 0.0)),
+            tau=float(dict_params.get('tau', 6.0)),
+            lambda_NFW=float(dict_params.get('lambda_NFW', 1.0)),
+            rp_bins=rp_bins,
+        )
+
+    def predict_occupation(
+        self,
+        probC: np.ndarray,
+        probS: np.ndarray,
+        f_exp: float = 0.0,
+        tau: float = 6.0,
+        lambda_NFW: float = 1.0,
+        rp_bins: Optional[np.ndarray] = None,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict]:
+        """
+        Predict DeltaSigma from an EXPLICIT per-halo occupation.
+
+        :meth:`predict` is this method with (probC, probS) evaluated from an
+        HOD, i.e. from halo mass (plus the assembly-bias property) alone.
+        Passing the arrays directly lifts that restriction: they can be the
+        *measured* per-halo galaxy counts, so the prediction is made at the
+        occupation the simulation actually realised, secondary dependences and
+        all. Comparing the two answers whether a mass-only occupation is
+        capable of the measured lensing amplitude at all.
+
+        Only the ratio matters — DeltaSigma is normalised by the occupation
+        sums — so raw integer counts and mean occupation numbers are
+        interchangeable.
+
+        Parameters
+        ----------
+        probC, probS : np.ndarray
+            Per-halo central and satellite occupation, aligned with the cache
+            halo rows. Not clipped: pass what you mean.
+        f_exp, tau, lambda_NFW : float
+            Satellite radial profile parameters.
+        rp_bins : np.ndarray, optional
+            Projected bin edges; defaults to (and must match) cache.rp_bins.
+
+        Returns
+        -------
+        rp_centers, delta_sigma, info
+        """
         if rp_bins is None:
             rp_bins = self.cache.rp_bins
         elif not np.allclose(rp_bins, self.cache.rp_bins):
@@ -984,16 +1195,12 @@ class TabulatedDeltaSigma:
                              "are pre-averaged on that binning).")
         rp_centers = self.cache.rp_centers
 
-        f_exp = float(dict_params.get('f_exp', 0.0))
-        tau = float(dict_params.get('tau', 6.0))
-        lambda_NFW = float(dict_params.get('lambda_NFW', 1.0))
-
-        probC, probS = self.halo.HOD.compute_HOD_occupation(
-            np.asarray(self.halo.logM), dict_params
-        )
-        # Bernoulli sampling in populate_centrals clips probC at 1 implicitly
-        probC = np.minimum(np.asarray(probC, dtype=np.float64), 1.0)
+        probC = np.asarray(probC, dtype=np.float64)
         probS = np.asarray(probS, dtype=np.float64)
+        if len(probC) != len(self.cache.positions) or len(probS) != len(probC):
+            raise ValueError(
+                f"occupation arrays ({len(probC)}, {len(probS)}) must have one "
+                f"entry per cache halo ({len(self.cache.positions)}).")
 
         sum_C, sum_S = probC.sum(), probS.sum()
         ngal = (sum_C + sum_S) / self.halo.Lbox ** 3
@@ -1035,31 +1242,27 @@ class TabulatedDeltaSigma:
         info = {'ngal': ngal, 'fsat': fsat, 'ds_cen': ds_cen, 'ds_sat': ds_sat}
         return rp_centers, ds_total, info
 
-    def make_predict_jax(self, n_sub_logM: int = 16, n_sub_fI: int = 4):
-        """Build a pure-JAX twin of :meth:`predict` for jit/vmap sampling.
+    def _occupation_cells(self, n_sub_logM: int = 16, n_sub_fI: int = 4):
+        """Fine (logM, fI) occupation grid nested in the cache tabulation bins.
 
-        Returns ``predict_fn(params) -> (ds_total, ngal, fsat)`` where
-        ``params`` is a dict of (traced) scalars. The satellite pipeline is
-        the exact jnp translation of :meth:`predict` (the scipy cubic-spline
-        stages are linear in their inputs and are precomputed as matrices by
-        probing the NumPy code with unit vectors). The centrals — exact
-        per-halo sums in :meth:`predict` — are tabulated on a fine
-        (n_m*n_sub_logM, n_f*n_sub_fI) occupation grid nested inside the
-        cache bins: profile sums are exact, only the occupation weight is
-        evaluated at the per-cell mean (logM, fI) instead of per halo.
-
-        The ngal/fsat catalog sums use the same fine grid. AB is supported
-        for ``ab_method`` 'mass' or 'direct' with a single AB property
-        (fI or fE); 'direct' uses exact per-cell means of sign(prop).
+        Shared by :meth:`make_predict_jax` and :meth:`make_ngal_fns`: halos are
+        binned into ``n_sub_logM * n_sub_fI`` sub-cells per cache bin so the
+        occupation can be evaluated at the per-cell mean (logM, fI) instead of
+        per halo. Returns the cell assignment, counts and per-cell means, plus
+        the assembly-bias property and the coefficient names that multiply it.
+        Cached per (n_sub_logM, n_sub_fI).
         """
-        import jax
-        import jax.numpy as jnp
-        from ..HOD_models import build_occupation_fn_jax
+        key = (n_sub_logM, n_sub_fI)
+        cache = getattr(self, '_occ_cells_cache', None)
+        if cache is None:
+            cache = self._occ_cells_cache = {}
+        if key in cache:
+            return cache[key]
 
         occ = self.halo.HOD
         if occ.assembly_bias and occ.ab_method not in ("mass", "direct"):
             raise NotImplementedError(
-                "make_predict_jax supports ab_method 'mass' or 'direct'.")
+                "occupation cells support ab_method 'mass' or 'direct'.")
 
         # ── AB property and the coefficient names that multiply it ──
         prop = None
@@ -1067,7 +1270,7 @@ class TabulatedDeltaSigma:
         if occ.assembly_bias:
             if occ.fI is not None and occ.fE is not None:
                 raise NotImplementedError(
-                    "make_predict_jax supports a single AB property (fI or fE).")
+                    "occupation cells support a single AB property (fI or fE).")
             if occ.fI is not None:
                 prop, cen_coef, sat_coef = np.asarray(occ.fI), "A_cent", "A_sat"
             else:
@@ -1116,6 +1319,92 @@ class TabulatedDeltaSigma:
         else:
             prop_cell = np.zeros(n_cells)
             sign_cell = np.zeros(n_cells)
+
+        cache[key] = dict(
+            prop=prop, cen_coef=cen_coef, sat_coef=sat_coef,
+            cell=cell, n_cells=n_cells, n_mc=n_mc, n_fc=n_fc,
+            n_sub_logM=n_sub_logM, n_sub_fI=n_sub_fI,
+            N_cell=N_cell, logM_cell=logM_cell,
+            prop_cell=prop_cell, sign_cell=sign_cell)
+        return cache[key]
+
+    def make_ngal_jax(self, n_sub_logM: int = 16, n_sub_fI: int = 4):
+        """Catalogue-sum ngal on the same fine cells as :meth:`make_predict_jax`.
+
+        Returns ``ngal_fn(params) -> ngal`` [(Mpc/h)^-3]: the jnp twin of the
+        ``(sum_C + sum_S) / Lbox^3`` that ``predict_fn`` reports, i.e. the halo
+        catalogue's own number density with assembly bias applied. Anchoring
+        the (Ac, As) rescale on this instead of an analytic mass function keeps
+        the rescale consistent with the catalogue the profiles are summed over.
+
+        Both occupations are linear in their amplitude (Ac for centrals, As for
+        satellites, see HOD_models), so ngal is linear in a common (Ac, As)
+        rescale factor and one division inverts it exactly — provided probC
+        stays below the ``min(probC, 1)`` clip and the 'direct' AB kink at 0.5,
+        which holds for the Ac ~ 1e-2 amplitudes used here.
+        """
+        import jax.numpy as jnp
+        from ..HOD_models import build_occupation_fn_jax
+
+        occ = self.halo.HOD
+        cells = self._occupation_cells(n_sub_logM, n_sub_fI)
+        cen_coef, sat_coef = cells['cen_coef'], cells['sat_coef']
+        n_mc, n_fc = cells['n_mc'], cells['n_fc']
+        j_logM_cell = jnp.asarray(cells['logM_cell'].reshape(n_mc, n_fc))
+        j_prop_cell = jnp.asarray(cells['prop_cell'].reshape(n_mc, n_fc))
+        j_sign_cell = jnp.asarray(cells['sign_cell'].reshape(n_mc, n_fc))
+        j_N_cell = jnp.asarray(cells['N_cell'].reshape(n_mc, n_fc))
+        occ_fn = build_occupation_fn_jax(occ)
+        Lbox3 = self.halo.Lbox ** 3
+        has_ab, ab_method = occ.assembly_bias, occ.ab_method
+
+        def ngal_fn(params):
+            cshift = sshift = 0.0
+            if has_ab and ab_method == "mass":
+                cshift = params.get(cen_coef, 0.0) * j_prop_cell
+                sshift = params.get(sat_coef, 0.0) * j_prop_cell
+            probC, probS = occ_fn(j_logM_cell, params, cshift, sshift)
+            if has_ab and ab_method == "direct":
+                ab_c = params.get(cen_coef, 0.0) * j_sign_cell
+                ab_s = params.get(sat_coef, 0.0) * j_sign_cell
+                probC = probC + ab_c * jnp.minimum(probC, 1.0 - probC)
+                probS = probS * (1.0 + ab_s)
+            probC = jnp.minimum(probC, 1.0)
+            return jnp.sum((probC + probS) * j_N_cell) / Lbox3
+
+        return ngal_fn
+
+    def make_predict_jax(self, n_sub_logM: int = 16, n_sub_fI: int = 4):
+        """Build a pure-JAX twin of :meth:`predict` for jit/vmap sampling.
+
+        Returns ``predict_fn(params) -> (ds_total, ngal, fsat)`` where
+        ``params`` is a dict of (traced) scalars. The satellite pipeline is
+        the exact jnp translation of :meth:`predict` (the scipy cubic-spline
+        stages are linear in their inputs and are precomputed as matrices by
+        probing the NumPy code with unit vectors). The centrals — exact
+        per-halo sums in :meth:`predict` — are tabulated on a fine
+        (n_m*n_sub_logM, n_f*n_sub_fI) occupation grid nested inside the
+        cache bins: profile sums are exact, only the occupation weight is
+        evaluated at the per-cell mean (logM, fI) instead of per halo.
+
+        The ngal/fsat catalog sums use the same fine grid. AB is supported
+        for ``ab_method`` 'mass' or 'direct' with a single AB property
+        (fI or fE); 'direct' uses exact per-cell means of sign(prop).
+        """
+        import jax
+        import jax.numpy as jnp
+        from ..HOD_models import build_occupation_fn_jax
+
+        occ = self.halo.HOD
+        cells = self._occupation_cells(n_sub_logM, n_sub_fI)
+        prop = cells['prop']
+        cen_coef, sat_coef = cells['cen_coef'], cells['sat_coef']
+        cell, n_cells = cells['cell'], cells['n_cells']
+        n_mc, n_fc = cells['n_mc'], cells['n_fc']
+        n_sub_fI = cells['n_sub_fI']
+        N_cell, logM_cell = cells['N_cell'], cells['logM_cell']
+        prop_cell, sign_cell = cells['prop_cell'], cells['sign_cell']
+
 
         n_rp = len(self.cache.rp_centers)
         D_cen = np.empty((n_cells, n_rp))
@@ -1200,7 +1489,7 @@ class TabulatedDeltaSigma:
                 cdf = jnp.log1p(x) - x / (1.0 + x)
                 cdf = cdf / cdf[-1]
                 r_nfw = jnp.interp(j_u_nodes, cdf, j_x_norm * Rvir)
-                u_max = 1.0 - jnp.exp(-3.0 * Rvir / (tau * Rs))
+                u_max = 1.0 - jnp.exp(-SAT_RMAX_RVIR * Rvir / (tau * Rs))
                 r_exp = -tau * Rs * jnp.log1p(-j_u_nodes * u_max)
                 r_all = jnp.concatenate([r_nfw, r_exp])
                 w_r = jnp.concatenate([(1.0 - f_exp) * j_u_w, f_exp * j_u_w])

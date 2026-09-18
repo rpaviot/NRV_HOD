@@ -627,6 +627,56 @@ class EmulatorFitter:
 # TabulatedFitter — Nautilus sampler backed by TabulatedDeltaSigma (no emulator)
 # ---------------------------------------------------------------------------
 
+def _solve_ngal_rescale(ngal_fn, merged, target_ngal, Ac_fiducial, n_iter=6):
+    """Common (Ac, As) factor putting the catalogue ngal on ``target_ngal``.
+
+    Both occupations are linear in their amplitude, so while probC stays
+    below the ``min(probC, 1)`` clip the first division is already exact.
+    The clip makes ngal concave in the factor — for the ELG fits it is
+    active over ~12% of the posterior volume, where the peak central
+    occupation approaches 1 — so a few fixed-point steps follow. They cost
+    one occupation evaluation on the tabulation's cell grid each, which is
+    negligible next to the DeltaSigma forward pass, and are a no-op (to
+    round-off) on the unclipped branch.
+
+    Works for concrete floats and for jnp tracers alike: the loop is
+    unrolled at trace time.
+    """
+    As_raw = merged["As"]
+    rf = target_ngal / ngal_fn({**merged, "Ac": Ac_fiducial})
+    for _ in range(n_iter):
+        rf = rf * target_ngal / ngal_fn(
+            {**merged, "Ac": Ac_fiducial * rf, "As": As_raw * rf})
+    return rf
+
+
+def _make_ngal_mf_jax(occ):
+    """Analytic mass-function ngal: jnp twin of ``compute_ngal_``.
+
+    Trapezoid rather than ``compute_ngal_``'s CubicSpline + Gauss-Legendre so
+    the same callable serves ``full_params`` and the jit/vmap likelihood; on
+    the 1024-point logM grid the two agree far inside the ~8% the mass function
+    itself is off by.
+
+    No ``min(probC, 1)`` clip enters here (``_compute_prob_bins`` has none), so
+    ngal is exactly linear in a common (Ac, As) factor and the first division
+    in :func:`_solve_ngal_rescale` already inverts it — the fixed-point steps
+    are no-ops on this anchor.
+    """
+    import jax.numpy as jnp
+    from HOD_NRV.HOD_numerical.HOD_models import build_occupation_fn_jax
+
+    occ_fn = build_occupation_fn_jax(occ)
+    j_logM = jnp.asarray(np.asarray(occ.logM_bins))
+    j_mf = jnp.asarray(np.asarray(occ.mass_function))
+
+    def ngal_fn(params):
+        probC, probS = occ_fn(j_logM, params)
+        return jnp.trapezoid(j_mf * (probC + probS), j_logM)
+
+    return ngal_fn
+
+
 class TabulatedFitter(EmulatorFitter):
     """
     Nautilus sampler calling TabulatedDeltaSigma.predict() directly.
@@ -645,8 +695,24 @@ class TabulatedFitter(EmulatorFitter):
     tabulated_ds : TabulatedDeltaSigma
         Predictor built from a cache with xi_gm tabulation.
     occupation_rescale : Occupation
-        NON-assembly-bias Occupation used only for the (Ac, As) -> ngal
-        rescaling (mirrors _full_rescaled_params in run_emulator_chains).
+        Supplies the analytic mass function used when
+        ``ngal_anchor="mass_function"`` (see that parameter); ignored under
+        the catalogue anchor.
+    ngal_anchor : {"catalogue", "mass_function"}
+        What the (Ac, As) -> ``target_ngal`` rescale is anchored on.
+
+        ``"mass_function"`` integrates ``occupation_rescale`` against its
+        analytic mass function (the grid-pipeline convention). Use it when the
+        assembly-bias amplitudes are *fixed at zero*: the occupation is then a
+        plain function of M, so an error in the mass function is absorbed
+        entirely into the absolute (Ac, As) -- which cancels out of DeltaSigma
+        and wgg, since both only see the Ac/As ratio.
+
+        ``"catalogue"`` sums the occupation over the tabulation's own halo
+        cells with assembly bias applied. Required when B_cent/B_sat are
+        sampled: AB reweights halos by their fI/fE split at fixed mass, which
+        no mass-function integral can see, so the analytic anchor would set
+        the wrong Ac/As ratio rather than just the wrong absolute scale.
     target_ngal : float
         Galaxy number density the (Ac, As) pair is rescaled to.
     Other arguments are as in EmulatorFitter (data_path / arrays, rp cuts,
@@ -669,7 +735,13 @@ class TabulatedFitter(EmulatorFitter):
         param_config: Optional[dict] = None,
         max_fsat: Optional[float] = None,
         Ac_fiducial: float = 0.01,
+        ngal_anchor: str = "catalogue",
         hod_occupation=None,
+        tabulated_wgg=None,
+        data_path_wgg: str = "",
+        rp_min_wgg: Optional[float] = None,
+        rp_max_wgg: Optional[float] = None,
+        n_wgg_threads: int = 1,
     ):
         self.fit_case = FitCase(fit_case)
         self.M1_fixed = M1_fixed
@@ -678,10 +750,17 @@ class TabulatedFitter(EmulatorFitter):
         self.rp_max = rp_max
 
         self.max_fsat = max_fsat
+        self.n_wgg_threads = n_wgg_threads
         self.Ac_fiducial = Ac_fiducial
         self.hod_occupation = hod_occupation
         if max_fsat is not None and hod_occupation is None:
             raise ValueError("max_fsat requires hod_occupation.")
+
+        if ngal_anchor not in ("catalogue", "mass_function"):
+            raise ValueError(
+                f"ngal_anchor must be 'catalogue' or 'mass_function', "
+                f"got {ngal_anchor!r}")
+        self.ngal_anchor = ngal_anchor
 
         self.tab = tabulated_ds
         self.occupation_rescale = occupation_rescale
@@ -714,7 +793,34 @@ class TabulatedFitter(EmulatorFitter):
             raise ValueError("Provide data_path or (ds_obs, cov_inv, rp_obs).")
 
         self._setup_interp()
+
+        # ── optional joint wgg (TabulatedWgg predictor + data on the same
+        # rp_bins; prediction is bin-averaged so no interpolation needed) ──
         self._fit_wgg = False
+        if tabulated_wgg is not None:
+            if not data_path_wgg:
+                raise ValueError("tabulated_wgg given but no data_path_wgg.")
+            self.tab_wgg = tabulated_wgg
+            wdata = np.load(data_path_wgg)
+            edges = wdata["rp_bins_wgg"] if "rp_bins_wgg" in wdata.files \
+                else wdata["rp_bins"]
+            wgg = wdata["wgg"]
+            cov = wdata["cov_wgg"]
+            centers = np.sqrt(edges[:-1] * edges[1:])
+            mask = np.ones(len(wgg), dtype=bool)
+            if rp_min_wgg is not None:
+                mask &= centers >= rp_min_wgg
+            if rp_max_wgg is not None:
+                mask &= centers <= rp_max_wgg
+            idx = np.nonzero(mask)[0]
+            if len(idx) == 0 or not np.all(np.diff(idx) == 1):
+                raise ValueError("wgg scale cut must select a contiguous, "
+                                 "non-empty rp range.")
+            self.rp_bins_wgg = edges[idx[0]:idx[-1] + 2]
+            self.wgg_obs = wgg[mask]
+            self.cov_inv_wgg = np.linalg.inv(cov[np.ix_(mask, mask)])
+            self.rp_obs_wgg = centers[mask]
+            self._fit_wgg = True
 
         if param_config is not None:
             priors, fixed = _parse_param_config(param_config)
@@ -744,16 +850,37 @@ class TabulatedFitter(EmulatorFitter):
         self.param_names = [p[0] for p in active]
         self.n_params = len(active)
 
+    @property
+    def ngal_fn(self):
+        """ngal the (Ac, As) rescale is anchored on -- see ``ngal_anchor``.
+
+        Either the catalogue sum over the tabulation's fine occupation cells
+        (assembly bias included) or the analytic mass-function integral. Both
+        are jnp-traceable, so ``full_params`` and the jit/vmap likelihood
+        rescale identically by construction.
+        """
+        fn = getattr(self, "_ngal_fn", None)
+        if fn is None:
+            fn = self._ngal_fn = (
+                _make_ngal_mf_jax(self.occupation_rescale)
+                if self.ngal_anchor == "mass_function"
+                else self.tab.make_ngal_jax())
+        return fn
+
     def full_params(self, free_dict):
-        """Merge free + fixed and rescale (Ac, As) to target_ngal."""
-        from HOD_NRV.HOD_numerical.HOD_models import rescale_Ac_to_target_ngal
+        """Merge free + fixed and rescale (Ac, As) to target_ngal.
+
+        Anchored on ``self.ngal_fn``, i.e. on the halo catalogue sum or on the
+        analytic mass function according to ``ngal_anchor``. Both occupations
+        are linear in their amplitude, so the single division is exact on the
+        unclipped branch.
+        """
         merged = {**self.fixed_params_dict, **free_dict}
         merged.pop("Ac", None)
-        Ac, As = rescale_Ac_to_target_ngal(
-            self.occupation_rescale, merged, self.target_ngal,
-            Ac_fiducial=self.Ac_fiducial)
-        return {**merged, "Ac": float(np.asarray(Ac).ravel()[0]),
-                "As": float(np.asarray(As).ravel()[0])}
+        rf = float(_solve_ngal_rescale(self.ngal_fn, merged, self.target_ngal,
+                                       self.Ac_fiducial))
+        return {**merged, "Ac": self.Ac_fiducial * rf,
+                "As": float(merged["As"]) * rf}
 
     def predict_at_obs(self, free_dict, rp_eval=None):
         """Tabulated DeltaSigma log-log interpolated onto rp_eval (or rp_obs)."""
@@ -765,6 +892,17 @@ class TabulatedFitter(EmulatorFitter):
         log_rp = np.log(rp_eval) if rp_eval is not None else self._log_rp_obs
         spl = CubicSpline(self._log_rp_emu, np.log(np.maximum(ds_pred, 1e-30)))
         return np.exp(spl(log_rp))
+
+    def predict_wgg_at_obs(self, free_dict, rp_bins=None):
+        """Tabulated wgg bin-averaged on the observed rp_bins (nested in
+        the wgg tabulation's fine grid — same bins as the data, so no
+        interpolation)."""
+        full = self.full_params(free_dict)
+        bins = self.rp_bins_wgg if rp_bins is None else rp_bins
+        _, wgg, _ = self.tab_wgg.predict(full, bins)
+        if not np.all(np.isfinite(wgg)):
+            raise ValueError("non-finite tabulated wgg prediction")
+        return wgg
 
     def log_likelihood(self, theta) -> float:
         if isinstance(theta, dict):
@@ -793,7 +931,20 @@ class TabulatedFitter(EmulatorFitter):
             return -1e100
 
         residual = ds_at_obs - self.ds_obs
-        return -0.5 * float(residual @ self.cov_inv @ residual)
+        logL = -0.5 * float(residual @ self.cov_inv @ residual)
+
+        if self._fit_wgg:
+            try:
+                wgg = self.predict_wgg_at_obs(free_dict)
+            except Exception:
+                return -1e100
+            r = wgg - self.wgg_obs
+            chi2 = float(r @ self.cov_inv_wgg @ r)
+            if not np.isfinite(chi2):
+                return -1e100
+            logL -= 0.5 * chi2
+
+        return logL
 
     def build_batched_loglike(self, pad_to: int = 32, vmap_chunk: int = 8):
         """Build a jit-compiled batched log-likelihood for ``vectorized=True``.
@@ -802,11 +953,11 @@ class TabulatedFitter(EmulatorFitter):
         ``(n, n_free)`` array (columns in ``free_names`` = nautilus prior
         order) to an ``(n,)`` numpy array of log-likelihoods. It is the
         batched twin of :meth:`log_likelihood`: the (Ac, As) -> target_ngal
-        rescale, the tabulated forward pass and the log-log cubic
-        interpolation onto the observed rp grid are all reproduced in pure
-        jnp. The scipy cubic-spline stages (ngal GL integral, rp
-        interpolation) are linear in their inputs and precomputed as
-        matrices by probing the exact NumPy code with basis vectors.
+        rescale (anchored per ``ngal_anchor``), the tabulated forward
+        pass and the log-log cubic interpolation onto the observed rp grid
+        are all reproduced in pure jnp. The scipy cubic-spline rp
+        interpolation is linear in its inputs and precomputed as a matrix
+        by probing the exact NumPy code with basis vectors.
         Points run through ``jax.lax.map`` over ``vmap``-ed chunks of
         ``vmap_chunk`` points (caps the transient satellite-convolution
         tensor at ~vmap_chunk * 0.25 GB while giving XLA large ops to
@@ -817,24 +968,15 @@ class TabulatedFitter(EmulatorFitter):
         import jax.numpy as jnp
         from scipy.interpolate import CubicSpline
         from HOD_NRV.HOD_numerical.HOD_models import (
-            build_occupation_fn_jax, ELG_satellite_cutoff, HOD_satellite,
+            ELG_satellite_cutoff, HOD_satellite,
         )
-        from HOD_NRV.utilsf.utils_functions import x_legendre, w_legendre
 
         predict_fn = self.tab.make_predict_jax()
 
-        # ── ngal rescale: GL integral of a CubicSpline is linear in the
-        # integrand values on logM_bins — probe it once with the identity ──
-        occ_r = self.occupation_rescale
-        logMb = np.asarray(occ_r.logM_bins)
-        a, b = logMb.min(), logMb.max()
-        gl_nodes = 0.5 * ((b - a) * np.asarray(x_legendre) + (a + b))
-        basis_at_nodes = CubicSpline(logMb, np.eye(len(logMb)))(gl_nodes)
-        W_ngal = 0.5 * (b - a) * (np.asarray(w_legendre) @ basis_at_nodes)
-        occ_r_fn = build_occupation_fn_jax(occ_r)
-        j_logMb = jnp.asarray(logMb)
-        j_mf = jnp.asarray(np.asarray(occ_r.mass_function))
-        j_W_ngal = jnp.asarray(W_ngal)
+        # ── ngal rescale: catalogue sum or analytic mass function, per
+        # ``ngal_anchor`` (the property hands back the matching jnp callable,
+        # the same one ``full_params`` uses) ──
+        ngal_fn = self.ngal_fn
 
         # ── obs-grid interpolation: log-log CubicSpline is linear in
         # log(ds) on the cache rp grid ──
@@ -876,10 +1018,8 @@ class TabulatedFitter(EmulatorFitter):
                 fsat_gate = (jnp.trapezoid(j_mf_fs * pS, j_logMb_fs)
                              / jnp.trapezoid(j_mf_fs * (pC + pS), j_logMb_fs))
 
-            # (Ac, As) -> target_ngal rescale (mass-function ngal, no AB)
-            probC, probS = occ_r_fn(j_logMb, {**merged, "Ac": Ac_fid})
-            ngal_fid = j_W_ngal @ (j_mf * (probC + probS))
-            rf = target_ngal / ngal_fid
+            # (Ac, As) -> target_ngal rescale (anchor per ngal_anchor)
+            rf = _solve_ngal_rescale(ngal_fn, merged, target_ngal, Ac_fid)
             full = {**merged, "Ac": Ac_fid * rf, "As": merged["As"] * rf}
 
             ds, ngal, fsat = predict_fn(full)
@@ -908,4 +1048,62 @@ class TabulatedFitter(EmulatorFitter):
                 points = np.vstack([points, np.repeat(points[-1:], n_pad, 0)])
             return np.asarray(compiled(jnp.asarray(points)))[:n]
 
-        return loglike_fn, free_names
+        if not self._fit_wgg:
+            return loglike_fn, free_names
+
+        # ── joint wgg: TabulatedWgg.predict has no jax twin, so add its
+        # chi2 on top of the batched DeltaSigma logL, one point at a time.
+        # The points of a batch are independent and TabulatedWgg.predict is
+        # NumPy (whose heavy kernels release the GIL), so they run on a
+        # thread pool: threads, not processes, because predict still calls
+        # the jitted occupation and JAX deadlocks after a fork — while it is
+        # fine from threads of the main process. Points already rejected by
+        # the DeltaSigma term are skipped. ──
+        import copy
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = (ThreadPoolExecutor(self.n_wgg_threads)
+                if self.n_wgg_threads > 1 else None)
+        _tls = threading.local()
+
+        def _thread_wgg():
+            """Per-thread TabulatedWgg clone.
+
+            Occupation.set_params stores the parameter vector on the
+            Occupation instance, so two threads predicting at once would
+            overwrite each other's parameters. The clones are shallow: the
+            tabulation and all per-halo arrays stay shared (read-only), only
+            the mutable Occupation is duplicated.
+            """
+            tw = getattr(_tls, "tab_wgg", None)
+            if tw is None:
+                tw = copy.copy(self.tab_wgg)
+                tw.halo = copy.copy(tw.halo)
+                tw.halo.HOD = copy.copy(tw.halo.HOD)
+                _tls.tab_wgg = tw
+            return tw
+
+        def _wgg_chi2(theta_row):
+            try:
+                full = self.full_params(dict(zip(free_names, theta_row)))
+                _, wgg, _ = _thread_wgg().predict(full, self.rp_bins_wgg)
+                if not np.all(np.isfinite(wgg)):
+                    return np.inf
+                r = wgg - self.wgg_obs
+                return float(r @ self.cov_inv_wgg @ r)
+            except Exception:
+                return np.inf
+
+        def joint_loglike_fn(points):
+            logl = np.array(loglike_fn(points))
+            pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
+            todo = [k for k in range(len(pts)) if logl[k] > -1e99]
+            if not todo:
+                return logl
+            mapper = pool.map if pool is not None else map
+            for k, chi2 in zip(todo, mapper(_wgg_chi2, [pts[k] for k in todo])):
+                logl[k] = logl[k] - 0.5 * chi2 if np.isfinite(chi2) else -1e100
+            return logl
+
+        return joint_loglike_fn, free_names

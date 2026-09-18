@@ -258,7 +258,7 @@ def extended_NFW_satellites_positions(key, halo_centers, Rvir, c, N_s, N_s_tot,
     u_samples = random_uniform_jax(key_exp, (N_s_tot,))
 
     # Exponential component
-    Rmax_exp = sat_Rvir * 3.0
+    Rmax_exp = sat_Rvir * SAT_RMAX_RVIR
     radii_exp = vmap(single_exponential_inverse_CDF_continuous, in_axes=(0, None, 0, 0))(
         u_samples, tau, sat_Rs, Rmax_exp
     )
@@ -316,7 +316,7 @@ def extended_elliptical_NFW_satellites_positions(key, halo_centers, Rvir, c,
     u_samples = random_uniform_jax(key_exp, (N_s_tot,))
 
     # Exponential component
-    Rmax_exp = sat_Rvir * 3.0
+    Rmax_exp = sat_Rvir * SAT_RMAX_RVIR
     radii_exp = vmap(single_exponential_inverse_CDF_continuous, in_axes=(0, None, 0, 0))(
         u_samples, tau, sat_Rs, Rmax_exp
     )

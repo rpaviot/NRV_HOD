@@ -266,6 +266,59 @@ class TabulatedWgg:
                       left=f_vals[0], right=0.0)
         return (f @ self._phi_w) @ w_rho          # on out_rp
 
+    def _convolve_operator(self, grid_rp, rho, w_rho):
+        """Matrix form of :meth:`_convolve` for out_rp == grid_rp.
+
+        ``_convolve`` is linear in ``f_vals`` — np.interp is piecewise linear
+        in the tabulated values, followed by two fixed contractions — so the
+        kernel is an (n_rp, n_rp) matrix M with ``M @ f == _convolve(f)``.
+        Building M costs one convolution, after which the O(n_m^2) sat-sat
+        pairs are matmuls rather than 2 * n_m^2 convolutions.
+        """
+        g = np.asarray(grid_rp)
+        n = len(g)
+        d = np.sqrt(np.maximum(
+            g[:, None, None] ** 2 + rho[None, :, None] ** 2
+            + 2.0 * g[:, None, None] * rho[None, :, None]
+            * self._cos_phi[None, None, :], 0.0)).ravel()
+
+        shape = (n, len(rho), len(self._cos_phi))
+        rows = self._operator_rows(shape)
+
+        # Linear-interpolation weights on the bracketing nodes. Clipping the
+        # index and t to [0, 1] reproduces np.interp's left=f_vals[0] below
+        # the grid; zeroing the weight above it reproduces right=0.0.
+        idx = np.clip(np.searchsorted(g, d) - 1, 0, n - 2)
+        t = np.clip((d - g[idx]) / (g[idx + 1] - g[idx]), 0.0, 1.0)
+        w = np.where(d > g[-1], 0.0,
+                     np.broadcast_to((w_rho[:, None] * self._phi_w[None, :])[None],
+                                     shape).ravel())
+        w_hi = w * t
+        w_lo = w - w_hi
+
+        M = (np.bincount(rows * n + idx, w_lo, n * n)
+             + np.bincount(rows * n + idx + 1, w_hi, n * n))
+        return M.reshape(n, n)
+
+    def _pair_triangle(self, n):
+        """Upper-triangle node-pair indices and their multiplicity, cached."""
+        cache = getattr(self, '_tri_cache', None)
+        if cache is None:
+            cache = self._tri_cache = {}
+        if n not in cache:
+            iu, ju = np.triu_indices(n)
+            cache[n] = (iu, ju, np.where(iu == ju, 1.0, 2.0))
+        return cache[n]
+
+    def _operator_rows(self, shape):
+        """Row index of every (out_rp, rho, phi) entry, cached per shape."""
+        cache = getattr(self, '_rows_cache', None)
+        if cache is None:
+            cache = self._rows_cache = {}
+        if shape not in cache:
+            cache[shape] = np.repeat(np.arange(shape[0]), shape[1] * shape[2])
+        return cache[shape]
+
     def predict(
         self,
         dict_params: Dict,
@@ -330,28 +383,27 @@ class TabulatedWgg:
                 self.i_m, weights=probS * self._conc, minlength=self.n_m)
                 / np.maximum(wS_m, 1e-300), self.conc_m)
 
-        kernels = [self._kernel(Rvir_w[m], conc_w[m], f_exp, tau, lam)
-                   for m in range(self.n_m)]
+        # Kernels as (n_rp, n_rp) operators. Mass bins with no satellites
+        # contribute nothing (both profiles below are weighted by S), so
+        # their operator is left at zero rather than built.
+        n_rp_tab = len(rp_tab)
+        K = np.zeros((self.n_m, n_rp_tab, n_rp_tab))
+        for m in np.nonzero(wS_m > 0)[0]:
+            K[m] = self._convolve_operator(
+                rp_tab, *self._kernel(Rvir_w[m], conc_w[m], f_exp, tau, lam))
 
         # cen-sat: 2 * Sum_m [Sum_i C_i Sum_{j in m} S_j wp_ij] * K_m
-        for m in range(self.n_m):
-            sel = slice(m * self.n_f, (m + 1) * self.n_f)
-            prof = np.einsum('jr,j->r', cs_j[sel], S[sel])
-            if not np.any(prof):
-                continue
-            total += 2.0 * self._convolve(rp_tab, rp_tab, prof, *kernels[m])
+        P_cs = np.einsum('mfr,mf->mr', cs_j.reshape(self.n_m, self.n_f, -1),
+                         S.reshape(self.n_m, self.n_f))
+        total += 2.0 * np.einsum('mij,mj->i', K, P_cs)
 
-        # sat-sat: Sum_{m<=m'} (2 - delta) G_mm' * K_m * K_m'
+        # sat-sat: Sum_{m<=m'} (2 - delta) K_m' K_m G_mm'
         G = np.einsum('mjr,j->mjr', ss_i, S)   # weight j by S then group
         G = G.reshape(self.n_m, self.n_m, self.n_f, -1).sum(axis=2)  # (n_m,n_m,n_rp)
-        for m in range(self.n_m):
-            for mp in range(m, self.n_m):
-                prof = G[m, mp]
-                if not np.any(prof):
-                    continue
-                mult = 1.0 if m == mp else 2.0
-                inner = self._convolve(rp_tab, rp_tab, prof, *kernels[m])
-                total += mult * self._convolve(rp_tab, rp_tab, inner, *kernels[mp])
+        inner = (K @ G.transpose(0, 2, 1)).transpose(0, 2, 1)   # [m,n,i]
+        mult = np.triu(np.full((self.n_m, self.n_m), 2.0), 1) + np.eye(self.n_m)
+        T = np.einsum('mn,mni->ni', mult, inner)
+        total += np.einsum('nij,nj->i', K, T)
 
         # Exact aggregation of nested fine bins onto rp_bins: wp combines
         # with annulus-area weights (RR separable in rp, pi), matching the
@@ -388,6 +440,9 @@ class TabulatedWgg:
             if P_ss[g] > 0:
                 # rho1, rho2 nodes; relative-angle CDF is analytic:
                 # Pr(|d rho| <= R) = arccos((rho1^2+rho2^2-R^2)/(2 rho1 rho2))/pi
+                # The integrand is symmetric under rho1 <-> rho2, so only the
+                # upper triangle of the node pairs is evaluated (off-diagonal
+                # pairs carry weight 2) — half the arccos calls, same sum.
                 r, w_r = satellite_radial_nodes(
                     self.Rvir_g[g], self.conc_g[g], f_exp, tau, lam,
                     self._u1, self._u1_w, self._x_norm)
@@ -395,10 +450,12 @@ class TabulatedWgg:
                 rho = (r[:, None] * sin_th[None, :]).ravel()
                 w_rho = (w_r[:, None] * self._mu1_w[None, :]).ravel()
                 w_rho = w_rho / w_rho.sum()
-                s2 = rho[:, None, None] ** 2 + rho[None, :, None] ** 2
-                p2 = np.maximum(2.0 * rho[:, None, None] * rho[None, :, None], 1e-30)
-                x = np.clip((s2 - rp_bins[None, None, :] ** 2) / p2, -1.0, 1.0)
-                cdf = np.einsum('i,j,ijk->k', w_rho, w_rho, np.arccos(x)) / np.pi
+                iu, ju, mult_p = self._pair_triangle(len(rho))
+                r1, r2 = rho[iu], rho[ju]
+                s2 = (r1 ** 2 + r2 ** 2)[:, None]
+                p2 = np.maximum(2.0 * r1 * r2, 1e-30)[:, None]
+                x = np.clip((s2 - rp_bins[None, :] ** 2) / p2, -1.0, 1.0)
+                cdf = (mult_p * w_rho[iu] * w_rho[ju]) @ np.arccos(x) / np.pi
                 wp_1h += 2 * V * P_ss[g] * np.diff(cdf) / (N ** 2 * area)
 
         rp_centers = np.sqrt(rp_bins[:-1] * rp_bins[1:])
