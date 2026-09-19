@@ -96,8 +96,22 @@ def parse_args():
                         "multi-species, so this is a diagnostic only.")
     p.add_argument("--jax_n_points", type=int, default=64,
                    help="Random prior draws per case for --jax validation")
+    p.add_argument("--wgg_tab", default=None,
+                   help="WggTabulation .npz on the cache's (logM, fI) bins. "
+                        "With --jax, also validates TabulatedWgg.make_predict_jax "
+                        "and the joint batched likelihood against the NumPy "
+                        "path, with the satellite profile pinned.")
     p.add_argument("--n_logM_bins_wgg", type=int, default=24,
                    help="24 validated; 16 leaves ~6% cc binning errors")
+    p.add_argument("--sat_kernel_weighting", default="occupation",
+                   choices=("occupation", "static"),
+                   help="2-halo satellite kernel centre for --wgg. "
+                        "'occupation' re-weights each mass bin's (Rvir, c) by "
+                        "<Nsat> every call; 'static' uses the plain bin means, "
+                        "matching TabulatedDeltaSigma and making the kernel a "
+                        "function of the profile alone (cacheable). The "
+                        "difference is a binning-resolution question -- run "
+                        "both against the MC here before trusting either.")
     p.add_argument("--n_fI_bins_wgg", type=int, default=8)
     return p.parse_args()
 
@@ -145,8 +159,21 @@ def _jax_param_config(case, assembly_bias):
     return cfg
 
 
+# Pinned satellite profile for the joint wgg parity (the measured hydro
+# values; the wgg jit twin exists only for a pinned profile)
+JAX_WGG_PROFILE = {"f_exp": 0.6813, "tau": 5.7355, "lambda_NFW": 0.3340}
+
+
 def run_jax_check(args, halo, cache):
-    """Validate make_predict_jax + build_batched_loglike vs the NumPy path."""
+    """Validate make_predict_jax + build_batched_loglike vs the NumPy path.
+
+    With ``--wgg_tab`` every case is run a second time as a joint wgg+DS fit
+    with the satellite profile pinned at JAX_WGG_PROFILE, which is when the
+    sampler swaps the per-point NumPy wgg for TabulatedWgg.make_predict_jax:
+    the twin evaluates the occupation on the fine cells instead of per halo,
+    so it must agree with predict to the cell-approximation level and the
+    joint batched logL with log_likelihood.
+    """
     from HOD_NRV.HOD_numerical.HOD_models import Occupation
     from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import (
         TabulatedDeltaSigma,
@@ -159,7 +186,25 @@ def run_jax_check(args, halo, cache):
     rng = np.random.default_rng(7)
     all_pass = True
 
+    wtab = None
+    if args.wgg_tab:
+        from HOD_NRV.HOD_numerical.twopoint_calculator.tabulated_wgg import (
+            WggTabulation, TabulatedWgg,
+        )
+        wtab = WggTabulation.load(args.wgg_tab)
+        if (len(wtab.bin_logM_edges) != len(cache.bin_logM_edges)
+                or not np.allclose(wtab.bin_logM_edges, cache.bin_logM_edges)):
+            raise SystemExit("--wgg_tab logM bins differ from the cache's.")
+        # analysis bins the tabulation was refined from (refine_rp_edges:
+        # 3 padding bins below, n_sub=3 per analysis bin, 2 above)
+        n_an = (len(wtab.rp_edges) - 6) // 3
+        rp_bins_wgg = np.asarray(wtab.rp_edges[3:3 + 3 * n_an + 1:3])
+        wgg_data_path = os.path.join(args.output_dir, "jax_wgg_synthetic.npz")
+        cases = cases + [c + "+wgg" for c in cases]
+
     for case in cases:
+        joint = case.endswith("+wgg")
+        case = case.replace("+wgg", "")
         conformity = case == "CONF"
         halo.set_halo_model("ELG_mHMQ", conformity=conformity,
                             elg_satellite=True)
@@ -169,6 +214,11 @@ def run_jax_check(args, halo, cache):
             conformity=conformity, elg_satellite=True)
 
         cfg = _jax_param_config(case, args.assembly_bias)
+        wgg_kw = {}
+        if joint:
+            cfg.update(JAX_WGG_PROFILE)
+            tabw = TabulatedWgg(wtab, halo, sat_kernel_weighting="static")
+            wgg_kw = {"tabulated_wgg": tabw, "data_path_wgg": wgg_data_path}
 
         # Synthetic data: NumPy prediction at prior midpoint, 5% diag errors
         mid = {k: 0.5 * (v[0] + v[1]) for k, v in cfg.items()
@@ -181,14 +231,21 @@ def run_jax_check(args, halo, cache):
             rp_obs=np.asarray(cache.rp_centers),
             param_config=cfg, Ac_fiducial=JAX_AC_FIDUCIAL,
         )
-        _, ds_ref, _ = tab.predict(fitter0.full_params(mid))
+        full_mid = fitter0.full_params(mid)
+        _, ds_ref, _ = tab.predict(full_mid)
         err = 0.05 * np.abs(ds_ref) + 1e-3
+        if joint:
+            _, wgg_ref, _ = tabw.predict(full_mid, rp_bins_wgg)
+            werr = 0.05 * np.abs(wgg_ref) + 1e-3
+            np.savez(wgg_data_path, rp_bins_wgg=rp_bins_wgg, wgg=wgg_ref,
+                     cov_wgg=np.diag(werr ** 2))
         fitter = TabulatedFitter(
             tabulated_ds=tab, occupation_rescale=occ_rescale,
             target_ngal=JAX_TARGET_NGAL, fit_case=fit_case_of[case],
             ds_obs=ds_ref, cov_inv=np.diag(1.0 / err**2),
             rp_obs=np.asarray(cache.rp_centers),
             rp_min=0.2, param_config=cfg, Ac_fiducial=JAX_AC_FIDUCIAL,
+            **wgg_kw,
         )
 
         bounds = np.array([(a, b) for _, a, b, _ in fitter.free_params])
@@ -197,18 +254,25 @@ def run_jax_check(args, halo, cache):
 
         # ── predict-level parity on a subset ──
         predict_fn = tab.make_predict_jax()
-        dev_ds, dev_ngal, dev_fsat = [], [], []
+        if joint:
+            wgg_fn = tabw.make_predict_jax(rp_bins_wgg, **JAX_WGG_PROFILE)
+        dev_ds, dev_ngal, dev_fsat, dev_wgg = [], [], [], [0.0]
         t_np = 0.0
-        for theta in pts[:16]:
+        for theta in pts:
             full = fitter.full_params(dict(zip(fitter.param_names, theta)))
             t0 = time.time()
             _, ds_np, info = tab.predict(full)
+            if joint:
+                _, wgg_np, _ = tabw.predict(full, rp_bins_wgg)
             t_np += time.time() - t0
             ds_j, ngal_j, fsat_j = (np.asarray(x) for x in predict_fn(full))
             dev_ds.append(np.max(np.abs(ds_j / ds_np - 1)))
             dev_ngal.append(abs(ngal_j / info['ngal'] - 1))
             dev_fsat.append(abs(fsat_j / info['fsat'] - 1))
-        t_np /= 16
+            if joint:
+                wgg_j = np.asarray(wgg_fn(full)[0])
+                dev_wgg.append(np.max(np.abs(wgg_j / wgg_np - 1)))
+        t_np /= len(pts)
 
         # ── loglike-level parity on all points ──
         loglike_fn, free_names = fitter.build_batched_loglike()
@@ -224,17 +288,36 @@ def run_jax_check(args, halo, cache):
         # compare rejected points only by agreement of the rejection
         both_ok = (ll_np > -1e99) & (ll_jax > -1e99)
         agree_rej = np.array_equal(ll_np > -1e99, ll_jax > -1e99)
+        # The cell approximation is a ~1e-4 relative error on the model, so
+        # far from the data (chi2 in the thousands for the random draws) it
+        # is a ~1e-4 relative error on logL: absolute 0.5 near the data, or
+        # 1% of |logL| away from it.
+        ll_tol = 0.5 + 0.01 * np.abs(ll_np[both_ok])
+        ok_ll = bool(np.all(d_ll[both_ok] <= ll_tol))
+        # what the sampler actually feels: the error where the posterior
+        # lives, i.e. among the quarter of the draws closest to the data
+        near = np.argsort(-np.where(both_ok, ll_np, -np.inf))[:max(1, len(pts) // 4)]
+        near = near[both_ok[near]]
 
         ok = (max(dev_ds) < 5e-3 and max(dev_fsat) < 5e-3
-              and np.max(d_ll[both_ok], initial=0.0) < 0.5 and agree_rej)
+              and max(dev_wgg) < 5e-3 and ok_ll and agree_rej)
         all_pass &= ok
         ab_tag = " +AB" if args.assembly_bias else ""
-        print(f"\n=== jax {case}{ab_tag} ===  [{'PASS' if ok else 'FAIL'}]")
+        joint_tag = " +wgg (profile pinned)" if joint else ""
+        print(f"\n=== jax {case}{ab_tag}{joint_tag} ===  "
+              f"[{'PASS' if ok else 'FAIL'}]")
         print(f"  predict : max|ds dev|={max(dev_ds):.2e}  "
-              f"ngal dev={max(dev_ngal):.2e}  fsat dev={max(dev_fsat):.2e}")
+              f"ngal dev={max(dev_ngal):.2e}  fsat dev={max(dev_fsat):.2e}"
+              + (f"  max|wgg dev|={max(dev_wgg):.2e}  "
+                 f"(wgg via {'jit twin' if fitter._wgg_jit else 'NumPy'})"
+                 if joint else ""))
         print(f"  loglike : max|dlogL|={np.max(d_ll[both_ok], initial=0.0):.3e} "
+              f"(max rel {np.max(d_ll[both_ok] / np.abs(ll_np[both_ok]), initial=0.0):.1e}) "
               f"over {both_ok.sum()}/{len(pts)} finite pts  "
               f"(rejection agreement: {agree_rej})")
+        print(f"  near data: {len(near)} best pts, logL in "
+              f"[{ll_np[near].min():.1f}, {ll_np[near].max():.1f}]  "
+              f"max|dlogL|={np.max(d_ll[near], initial=0.0):.3e}")
         print(f"  timing  : numpy {t_np*1e3:.0f} ms/pt | jax "
               f"{t_jax*1e3:.1f} ms/pt (compile {t_compile:.1f} s) | "
               f"speedup x{t_np/max(t_jax, 1e-9):.0f}")
@@ -273,8 +356,9 @@ def run_wgg_check(args, halo, cases):
             rp_edges=refine_rp_edges(RP_BINS))
         tab.save(tab_path)
 
-    tabw = TabulatedWgg(tab, halo)
-    print(tabw)
+    tabw = TabulatedWgg(tab, halo,
+                        sat_kernel_weighting=args.sat_kernel_weighting)
+    print(f"{tabw}  sat_kernel_weighting={args.sat_kernel_weighting}")
 
     results = {}
     all_pass = True
@@ -528,7 +612,13 @@ def main():
 
     column_mapping = dict(COLUMN_MAPPING)
     if args.assembly_bias:
-        column_mapping["fI"] = "fs_norm"
+        # --jax samples B_cent/B_sat like the chains, which act on fE; the
+        # --wgg MC cases use A_cent/A_sat on fI. Same array either way, so
+        # the cache's fI tabulation bins resolve identically.
+        if args.jax:
+            column_mapping["fE"] = args.ab_column or "fs_norm"
+        else:
+            column_mapping["fI"] = "fs_norm"
 
     print(f"Loading halo catalog ({args.halo_fraction:.0%} subsample)...")
     df = pd.read_parquet(args.halo_path)
@@ -574,14 +664,15 @@ def main():
             Lbox=LBOX, rsd_axis=halo.rsd_axis, RHO_M=halo.RHO_M,
             rp_bins=RP_BINS,
             halo_logM=np.asarray(halo.logM),
-            halo_fI=np.asarray(halo.fI) if args.assembly_bias else None,
+            halo_fI=(np.asarray(halo.fI if halo.fI is not None else halo.fE)
+                     if args.assembly_bias else None),
             n_logM_bins=args.n_logM_bins, n_fI_bins=args.n_fI_bins,
         )
         cache.save(cache_path)
 
     if args.jax:
-        run_jax_check(args, halo, cache)
-        return
+        # non-zero exit on FAIL so a chain can be queued with afterok
+        raise SystemExit(0 if run_jax_check(args, halo, cache) else 1)
 
     tab = TabulatedDeltaSigma(cache, halo)
     print(tab)

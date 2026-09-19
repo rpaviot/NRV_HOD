@@ -174,7 +174,7 @@ def rescale_Ac_to_target_ngal(hod_model, params, target_ngal, Ac_fiducial=1.0):
     return Ac_fiducial * rescale_factor, params['As'] * rescale_factor
 
 
-def build_occupation_fn_jax(occ):
+def build_occupation_fn_jax(occ, split_conformity=False):
     """Pure-JAX twin of Occupation.compute_HOD_occupation for traced params.
 
     Returns ``fn(logM, params, mmin_shift=0.0, m1_shift=0.0) -> (probC, probS)``
@@ -185,6 +185,11 @@ def build_occupation_fn_jax(occ):
     ``_compute_probS(has_central=None)``. The closure captures only the
     occupation's function choices — no per-halo state — so it is safe inside
     jit/vmap.
+
+    With ``split_conformity=True`` the twin returns ``(probC, probS, lam1,
+    lam0)``, the conditional satellite means given a central / no central
+    (``compute_satellite_occupation(has_central=...)``), which the same-halo
+    pair terms of wgg need separately; without conformity both equal probS.
     """
     central_fn = occ.HOD_central
     cen_names = list(occ.central_params)
@@ -201,10 +206,14 @@ def build_occupation_fn_jax(occ):
         if conformity:
             ones = jnp.ones_like(logM, dtype=bool)
             zeros = jnp.zeros_like(logM, dtype=bool)
-            probS = (probC * sat_fn(logM, *sat_args, ones)
-                     + (1.0 - probC) * sat_fn(logM, *sat_args, zeros))
+            lam1 = sat_fn(logM, *sat_args, ones)
+            lam0 = sat_fn(logM, *sat_args, zeros)
+            probS = probC * lam1 + (1.0 - probC) * lam0
         else:
             probS = sat_fn(logM, *sat_args)
+            lam1 = lam0 = probS
+        if split_conformity:
+            return probC, probS, lam1, lam0
         return probC, probS
 
     return fn

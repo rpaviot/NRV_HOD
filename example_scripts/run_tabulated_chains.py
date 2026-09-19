@@ -104,9 +104,11 @@ PRIOR_RANGES = {
     # The direct-vs-tabulated null test (job 58367900) calibrates the lever:
     # B = -0.3 buys +7.3% of large-scale amplitude through centrals and +2.9%
     # through satellites, and closing the 19.3% mass-only deficit therefore
-    # needs of order -0.8 dex. (-0.5, 0.5) could not reach it.
-    "B_cent":     (-1.0,  1.0),
-    "B_sat":      (-1.0,  1.0),
+    # needs of order -0.8 dex. (-0.5, 0.5) could not reach it, and the joint
+    # DS(rp>2)+wgg fit (job 58851755) railed against -1 (median -0.85, MAP
+    # -0.96), so the edge is at -2.
+    "B_cent":     (-2.0,  2.0),
+    "B_sat":      (-2.0,  2.0),
 }
 
 FIXED_DEFAULTS = {
@@ -341,6 +343,54 @@ def _print_per_bin(name, rp, obs, model, cov_inv):
     print(f"  sum chi2_i = {contrib.sum():.2f}")
 
 
+def _time_likelihood(fitter, n_calls, n_batch=128):
+    """Time the sampling likelihood exactly the way Nautilus calls it.
+
+    Nautilus drives the vectorized path in batches of ``n_batch`` (matching
+    the loglike's own pad_to), and the first batch pays the XLA compile, so
+    that is reported apart from the steady-state cost that actually sets a
+    chain's wall time. With ``--wgg_tab`` the returned callable is the joint
+    one, so the same flag set that defines a chain also defines its timing.
+    """
+    import time
+    rng = np.random.default_rng(0)
+    lo, hi = [], []
+    for _name, a, b, kind in fitter.free_params:
+        if kind == "gaussian":
+            lo.append(a - 2.0 * b)
+            hi.append(a + 2.0 * b)
+        else:
+            lo.append(a)
+            hi.append(b)
+    lo, hi = np.asarray(lo), np.asarray(hi)
+
+    loglike, free_names = fitter.build_batched_loglike()
+    if getattr(fitter, "_fit_wgg", False):
+        print(f"  [timing] wgg term    : "
+              f"{'jit twin (pinned profile)' if fitter._wgg_jit else 'NumPy thread pool'}")
+    n_batches = max(2, int(np.ceil(n_calls / n_batch)) + 1)
+    pts = lo + (hi - lo) * rng.random((n_batches * n_batch, len(lo)))
+
+    t0 = time.perf_counter()
+    first = np.asarray(loglike(pts[:n_batch]))
+    t_compile = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    for i in range(1, n_batches):
+        loglike(pts[i * n_batch:(i + 1) * n_batch])
+    dt = time.perf_counter() - t0
+    n_timed = (n_batches - 1) * n_batch
+
+    ms = 1000.0 * dt / n_timed
+    alive = int(np.sum(np.isfinite(first) & (first > -1e99)))
+    print(f"  [timing] free params : {len(free_names)}  ({', '.join(free_names)})")
+    print(f"  [timing] first batch : {t_compile:8.2f} s  (incl. XLA compile)")
+    print(f"  [timing] steady state: {n_timed} calls in {dt:.2f} s"
+          f"  ->  {ms:.1f} ms/call  ({3600.0 / (ms / 1000.0):.0f} calls/h)")
+    print(f"  [timing] 190k calls  : {190000 * ms / 1000.0 / 3600.0:.1f} h"
+          f"   (a n_eff=30000 chain at the measured ~0.16 N_eff/call)")
+    print(f"  [timing] {alive}/{n_batch} points of the first batch are in support")
+
 # ============================================================================
 # Run one case
 # ============================================================================
@@ -363,18 +413,21 @@ def run_case(case_name, fit_case, halo, tab, args):
                 fmt='ko', ms=4, zorder=10, label='Flamingo ELG data')
 
     # Joint wgg: needs `halo` (per case), so the predictor is built here.
-    # The likelihood becomes batched-jax DeltaSigma + a NumPy wgg loop
-    # (~1 s/point), so joint chains are much slower than DeltaSigma-only.
+    # With the satellite profile pinned (--fix f_exp tau lambda_NFW) the wgg
+    # term runs inside the batched jit next to DeltaSigma; with it free the
+    # likelihood is batched-jax DeltaSigma + a NumPy wgg loop (~1 s/point).
     tab_wgg = None
     wgg_tag = _fix_tag(args)
     if wgg_tag:
         print(f"  Pinned parameters: "
               + ", ".join(f"{k}={v:g}" for k, v in sorted(args.fix_map.items())))
     if args.wgg_tab:
-        tab_wgg = TabulatedWgg(WggTabulation.load(args.wgg_tab), halo)
+        tab_wgg = TabulatedWgg(WggTabulation.load(args.wgg_tab), halo,
+                               sat_kernel_weighting=args.sat_kernel_weighting)
         wgg_tag += "_wggjoint"
         print(f"  Joint wgg fit: {tab_wgg} "
-              f"(rp_min_wgg={args.rp_min_wgg}, data={args.data_path})")
+              f"(rp_min_wgg={args.rp_min_wgg}, data={args.data_path}, "
+              f"sat_kernel_weighting={args.sat_kernel_weighting})")
 
     bestfits = {}
     for rp_min, color in zip(args.rp_min_values, COLORS):
@@ -412,6 +465,10 @@ def run_case(case_name, fit_case, halo, tab, args):
         )
         print(f"  {fitter.n_bins} bins in [{fitter.rp_obs[0]:.3f}, "
               f"{fitter.rp_obs[-1]:.2f}] Mpc/h, {fitter.n_params} free params")
+
+        if args.time_likelihood:
+            _time_likelihood(fitter, args.time_likelihood)
+            continue
 
         if args.postprocess:
             # Reuse an already-sampled chain: recompute Meff/fsat/chi2/plots
@@ -490,6 +547,11 @@ def run_case(case_name, fit_case, halo, tab, args):
                  f"$f_{{\\rm sat}}={fsat:.3f}$")
         ax.plot(rp_all, rp_all * ds_map_full, color=color, lw=1.8, label=label)
 
+    if args.time_likelihood:
+        # Diagnostic mode: nothing was sampled, so there is no fit to plot.
+        plt.close(fig)
+        return rp_all, {}, None
+
     ax.set_xscale('log')
     ax.set_xlabel(r'$r_p\;[\mathrm{Mpc}/h]$', fontsize=12)
     ax.set_ylabel(r'$r_p\,\Delta\Sigma\;[M_\odot\,\mathrm{pc}^{-2}\cdot\mathrm{Mpc}/h]$',
@@ -545,6 +607,12 @@ def parse_args():
                    help="WggTabulation .npz whose fine rp grid nests the "
                         "data's rp_bins_wgg — enables the joint wgg+DS fit "
                         "(wgg data+cov read from --data_path).")
+    p.add_argument("--sat_kernel_weighting", default="static",
+                   choices=["static", "occupation"],
+                   help="TabulatedWgg satellite-kernel centres. 'static' "
+                        "(HOD-independent bin means, 0.01-0.06%% from "
+                        "'occupation' at 40 mass bins) is what the jit wgg "
+                        "twin needs; 'occupation' forces the NumPy path.")
     p.add_argument("--n_wgg_threads", type=int,
                    default=len(os.sched_getaffinity(0))
                    if hasattr(os, "sched_getaffinity") else os.cpu_count(),
@@ -588,6 +656,11 @@ def parse_args():
                         "dimension from the chain and is appended to the "
                         "output tag so the run does not overwrite the free "
                         "one.")
+    p.add_argument("--time_likelihood", type=int, default=0, metavar="N",
+                   help="Time N likelihood calls for this exact configuration "
+                        "and exit without sampling. Reports the XLA compile "
+                        "separately from the steady-state ms/call that sets a "
+                        "chain's wall time.")
     p.add_argument("--postprocess", action="store_true",
                    help="Skip sampling: load the saved chain_*.npz and "
                         "(re)compute Meff/fsat/chi2, plots, and the aggregate. "

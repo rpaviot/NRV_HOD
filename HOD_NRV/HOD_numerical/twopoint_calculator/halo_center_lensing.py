@@ -967,6 +967,123 @@ class OptimizedDeltaSigmaCalculator:
         )
 
 
+def build_occupation_cells(halo, logM_edges, fI_edges,
+                           n_sub_logM: int = 16, n_sub_fI: int = 32,
+                           fI_sub: str = "width") -> Dict:
+    """Fine (logM, fI) occupation grid nested in a set of tabulation bins.
+
+    The jit twins of the tabulated predictors (:meth:`TabulatedDeltaSigma.
+    make_predict_jax`, :meth:`TabulatedWgg.make_predict_jax`) never touch the
+    halo catalogue per point: halos are binned once into ``n_sub_logM *
+    n_sub_fI`` sub-cells of every (logM [, fI]) tabulation bin, and the
+    occupation is evaluated at the per-cell mean (logM, fI) with the cell's
+    halo count as weight. Sub-bins in logM are equal-width, and so are the
+    sub-bins in fI within each fI bin (``fI_sub="width"``). Cell
+    ``i_mc * n_fc + i_fc`` lies in tabulation bin
+    ``(i_mc // n_sub_logM) * n_f + i_fc // n_sub_fI``, which is what lets the
+    per-bin occupation sums be reshape-sums over the cells.
+
+    The cell approximation errs where the occupation curves within a cell.
+    Along logM the sub-bins are already fine (16 per bin, ~0.01 dex); along
+    the AB property it is the ``ab_method='mass'`` shift ``B * prop`` that
+    matters, so what has to be bounded is the RANGE of ``prop`` inside a
+    cell, not its halo count. Equal-count sub-bins (``fI_sub="count"``, the
+    original choice) leave the tail cells of the skewed property
+    distribution 10x wider than the bulk ones: at |B| ~ 0.8 dex 4 of them
+    left ~1e-3 in wgg/ngal against ~6e-5 with 16 (laptop, 400k halos), but
+    at a steep occupation (alpha * B_sat ~ 1.3 dex per unit prop, fsat 0.8)
+    the wgg twin was 5% off at 16 and still 3% at 128 (hydro R1, job
+    59249035). Equal-width sub-bins resolve the tails at the price of
+    thinly populated cells in the bulk, which cost nothing (empty cells
+    carry zero weight): over the chains' full prior box the wgg twin is
+    then within 3.2e-4 at 16 sub-bins and 1.4e-4 at 32 (job 59249064,
+    median 1.7e-5; 9 -> 15 ms/call), where the logM sub-division becomes
+    the floor. 32 is the default.
+
+    Returns a dict with the cell assignment (``cell``, one entry per halo),
+    the grid shape (``n_mc``, ``n_fc``, ``n_cells``, ``n_sub_logM``,
+    ``n_sub_fI``), per-cell counts and means (``N_cell``, ``logM_cell``,
+    ``prop_cell``, ``sign_cell``), and the assembly-bias property with the
+    coefficient names that multiply it (``prop``, ``cen_coef``, ``sat_coef``).
+    """
+    occ = halo.HOD
+    if occ.assembly_bias and occ.ab_method not in ("mass", "direct"):
+        raise NotImplementedError(
+            "occupation cells support ab_method 'mass' or 'direct'.")
+
+    # ── AB property and the coefficient names that multiply it ──
+    prop = None
+    cen_coef = sat_coef = None
+    if occ.assembly_bias:
+        if occ.fI is not None and occ.fE is not None:
+            raise NotImplementedError(
+                "occupation cells support a single AB property (fI or fE).")
+        if occ.fI is not None:
+            prop, cen_coef, sat_coef = np.asarray(occ.fI), "A_cent", "A_sat"
+        else:
+            prop, cen_coef, sat_coef = np.asarray(occ.fE), "B_cent", "B_sat"
+
+    # ── Fine occupation grid nested in the tabulation bins ──
+    logM = np.asarray(halo.logM)
+    edges_m = np.asarray(logM_edges)
+    n_m = len(edges_m) - 1
+    n_f = 1 if fI_edges is None else len(fI_edges) - 1
+    n_mc = n_m * n_sub_logM
+    fine_m_edges = np.concatenate(
+        [np.linspace(edges_m[i], edges_m[i + 1], n_sub_logM + 1)[:-1]
+         for i in range(n_m)] + [edges_m[-1:]])
+    i_mc = np.clip(np.digitize(logM, fine_m_edges) - 1, 0, n_mc - 1)
+
+    if n_f > 1:
+        if prop is None:
+            raise ValueError("Tabulation has fI bins but the HOD has no fI/fE.")
+        fI_edges = np.asarray(fI_edges)
+        i_f = np.clip(np.digitize(prop, fI_edges) - 1, 0, n_f - 1)
+        n_fc = n_f * n_sub_fI
+        i_fc = np.empty(len(prop), dtype=np.int64)
+        eps = 1e-9
+        if fI_sub not in ("width", "count"):
+            raise ValueError("fI_sub must be 'width' or 'count'")
+        for f in range(n_f):
+            sel = i_f == f
+            if fI_sub == "width":
+                q = np.linspace(prop[sel].min(), prop[sel].max(), n_sub_fI + 1)
+            else:
+                q = np.quantile(prop[sel], np.linspace(0, 1, n_sub_fI + 1))
+            q[0] -= eps
+            q[-1] += eps
+            i_fc[sel] = f * n_sub_fI + np.clip(
+                np.digitize(prop[sel], q) - 1, 0, n_sub_fI - 1)
+    else:
+        n_fc, n_sub_fI = 1, 1
+        i_fc = np.zeros(len(logM), dtype=np.int64)
+
+    cell = i_mc * n_fc + i_fc
+    n_cells = n_mc * n_fc
+    N_cell = np.bincount(cell, minlength=n_cells).astype(np.float64)
+    safe_N = np.maximum(N_cell, 1.0)
+    logM_cell = np.bincount(cell, weights=logM, minlength=n_cells) / safe_N
+    # empty cells: use the fine-bin midpoint (weight is 0 anyway)
+    mid_m = 0.5 * (fine_m_edges[:-1] + fine_m_edges[1:])
+    empty = N_cell == 0
+    logM_cell[empty] = np.repeat(mid_m, n_fc)[empty]
+    if prop is not None:
+        prop_cell = np.bincount(cell, weights=prop, minlength=n_cells) / safe_N
+        # 'direct' AB uses sign(prop): exact per-cell mean of the signs
+        sign_cell = np.bincount(
+            cell, weights=np.sign(prop), minlength=n_cells) / safe_N
+    else:
+        prop_cell = np.zeros(n_cells)
+        sign_cell = np.zeros(n_cells)
+
+    return dict(
+        prop=prop, cen_coef=cen_coef, sat_coef=sat_coef,
+        cell=cell, n_cells=n_cells, n_mc=n_mc, n_fc=n_fc,
+        n_sub_logM=n_sub_logM, n_sub_fI=n_sub_fI,
+        N_cell=N_cell, logM_cell=logM_cell,
+        prop_cell=prop_cell, sign_cell=sign_cell)
+
+
 class TabulatedDeltaSigma:
     """
     TabCorr-style tabulated DeltaSigma predictor (Zheng & Guo 2016;
@@ -1242,93 +1359,25 @@ class TabulatedDeltaSigma:
         info = {'ngal': ngal, 'fsat': fsat, 'ds_cen': ds_cen, 'ds_sat': ds_sat}
         return rp_centers, ds_total, info
 
-    def _occupation_cells(self, n_sub_logM: int = 16, n_sub_fI: int = 4):
+    def _occupation_cells(self, n_sub_logM: int = 16, n_sub_fI: int = 32,
+                          fI_sub: str = "width"):
         """Fine (logM, fI) occupation grid nested in the cache tabulation bins.
 
-        Shared by :meth:`make_predict_jax` and :meth:`make_ngal_fns`: halos are
-        binned into ``n_sub_logM * n_sub_fI`` sub-cells per cache bin so the
-        occupation can be evaluated at the per-cell mean (logM, fI) instead of
-        per halo. Returns the cell assignment, counts and per-cell means, plus
-        the assembly-bias property and the coefficient names that multiply it.
-        Cached per (n_sub_logM, n_sub_fI).
+        Shared by :meth:`make_predict_jax` and :meth:`make_ngal_jax`; see
+        :func:`build_occupation_cells`. Cached per (n_sub_logM, n_sub_fI, fI_sub).
         """
-        key = (n_sub_logM, n_sub_fI)
+        key = (n_sub_logM, n_sub_fI, fI_sub)
         cache = getattr(self, '_occ_cells_cache', None)
         if cache is None:
             cache = self._occ_cells_cache = {}
-        if key in cache:
-            return cache[key]
-
-        occ = self.halo.HOD
-        if occ.assembly_bias and occ.ab_method not in ("mass", "direct"):
-            raise NotImplementedError(
-                "occupation cells support ab_method 'mass' or 'direct'.")
-
-        # ── AB property and the coefficient names that multiply it ──
-        prop = None
-        cen_coef = sat_coef = None
-        if occ.assembly_bias:
-            if occ.fI is not None and occ.fE is not None:
-                raise NotImplementedError(
-                    "occupation cells support a single AB property (fI or fE).")
-            if occ.fI is not None:
-                prop, cen_coef, sat_coef = np.asarray(occ.fI), "A_cent", "A_sat"
-            else:
-                prop, cen_coef, sat_coef = np.asarray(occ.fE), "B_cent", "B_sat"
-
-        # ── Fine occupation grid nested in the cache tabulation bins ──
-        logM = np.asarray(self.halo.logM)
-        edges_m = np.asarray(self.cache.bin_logM_edges)
-        n_mc = self.n_m * n_sub_logM
-        fine_m_edges = np.concatenate(
-            [np.linspace(edges_m[i], edges_m[i + 1], n_sub_logM + 1)[:-1]
-             for i in range(self.n_m)] + [edges_m[-1:]])
-        i_mc = np.clip(np.digitize(logM, fine_m_edges) - 1, 0, n_mc - 1)
-
-        if self.n_f > 1:
-            fI_edges = np.asarray(self.cache.bin_fI_edges)
-            i_f = np.clip(np.digitize(prop, fI_edges) - 1, 0, self.n_f - 1)
-            n_fc = self.n_f * n_sub_fI
-            i_fc = np.empty(len(prop), dtype=np.int64)
-            eps = 1e-9
-            for f in range(self.n_f):
-                sel = i_f == f
-                q = np.quantile(prop[sel], np.linspace(0, 1, n_sub_fI + 1))
-                q[0] -= eps
-                q[-1] += eps
-                i_fc[sel] = f * n_sub_fI + np.clip(
-                    np.digitize(prop[sel], q) - 1, 0, n_sub_fI - 1)
-        else:
-            n_fc, n_sub_fI = 1, 1
-            i_fc = np.zeros(len(logM), dtype=np.int64)
-
-        cell = i_mc * n_fc + i_fc
-        n_cells = n_mc * n_fc
-        N_cell = np.bincount(cell, minlength=n_cells).astype(np.float64)
-        safe_N = np.maximum(N_cell, 1.0)
-        logM_cell = np.bincount(cell, weights=logM, minlength=n_cells) / safe_N
-        # empty cells: use the fine-bin midpoint (weight is 0 anyway)
-        mid_m = 0.5 * (fine_m_edges[:-1] + fine_m_edges[1:])
-        empty = N_cell == 0
-        logM_cell[empty] = np.repeat(mid_m, n_fc)[empty]
-        if prop is not None:
-            prop_cell = np.bincount(cell, weights=prop, minlength=n_cells) / safe_N
-            # 'direct' AB uses sign(prop): exact per-cell mean of the signs
-            sign_cell = np.bincount(
-                cell, weights=np.sign(prop), minlength=n_cells) / safe_N
-        else:
-            prop_cell = np.zeros(n_cells)
-            sign_cell = np.zeros(n_cells)
-
-        cache[key] = dict(
-            prop=prop, cen_coef=cen_coef, sat_coef=sat_coef,
-            cell=cell, n_cells=n_cells, n_mc=n_mc, n_fc=n_fc,
-            n_sub_logM=n_sub_logM, n_sub_fI=n_sub_fI,
-            N_cell=N_cell, logM_cell=logM_cell,
-            prop_cell=prop_cell, sign_cell=sign_cell)
+        if key not in cache:
+            cache[key] = build_occupation_cells(
+                self.halo, self.cache.bin_logM_edges, self.cache.bin_fI_edges,
+                n_sub_logM, n_sub_fI, fI_sub)
         return cache[key]
 
-    def make_ngal_jax(self, n_sub_logM: int = 16, n_sub_fI: int = 4):
+    def make_ngal_jax(self, n_sub_logM: int = 16, n_sub_fI: int = 32,
+                      fI_sub: str = "width"):
         """Catalogue-sum ngal on the same fine cells as :meth:`make_predict_jax`.
 
         Returns ``ngal_fn(params) -> ngal`` [(Mpc/h)^-3]: the jnp twin of the
@@ -1347,7 +1396,7 @@ class TabulatedDeltaSigma:
         from ..HOD_models import build_occupation_fn_jax
 
         occ = self.halo.HOD
-        cells = self._occupation_cells(n_sub_logM, n_sub_fI)
+        cells = self._occupation_cells(n_sub_logM, n_sub_fI, fI_sub)
         cen_coef, sat_coef = cells['cen_coef'], cells['sat_coef']
         n_mc, n_fc = cells['n_mc'], cells['n_fc']
         j_logM_cell = jnp.asarray(cells['logM_cell'].reshape(n_mc, n_fc))
@@ -1374,7 +1423,8 @@ class TabulatedDeltaSigma:
 
         return ngal_fn
 
-    def make_predict_jax(self, n_sub_logM: int = 16, n_sub_fI: int = 4):
+    def make_predict_jax(self, n_sub_logM: int = 16, n_sub_fI: int = 32,
+                         fI_sub: str = "width"):
         """Build a pure-JAX twin of :meth:`predict` for jit/vmap sampling.
 
         Returns ``predict_fn(params) -> (ds_total, ngal, fsat)`` where
@@ -1396,7 +1446,7 @@ class TabulatedDeltaSigma:
         from ..HOD_models import build_occupation_fn_jax
 
         occ = self.halo.HOD
-        cells = self._occupation_cells(n_sub_logM, n_sub_fI)
+        cells = self._occupation_cells(n_sub_logM, n_sub_fI, fI_sub)
         prop = cells['prop']
         cen_coef, sat_coef = cells['cen_coef'], cells['sat_coef']
         cell, n_cells = cells['cell'], cells['n_cells']

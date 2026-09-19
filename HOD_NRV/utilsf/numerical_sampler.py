@@ -963,6 +963,11 @@ class TabulatedFitter(EmulatorFitter):
         tensor at ~vmap_chunk * 0.25 GB while giving XLA large ops to
         thread) and batches are padded to a multiple of ``pad_to`` to
         avoid shape-driven recompilation.
+
+        A joint wgg term joins the jit when the satellite profile is pinned
+        (``TabulatedWgg.make_predict_jax``, static kernels); with the
+        profile free it is added per point from the NumPy ``predict`` on a
+        thread pool, which is ~30x costlier per call.
         """
         import jax
         import jax.numpy as jnp
@@ -972,6 +977,31 @@ class TabulatedFitter(EmulatorFitter):
         )
 
         predict_fn = self.tab.make_predict_jax()
+
+        # ── joint wgg, jit twin: only for a PINNED satellite profile, whose
+        # kernels enter as constants (TabulatedWgg.make_predict_jax). With
+        # the profile free the wgg term falls back to the per-point NumPy
+        # predict on a thread pool, further down. ──
+        free_names = list(self.param_names)
+        fixed = {k: float(v) for k, v in self.fixed_params_dict.items()}
+        profile_names = ("f_exp", "tau", "lambda_NFW")
+        wgg_fn = None
+        if self._fit_wgg:
+            pinned = not any(n in free_names for n in profile_names)
+            static = self.tab_wgg.sat_kernel_weighting == "static"
+            if pinned and static:
+                wgg_fn = self.tab_wgg.make_predict_jax(
+                    self.rp_bins_wgg, fixed.get("f_exp", 0.0),
+                    fixed.get("tau", 6.0), fixed.get("lambda_NFW", 1.0))
+                j_wgg_obs = jnp.asarray(self.wgg_obs)
+                j_cov_inv_wgg = jnp.asarray(self.cov_inv_wgg)
+            else:
+                why = ("the satellite profile is free" if not pinned else
+                       "sat_kernel_weighting != 'static'")
+                print(f"  [build_batched_loglike] wgg on the NumPy thread-pool "
+                      f"path ({why}); the jit twin needs a pinned profile and "
+                      f"static kernels.")
+        self._wgg_jit = wgg_fn is not None
 
         # ── ngal rescale: catalogue sum or analytic mass function, per
         # ``ngal_anchor`` (the property hands back the matching jnp callable,
@@ -986,8 +1016,6 @@ class TabulatedFitter(EmulatorFitter):
         j_ds_obs = jnp.asarray(self.ds_obs)
         j_cov_inv = jnp.asarray(self.cov_inv)
 
-        free_names = list(self.param_names)
-        fixed = {k: float(v) for k, v in self.fixed_params_dict.items()}
         target_ngal = float(self.target_ngal)
         Ac_fid = float(self.Ac_fiducial)
 
@@ -1029,6 +1057,12 @@ class TabulatedFitter(EmulatorFitter):
             logL = -0.5 * (resid @ j_cov_inv @ resid)
 
             good = jnp.isfinite(ds).all() & jnp.isfinite(logL)
+            if wgg_fn is not None:
+                # Same block-diagonal chi2 as log_likelihood (cov_cross ignored)
+                wgg, _, _ = wgg_fn(full)
+                rw = wgg - j_wgg_obs
+                logL = logL - 0.5 * (rw @ j_cov_inv_wgg @ rw)
+                good = good & jnp.isfinite(wgg).all() & jnp.isfinite(logL)
             if max_fsat is not None:
                 good = good & jnp.isfinite(fsat_gate) & (fsat_gate <= max_fsat)
             return jnp.where(good, logL, -1e100)
@@ -1048,11 +1082,12 @@ class TabulatedFitter(EmulatorFitter):
                 points = np.vstack([points, np.repeat(points[-1:], n_pad, 0)])
             return np.asarray(compiled(jnp.asarray(points)))[:n]
 
-        if not self._fit_wgg:
+        if not self._fit_wgg or wgg_fn is not None:
             return loglike_fn, free_names
 
-        # ── joint wgg: TabulatedWgg.predict has no jax twin, so add its
-        # chi2 on top of the batched DeltaSigma logL, one point at a time.
+        # ── joint wgg with a FREE profile: no jax twin, so add the chi2 of
+        # TabulatedWgg.predict on top of the batched DeltaSigma logL, one
+        # point at a time.
         # The points of a batch are independent and TabulatedWgg.predict is
         # NumPy (whose heavy kernels release the GIL), so they run on a
         # thread pool: threads, not processes, because predict still calls
