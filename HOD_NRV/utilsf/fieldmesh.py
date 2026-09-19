@@ -179,12 +179,36 @@ def compute_Tij(i: int, j: int, deltak: np.ndarray, phase_axes: Tuple[np.ndarray
 
 
 def normalize_distribution(p: np.ndarray) -> np.ndarray:
-    """Map ln(p) to [-1, 1] via (median, 2nd, 98th percentiles), then clip."""
-    p = np.log(p)
-    low_percentile = np.percentile(p, 2)
-    high_percentile = np.percentile(p, 98)
-    median = np.median(p)
+    """Map ln(p) to [-1, 1] via (median, 2nd, 98th percentiles), then clip.
+
+    p <= 0 has no logarithm, and the caller passes 1 + delta. Gaussian
+    smoothing on a finite mesh rings, so a few halos in the emptiest cells come
+    back with delta slightly below -1 (3 of 9,867,206 in DMO at Nmesh=1024,
+    min delta = -1.00866). Physically those are as empty as a cell gets and
+    belong at the -1 end of the scale.
+
+    Two things have to be right for that, and the second matters far more than
+    the first: the log must not return non-finite, and the percentiles must
+    IGNORE any that do. np.percentile propagates a single NaN to its entire
+    output, and this function is called per mass bin -- so one ringing halo
+    used to NaN every halo sharing its mass bin. That amplification is what
+    turned 3 bad halos into 3,207,324 NaN rows of delta_norm (32.5% of the
+    catalogue) in both DMO boxes, while fs_norm was untouched because q_R^2 is
+    positive by construction.
+    """
+    with np.errstate(invalid="ignore", divide="ignore"):
+        p = np.log(p)
+    good = np.isfinite(p)
+    if not good.any():
+        return np.full(p.shape, -1.)
+    ref = p[good]
+    low_percentile = np.percentile(ref, 2)
+    high_percentile = np.percentile(ref, 98)
+    median = np.median(ref)
     norm_p = (p - median) / (high_percentile - low_percentile)
+    # Before the clips: NaN compares False against both bounds and would
+    # otherwise survive them.
+    norm_p[~good] = -1.
     norm_p[norm_p < -1.] = -1.
     norm_p[norm_p > 1.] = 1.
     return norm_p
