@@ -3,7 +3,8 @@ import numpy as np
 import jax.numpy as jnp
 import jax.random as jrandom
 from jax import jit
-from HOD_NRV.utilsf.utils_functions import gauss_legendre_integration,random_uniform_jax,random_poisson_numba
+from HOD_NRV.utilsf.utils_functions import (gauss_legendre_integration, random_uniform_jax,
+                                            random_poisson_numba, SAT_RMAX_RVIR)
 from numba import vectorize, njit, prange
 from functools import partial
 
@@ -296,7 +297,7 @@ def extended_NFW_positions_numba(halo_centers, Rvir, c, N_s,
     u_phi = np.random.uniform(0.0, 1.0, N_s_tot)
 
     # Exponential component: r in [0, Rmax], decays as exp(-r/(tau*Rs))
-    Rmax_exp = sat_Rvir * 3.0
+    Rmax_exp = sat_Rvir * SAT_RMAX_RVIR   # same truncation as NFW_jax
     u_max = 1.0 - np.exp(-Rmax_exp / (tau * sat_Rs))
     u_scaled = u * u_max
     radii_exp = -tau * sat_Rs * np.log(1.0 - u_scaled)
@@ -348,7 +349,7 @@ def extended_elliptical_NFW_positions_numba(halo_centers, Rvir, c, shapes, axis_
     u_phi = np.random.uniform(0.0, 1.0, N_s_tot)
 
     # Exponential component: r in [0, Rmax], decays as exp(-r/(tau*Rs))
-    Rmax_exp = sat_Rvir * 3.0
+    Rmax_exp = sat_Rvir * SAT_RMAX_RVIR   # same truncation as NFW_jax
     u_max = 1.0 - np.exp(-Rmax_exp / (tau * sat_Rs))
     u_scaled = u * u_max
     radii_exp = -tau * sat_Rs * np.log(1.0 - u_scaled)
