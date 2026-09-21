@@ -116,6 +116,8 @@ FIXED_DEFAULTS = {
     "Mmax":   MMAX_FIXED,
     "A_cent": 0.0,
     "A_sat":  0.0,
+    "B_cent_slope": 0.0,
+    "B_sat_slope":  0.0,
 }
 
 FIT_CASE_OF = {
@@ -137,6 +139,8 @@ def _ab_tag(args):
         tag += f"_{args.ab_method}"
     if getattr(args, "ab_rank", False):
         tag += "_rank"
+    if getattr(args, "ab_slope", False):
+        tag += "_slope"
     return tag
 
 
@@ -157,10 +161,13 @@ def _fix_tag(args):
 # centrals) with fE in [-1, 1], so |B| <= 1 is the positivity bound
 # (Hadzhiyska+2023 Note 2: |a| + |b| <= 2 on their [-0.5, 0.5] rank).
 VARIANT_B_RANGE = (-1.0, 1.0)
+# logM slope of the variant coefficients, per dex about AB_PIVOT_LOGM (12.5);
+# the coefficient itself is clipped to VARIANT_B_RANGE per halo/cell.
+VARIANT_SLOPE_RANGE = (-1.0, 1.0)
 
 
 def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False, fixed=None,
-                       ab_method="mass"):
+                       ab_method="mass", ab_slope=False):
     """Same prior structure as run_emulator_chains.py --full_bb (elg_satellite).
 
     ``fixed`` is a {name: value} override applied last: a scalar in
@@ -198,6 +205,9 @@ def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False, fixed=None
         for name in ("B_cent", "B_sat"):
             if name in active:
                 cfg[name] = VARIANT_B_RANGE
+        if ab_slope and "B_cent" in active:
+            cfg["B_cent_slope"] = VARIANT_SLOPE_RANGE
+            cfg["B_sat_slope"] = VARIANT_SLOPE_RANGE
 
     for name, value in (fixed or {}).items():
         if name not in cfg:
@@ -463,7 +473,8 @@ def run_case(case_name, fit_case, halo, tab, args):
 
         param_config = build_param_config(
             fit_case, assembly_bias=assembly_bias, gaussian_ab=args.gaussian_ab,
-            fixed=args.fix_map, ab_method=args.ab_method)
+            fixed=args.fix_map, ab_method=args.ab_method,
+            ab_slope=args.ab_slope)
 
         fitter = TabulatedFitter(
             tabulated_ds=tab,
@@ -667,6 +678,10 @@ def parse_args():
                         "Hadzhiyska+2023 and AbacusHOD. The tabulation bins "
                         "are still cut on the column's values, so no "
                         "re-tabulation is needed.")
+    p.add_argument("--ab_slope", action="store_true",
+                   help="With --ab_method variant: also sample a logM slope "
+                        "of B_cent and B_sat (B + slope*(logM - 12.5), "
+                        f"priors {VARIANT_SLOPE_RANGE} per dex).")
     p.add_argument("--per_bin", action="store_true",
                    help="Print per-bin residuals and chi2 contributions for "
                         "DeltaSigma and wgg (diagnostic; pairs with "
@@ -736,7 +751,7 @@ def predict_at(case_name, fit_case, halo, tab, args):
     param_config = build_param_config(
         fit_case, assembly_bias=case_name.endswith("_AB"),
         gaussian_ab=args.gaussian_ab, fixed=args.fix_map,
-        ab_method=args.ab_method)
+        ab_method=args.ab_method, ab_slope=args.ab_slope)
 
     tab_wgg = None
     if args.wgg_tab:

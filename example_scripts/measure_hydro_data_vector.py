@@ -80,7 +80,7 @@ import jax.numpy as jnp
 from HOD_NRV.HOD_analytical.pycosmo import Cosmology
 from HOD_NRV.HOD_numerical.HOD_models import (
     LRG_Zheng07, ELG_GHOD, ELG_SFR, ELG_mHMQ, HOD_satellite,
-    ELG_satellite_cutoff)
+    ELG_satellite_cutoff, AB_PIVOT_LOGM)
 from HOD_NRV.HOD_numerical.twopoint_calculator.standard_two_point_calculator import (
     compute_galaxy_lensing, compute_galaxy_clustering)
 from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import (
@@ -1070,10 +1070,12 @@ def _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen, n_sat,
     # the (1 - N_cen) factor) or amp*(S0 + B*S1) (satellites).
     P0 = {k: np.asarray(models[k](0.0), dtype=np.float64) for k in models}
     S = {}
+    dM = np.asarray(lm) - AB_PIVOT_LOGM
     for k in models:
         S[k] = tuple(np.bincount(cell, weights=w, minlength=ncell)
                      .reshape(nM, nE)
-                     for w in (P0[k], P0[k] * fe_np, P0[k] ** 2 * fe_np))
+                     for w in (P0[k], P0[k] * fe_np, P0[k] ** 2 * fe_np,
+                               P0[k] * fe_np * dM, P0[k] ** 2 * fe_np * dM))
 
     # Cells where the truth model itself predicts ~nothing are pure link
     # noise for the deviance (n ln(n/mu) with mu -> 0) and blind to B.
@@ -1110,12 +1112,13 @@ def _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen, n_sat,
                             th["Mcut"], th["Mmax"]), dtype=np.float64)
                     mu += np.bincount(cell[idx], weights=w, minlength=ncell)
             return amp * mu.reshape(nM, nE)[bins]
-        S0, S1, S2 = S[kind]
+        S0, S1, S2, S1m, S2m = S[kind]
+        B, slope = (B if isinstance(B, tuple) else (B, 0.0))
         if kind == "cen":
-            mu = (amp * S0 + amp * B * S1
-                  - args.fit_ab_ncen_scale * amp * amp * B * S2)
+            mu = (amp * S0 + amp * (B * S1 + slope * S1m)
+                  - args.fit_ab_ncen_scale * amp * amp * (B * S2 + slope * S2m))
         else:
-            mu = amp * (S0 + B * S1)
+            mu = amp * (S0 + B * S1 + slope * S1m)
         return mu[bins]
 
     def profile(form, kind, B, bins):
@@ -1161,8 +1164,32 @@ def _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen, n_sat,
                   f" {r['B']:8.3f} {r['err_lo']:7.3f} {r['err_hi']:7.3f}"
                   f" {r['amp']:7.3f} {r['C'] / dof:10.2f}"
                   f" {r['C0'] - r['C']:9.1f} {r['n_cells']:6d}")
+    # variant with a logM slope, B(M) = B + slope*(logM - AB_PIVOT_LOGM): the
+    # form run_tabulated_chains --ab_method variant --ab_slope samples.
+    from scipy.optimize import minimize
+    for kind in ("cen", "sat"):
+        bins = okM[kind]
+        g0 = glob[("variant", kind)]
+        r = minimize(lambda x: profile("variant", kind, (x[0], x[1]), bins)[0],
+                     x0=[g0["B"], 0.0], method="Nelder-Mead",
+                     options={"xatol": 1e-4, "fatol": 1e-3})
+        Bb, sl = float(r.x[0]), float(r.x[1])
+        Cmin, amp = profile("variant", kind, (Bb, sl), bins)
+        used = np.where(bins)[0]
+        Brange = (Bb + sl * (logM[used.min()] - AB_PIVOT_LOGM),
+                  Bb + sl * (logM[used.max()] - AB_PIVOT_LOGM))
+        glob[("variant_slope", kind)] = dict(B=Bb, slope=sl, amp=amp, C=Cmin,
+                                             C0=g0["C"], n_cells=g0["n_cells"])
+        dof = g0["n_cells"] - 3
+        print(f"  {'var+slope':>8} {('centrals' if kind == 'cen' else 'satellites'):>10}"
+              f" {Bb:8.3f} {'slope':>7} {sl:7.3f} {amp:7.3f} {Cmin / dof:10.2f}"
+              f" {g0['C'] - Cmin:9.1f} {g0['n_cells']:6d}"
+              f"   B(M) = {Brange[0]:.2f} .. {Brange[1]:.2f} over the fitted bins"
+              + ("  (exceeds the +-1 clip)" if max(abs(Brange[0]), abs(Brange[1])) > 1 else ""))
     print("  'mass': logMmin/logM1 += B*fE (dex; B<0 raises occupation at high "
           "fE).  'variant': N *= 1 + B*fE (B>0 raises it).")
+    print(f"  'var+slope': B(M) = B + slope*(logM - {AB_PIVOT_LOGM}); its dC "
+          "column is the drop from the single-B variant fit.")
     print("  amp: rescale of the JSON's Ac/As (the chains' /10 convention -> "
           "~10 expected).  dC(B=0): deviance drop from B=0, ~ (n sigma)^2.")
     print("  err = nan: the 1-sigma interval reaches the fit bound "
@@ -1179,8 +1206,10 @@ def _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen, n_sat,
     local = {("mass", "cen"): [], ("mass", "sat"): [],
              ("variant", "cen"): [], ("variant", "sat"): []}
     ratio_glob = {}
-    for form, kind in glob:
+    for form, kind in list(glob):
         g = glob[(form, kind)]
+        if form == "variant_slope":
+            continue
         mu = cell_sums(form, kind, g["B"], g["amp"], np.ones(nM, bool))
         with np.errstate(divide="ignore", invalid="ignore"):
             ratio_glob[(form, kind)] = mu[:, -1] / mu[:, 0]

@@ -158,6 +158,17 @@ def assembly_bias_mass(logM, A, B, fI, fE):
     return logM + _ab_combine(A, fI, B, fE)
 
 
+# Pivot of the optional logM slope on the 'variant' coefficients (see
+# Occupation.set_params): B(M) = B + B_slope * (logM - AB_PIVOT_LOGM).
+AB_PIVOT_LOGM = 12.5
+
+
+def variant_coefficient(B, slope, logM):
+    """B(M) = clip(B + slope * (logM - AB_PIVOT_LOGM), -1, 1) -- the same
+    rule the per-halo path applies, for the cell twins."""
+    return jnp.clip(B + slope * (logM - AB_PIVOT_LOGM), -1.0, 1.0)
+
+
 def rank_within_mass_bins(prop, logM, dlogM=0.1, min_count=1000):
     """Rank ``prop`` among the halos of its mass bin, mapped to [-1, 1].
 
@@ -295,7 +306,7 @@ class Occupation:
     satellite_conformity_params=["As", "Mmin", "M1", "alpha", "kappa", "kappa_EE"]
     satellite_elg_params=["As", "M1", "alpha", "Mcut", "Mmax"]
     satellite_elg_conformity_params=["As", "M1", "alpha", "Mcut", "Mmax", "kappa_EE"]
-    assembly_bias_params=['A_cent','B_cent','A_sat','B_sat']
+    assembly_bias_params=['A_cent','B_cent','A_sat','B_sat','B_cent_slope','B_sat_slope']
 
     def __init__(self, hod_type, logM_bins, mass_function, assembly_bias=False,
                  conformity=False, elg_satellite=False, fI=None, fE=None,
@@ -404,9 +415,21 @@ class Occupation:
                     )
             else:  # variant: continuous fI/fE
                 self._A_cent = A_cent
-                self._B_cent = B_cent
                 self._A_sat  = A_sat
-                self._B_sat  = B_sat
+                # Optional mass dependence of the environment coefficient,
+                # B(M) = B + B_slope * (logM - AB_PIVOT_LOGM), clipped to the
+                # positivity bound. The Flamingo satellite AB falls from ~0.9
+                # at 10^11.8 to ~0.1 at 10^13.4 (2026-09-21); a single B
+                # over-weights the massive, most biased satellite hosts.
+                sc = dict_params.get("B_cent_slope", 0.0)
+                ss = dict_params.get("B_sat_slope", 0.0)
+                if self.logM_halos is not None:
+                    lm = jnp.asarray(self.logM_halos)
+                    self._B_cent = variant_coefficient(B_cent, sc, lm)
+                    self._B_sat  = variant_coefficient(B_sat, ss, lm)
+                else:
+                    self._B_cent = B_cent
+                    self._B_sat  = B_sat
 
 
     def _apply_direct_ab(self, probC, probS):

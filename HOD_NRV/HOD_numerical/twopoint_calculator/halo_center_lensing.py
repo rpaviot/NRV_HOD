@@ -1405,7 +1405,7 @@ class TabulatedDeltaSigma:
         which holds for the Ac ~ 1e-2 amplitudes used here.
         """
         import jax.numpy as jnp
-        from ..HOD_models import build_occupation_fn_jax
+        from ..HOD_models import build_occupation_fn_jax, variant_coefficient
 
         occ = self.halo.HOD
         cells = self._occupation_cells(n_sub_logM, n_sub_fI, fI_sub)
@@ -1431,8 +1431,12 @@ class TabulatedDeltaSigma:
                 probC = probC + ab_c * jnp.minimum(probC, 1.0 - probC)
                 probS = probS * (1.0 + ab_s)
             elif has_ab and ab_method == "variant":
-                ab_c = params.get(cen_coef, 0.0) * j_prop_cell
-                ab_s = params.get(sat_coef, 0.0) * j_prop_cell
+                ab_c = variant_coefficient(
+                    params.get(cen_coef, 0.0),
+                    params.get(cen_coef + "_slope", 0.0), j_logM_cell) * j_prop_cell
+                ab_s = variant_coefficient(
+                    params.get(sat_coef, 0.0),
+                    params.get(sat_coef + "_slope", 0.0), j_logM_cell) * j_prop_cell
                 probC = jnp.minimum(probC, 1.0)
                 probC = probC * (1.0 + ab_c * (1.0 - probC))
                 probS = probS * (1.0 + ab_s)
@@ -1463,7 +1467,7 @@ class TabulatedDeltaSigma:
         """
         import jax
         import jax.numpy as jnp
-        from ..HOD_models import build_occupation_fn_jax
+        from ..HOD_models import build_occupation_fn_jax, variant_coefficient
 
         occ = self.halo.HOD
         cells = self._occupation_cells(n_sub_logM, n_sub_fI, fI_sub)
@@ -1534,8 +1538,12 @@ class TabulatedDeltaSigma:
                 probC = probC + ab_c * jnp.minimum(probC, 1.0 - probC)
                 probS = probS * (1.0 + ab_s)
             elif has_ab and ab_method == "variant":
-                ab_c = params.get(cen_coef, 0.0) * j_prop_cell
-                ab_s = params.get(sat_coef, 0.0) * j_prop_cell
+                ab_c = variant_coefficient(
+                    params.get(cen_coef, 0.0),
+                    params.get(cen_coef + "_slope", 0.0), j_logM_cell) * j_prop_cell
+                ab_s = variant_coefficient(
+                    params.get(sat_coef, 0.0),
+                    params.get(sat_coef + "_slope", 0.0), j_logM_cell) * j_prop_cell
                 probC = jnp.minimum(probC, 1.0)
                 probC = probC * (1.0 + ab_c * (1.0 - probC))
                 probS = probS * (1.0 + ab_s)

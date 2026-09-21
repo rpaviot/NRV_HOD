@@ -93,6 +93,9 @@ def parse_args():
     p.add_argument("--ab_rank", action="store_true",
                    help="Rank the AB column within 0.1 dex mass bins before "
                         "the scheme sees it (Hadzhiyska+2023 definition).")
+    p.add_argument("--ab_slope", action="store_true",
+                   help="--jax: also draw B_cent_slope / B_sat_slope (the "
+                        "variant coefficients' logM slope).")
     p.add_argument("--ab_column", default=None,
                    help="Map this column as fE (needed when the cache carries "
                         "an fI tabulation dimension).")
@@ -140,13 +143,16 @@ JAX_PRIORS = {
     "kappa_EE":   (0.5,   1.0),
     "B_cent":     (-0.5,  0.5),
     "B_sat":      (-0.5,  0.5),
+    "B_cent_slope": (-0.5, 0.5),
+    "B_sat_slope":  (-0.5, 0.5),
 }
-JAX_FIXED = {"M1": 13.0, "Mmax": 15.0, "A_cent": 0.0, "A_sat": 0.0}
+JAX_FIXED = {"M1": 13.0, "Mmax": 15.0, "A_cent": 0.0, "A_sat": 0.0,
+             "B_cent_slope": 0.0, "B_sat_slope": 0.0}
 JAX_TARGET_NGAL = 2.3e-4
 JAX_AC_FIDUCIAL = 0.01
 
 
-def _jax_param_config(case, assembly_bias):
+def _jax_param_config(case, assembly_bias, ab_slope=False):
     base = ["As", "Mmin", "sig_M", "gamma", "alpha", "Mcut", "lambda_NFW"]
     cfg = dict(JAX_FIXED)
     if case == "NFW":
@@ -159,6 +165,8 @@ def _jax_param_config(case, assembly_bias):
         free = base + ["f_exp", "tau", "kappa_EE"]
     if assembly_bias:
         free = free + ["B_cent", "B_sat"]
+        if ab_slope:
+            free = free + ["B_cent_slope", "B_sat_slope"]
     else:
         cfg["B_cent"], cfg["B_sat"] = 0.0, 0.0
     for name in free:
@@ -221,7 +229,7 @@ def run_jax_check(args, halo, cache):
             "ELG_mHMQ", halo.logM_bins, halo.mass_function,
             conformity=conformity, elg_satellite=True)
 
-        cfg = _jax_param_config(case, args.assembly_bias)
+        cfg = _jax_param_config(case, args.assembly_bias, args.ab_slope)
         wgg_kw = {}
         if joint:
             cfg.update(JAX_WGG_PROFILE)
