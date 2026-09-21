@@ -199,13 +199,23 @@ def rank_within_mass_bins(prop, logM, dlogM=0.1, min_count=1000):
             if len(nxt):
                 remap[remap == 0] = nxt[0] + 1
         ibin = remap[ibin]
-    order = np.lexsort((prop, ibin))          # by bin, then by prop
+    # Ties get their average rank (scipy 'average'): the environment columns
+    # are exactly 0 for many halos above logM ~14 (the build-time
+    # normalisation bins are nearly empty there, so (x - median) vanishes),
+    # and an arbitrary tie order would hand identical values ranks spread
+    # over [-0.5, 0.5] -- fake per-halo scatter that the cell-based twins
+    # cannot see (2e-2 wgg parity error at large alpha * B_sat).
+    from scipy.stats import rankdata
+    order = np.argsort(ibin, kind="stable")
     ib_sorted = ibin[order]
     starts = np.searchsorted(ib_sorted, np.arange(ibin.max() + 2))
-    counts = np.diff(starts)
-    pos = np.arange(len(prop)) - np.repeat(starts[:-1], counts)
     f = np.empty(len(prop))
-    f[order] = 2.0 * (pos + 0.5) / np.repeat(counts, counts) - 1.0
+    for b in range(len(starts) - 1):
+        idx = order[starts[b]:starts[b + 1]]
+        if len(idx) == 0:
+            continue
+        r = rankdata(prop[idx], method="average")        # 1..n, ties averaged
+        f[idx] = 2.0 * (r - 0.5) / len(idx) - 1.0
     return f
 
 
