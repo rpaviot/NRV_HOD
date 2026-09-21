@@ -194,6 +194,14 @@ def parse_args():
                         "variable and what run_tabulated_chains --ab_rank "
                         "feeds the chains. The quantile cells are unchanged "
                         "(the rank is monotonic in the value).")
+    p.add_argument("--fit_ab_ncen_scale", type=float, default=1.0,
+                   help="Scale of <N_cen> inside the variant form's "
+                        "(1 - <N_cen>) factor. 1 (default) is physical. The "
+                        "chains run Ac/As at 1/10 of the sample's density "
+                        "(target_ngal 2.3e-4), where that factor is "
+                        "(1 - N/10); pass 0.1 to calibrate B_cent in the "
+                        "convention run_tabulated_chains --ab_method variant "
+                        "will use (the satellite form is scale-free).")
     p.add_argument("--fit_ab_min_model", type=float, default=5.0,
                    help="Drop mass bins where the unshifted truth model "
                         "predicts fewer galaxies than this in some quantile "
@@ -1052,7 +1060,9 @@ def _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen, n_sat,
     models = {"cen": cen_model, "sat": sat_model}
 
     print(f"\n=== B_cent / B_sat fitted to <N>(M | {args.env_column}) at the "
-          f"'{label}' occupation, {nE} quantiles, amplitude free ===")
+          f"'{label}' occupation, {nE} quantiles, amplitude free"
+          + (f", variant (1 - N_cen) at N_cen x {args.fit_ab_ncen_scale:g}"
+             if args.fit_ab_ncen_scale != 1.0 else "") + " ===")
     print(f"  truth params: " + ", ".join(f"{k}={v:.4g}" for k, v in th.items()))
 
     # 'variant' is analytic in (B, amp) given three per-cell sums of the
@@ -1102,7 +1112,8 @@ def _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen, n_sat,
             return amp * mu.reshape(nM, nE)[bins]
         S0, S1, S2 = S[kind]
         if kind == "cen":
-            mu = amp * S0 + amp * B * S1 - amp * amp * B * S2
+            mu = (amp * S0 + amp * B * S1
+                  - args.fit_ab_ncen_scale * amp * amp * B * S2)
         else:
             mu = amp * (S0 + B * S1)
         return mu[bins]
@@ -1196,7 +1207,9 @@ def _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen, n_sat,
     print("  A B_m that runs with mass is a form the data reject.")
 
     out = os.path.splitext(args.output)[0] + (
-        "_fit_ab_rank.npz" if args.fit_ab_rank else "_fit_ab.npz")
+        "_fit_ab_rank" if args.fit_ab_rank else "_fit_ab") + (
+        f"_ncen{args.fit_ab_ncen_scale:g}" if args.fit_ab_ncen_scale != 1.0
+        else "") + ".npz"
     np.savez(out, logM=logM, n_env_bins=nE, env_column=args.env_column,
              label=label, truth_params=json.dumps(th),
              **{f"global_{f}_{k}_{key}": np.array(v)
