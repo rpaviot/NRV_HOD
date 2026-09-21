@@ -161,15 +161,39 @@ def parse_args():
                    help="Hydro host catalogue carrying the environment "
                         "columns (delta_h, delta_norm, qr2, fs_norm).")
     p.add_argument("--env_column", default="qr2",
-                   choices=["qr2", "fs_norm", "delta_h", "delta_norm"],
-                   help="Environment column to split on. qr2 is the raw tidal "
-                        "shear q_R^2 at R = 2.25 Rvir; fs_norm is its "
-                        "per-mass-bin rank-normalised form (what the chains "
-                        "map as fE). The split is by quantile within each mass "
-                        "bin either way, so raw vs normalised only changes the "
-                        "mass binning used to rank.")
+                   help="Environment column to split on (any column of the "
+                        "host catalogue). qr2 is the raw tidal shear q_R^2; "
+                        "fs_norm its per-mass-bin normalised form (what the "
+                        "chains map as fE); the nmesh1024 catalogue also "
+                        "carries fs_norm_R1 / delta_norm_R3 etc. at fixed "
+                        "smoothing radii. The split is by quantile within each "
+                        "mass bin either way, so raw vs normalised only "
+                        "changes the mass binning used to rank -- but --fit_ab "
+                        "evaluates B*fE on the column's VALUES, so give it the "
+                        "normalised column the chains use.")
     p.add_argument("--n_env_bins", type=int, default=4,
                    help="Number of environment quantiles per mass bin.")
+    p.add_argument("--fit_ab", default=None, metavar="JSON",
+                   help="With --hod_env: fit B_cent and B_sat straight to the "
+                        "measured <N>(M | env), no lensing in the loop, at the "
+                        "truth occupation given as a predict-specs JSON (path "
+                        "or inline; the chain-convention Ac/As are rescaled by "
+                        "a free amplitude). Fits both parametrisations in "
+                        "HOD_models -- ab_method='mass' (the chains: logMmin, "
+                        "logM1 shifted by B*fE, B in dex, B<0 raises occupation "
+                        "at high fE) and 'variant' (Hearin: N*(1+B*fE), B>0 "
+                        "raises it) -- globally and per mass bin, so the table "
+                        "says whether ONE B can represent the measured signal.")
+    p.add_argument("--fit_ab_label", default=None,
+                   help="Which entry of the --fit_ab JSON list to use "
+                        "(default: the first).")
+    p.add_argument("--fit_ab_min_model", type=float, default=5.0,
+                   help="Drop mass bins where the unshifted truth model "
+                        "predicts fewer galaxies than this in some quantile "
+                        "cell. Such cells carry no information on B, and a "
+                        "handful of mislinked satellites there (nearest-centre "
+                        "link, model ~0) would otherwise dominate the "
+                        "deviance.")
     p.add_argument("--link_cache", default=LINK_CACHE,
                    help="npz cache of the galaxy->host KD-tree link.")
     p.add_argument("--fit_hod", default=None, metavar="MEASURED_HOD_NPZ",
@@ -813,7 +837,12 @@ def measure_hod_environment(args):
 
     qname = {"qr2": "tidal shear q_R^2", "fs_norm": "normalised tidal shear",
              "delta_h": "overdensity delta", "delta_norm": "normalised delta"}
-    print(f"\n=== <N>(M) split by {qname[args.env_column]} "
+    qname = qname.get(args.env_column, args.env_column)
+    sum_env = np.bincount(flat[flat >= 0], weights=env[flat >= 0],
+                          minlength=nM * nE).reshape(nM, nE)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        mean_env = np.where(n_host > 0, sum_env / n_host, np.nan)
+    print(f"\n=== <N>(M) split by {qname} "
           f"({args.env_column}), {nE} quantiles at fixed mass ===")
     hdr = f"{'logM':>6} {'N_host/q':>9}"
     for e in range(nE):
@@ -889,10 +918,14 @@ def measure_hod_environment(args):
              env_column=args.env_column, n_env_bins=nE,
              n_host=n_host, n_cen=n_cen, n_sat=n_sat,
              ncen=ncen, nsat=nsat, ncen_err=ncen_err, nsat_err=nsat_err,
-             mean_logM=mean_logM, dlogM_env=dlogM_env,
+             mean_logM=mean_logM, dlogM_env=dlogM_env, mean_env=mean_env,
              slope_cen=slope_cen, slope_sat=slope_sat,
              link_dist=dist.astype(np.float32))
     print(f"\nSaved environment-split HOD -> {args.output}")
+
+    if args.fit_ab:
+        _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen,
+                             n_sat, mean_env)
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
     M = 10.0**logM
@@ -920,12 +953,291 @@ def measure_hod_environment(args):
     ax.set_xscale("log"); ax.set_xlabel(r"$M_{\rm 200m}\;[M_\odot/h]$")
     ax.set_ylabel(r"$\langle N\rangle$(highest q) / $\langle N\rangle$(lowest q)")
     ax.set_ylim(0, 3); ax.grid(alpha=0.3, which="both", ls=":"); ax.legend(fontsize=8)
-    fig.suptitle(f"NISP truth HOD vs {qname[args.env_column]} "
+    fig.suptitle(f"NISP truth HOD vs {qname} "
                  f"at fixed mass (Flamingo hydro)", fontsize=13)
     fig.tight_layout()
     plot_path = os.path.splitext(args.output)[0] + ".png"
     fig.savefig(plot_path, dpi=150)
     print(f"Saved plot -> {plot_path}")
+
+
+# ----------------------------------------------------------------------------
+# B_cent / B_sat straight from the environment-split occupation
+# ----------------------------------------------------------------------------
+#
+# The chains parametrise assembly bias as ab_method="mass": per halo,
+# logMmin -> logMmin + B_cent*fE and logM1 -> logM1 + B_sat*fE on the
+# continuous fE. The only calibration of B so far went through lensing -- a
+# TIED B_cent = B_sat scan at the truth occupation (job 58497015) put the
+# DeltaSigma optimum at -0.3 dex -- so the occupation measurement above is
+# the first direct one. The per-halo model is evaluated on the same halos and
+# summed into the same (mass, quantile) cells, with a Poisson deviance on the
+# galaxy counts; the amplitude is free (the chains rescale Ac/As to ngal).
+#
+# Two parametrisations, because they cannot both be right: a logMmin shift
+# multiplies <N_cen> by ~10^(slope*B*fE) with slope = dlog<N>/dlogM, which is
+# zero at the mHMQ peak and negative above it, so a hi/lo ratio that stays
+# above 1 through the peak is not a shift. 'variant' (Hearin) is a plain
+# amplitude modulation N*(1 + B*fE). The per-mass-bin fits say which one the
+# measured signal is, and whether ONE B can represent it.
+#
+# Sign conventions differ: 'mass' B < 0 raises occupation at high fE (the
+# threshold moves DOWN), 'variant' B > 0 does.
+
+_FIT_AB_BOUNDS = {"mass": (-2.0, 2.0), "variant": (-0.99, 0.99)}
+
+
+def _poisson_dev(mu, n):
+    """Poisson deviance 2 sum[mu - n + n ln(n/mu)] (n ln n/mu := 0 at n=0)."""
+    mu = np.maximum(mu, 1e-300)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        t = np.where(n > 0, n * np.log(n / mu), 0.0)
+    return 2.0 * float(np.sum(mu - n + t))
+
+
+def _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen, n_sat,
+                         mean_env):
+    import json
+    from scipy.optimize import minimize_scalar, brentq
+
+    spec = args.fit_ab.strip()
+    specs = (json.loads(spec) if spec.startswith(("[", "{"))
+             else json.load(open(spec)))
+    if isinstance(specs, dict):
+        specs = [specs]
+    if args.fit_ab_label:
+        specs = [q for q in specs if q.get("label") == args.fit_ab_label]
+        if not specs:
+            raise ValueError(f"--fit_ab_label {args.fit_ab_label!r} not in "
+                             f"the --fit_ab JSON")
+    label = specs[0].get("label", "spec")
+    th = {k: float(v) for k, v in specs[0].items() if k != "label"}
+
+    nM, nE = n_host.shape
+    ncell = nM * nE
+    sel = flat >= 0
+    lm = jnp.asarray(logM_h[sel], dtype=jnp.float64)
+    fe = jnp.asarray(env[sel], dtype=jnp.float64)
+    fe_np = np.asarray(fe)
+    cell = flat[sel]
+    # Halos grouped by mass bin, for the per-bin fits.
+    order = np.argsort(cell // nE, kind="stable")
+    bin_starts = np.searchsorted((cell // nE)[order], np.arange(nM + 1))
+
+    def cen_model(shift):
+        return ELG_mHMQ(lm, th["Ac"], th["Mmin"] + shift, th["sig_M"],
+                        th["gamma"])
+
+    def sat_model(shift):
+        return ELG_satellite_cutoff(lm, th["As"], th["M1"] + shift,
+                                    th["alpha"], th["Mcut"], th["Mmax"])
+
+    # Same cell thresholds as --fit_hod: every quantile of the bin populated,
+    # and enough galaxies in the bin for a ratio to mean anything.
+    okM = {"cen": (n_host.min(1) > args.fit_hod_min_host) & (n_cen.sum(1) > 10),
+           "sat": (n_host.min(1) > args.fit_hod_min_host) & (n_sat.sum(1) > 10)}
+    counts = {"cen": n_cen.astype(np.float64), "sat": n_sat.astype(np.float64)}
+    models = {"cen": cen_model, "sat": sat_model}
+
+    print(f"\n=== B_cent / B_sat fitted to <N>(M | {args.env_column}) at the "
+          f"'{label}' occupation, {nE} quantiles, amplitude free ===")
+    print(f"  truth params: " + ", ".join(f"{k}={v:.4g}" for k, v in th.items()))
+
+    # 'variant' is analytic in (B, amp) given three per-cell sums of the
+    # unshifted occupation P0: mu = amp*S0 + amp*B*S1 - amp^2*B*S2 (centrals,
+    # the (1 - N_cen) factor) or amp*(S0 + B*S1) (satellites).
+    P0 = {k: np.asarray(models[k](0.0), dtype=np.float64) for k in models}
+    S = {}
+    for k in models:
+        S[k] = tuple(np.bincount(cell, weights=w, minlength=ncell)
+                     .reshape(nM, nE)
+                     for w in (P0[k], P0[k] * fe_np, P0[k] ** 2 * fe_np))
+
+    # Cells where the truth model itself predicts ~nothing are pure link
+    # noise for the deviance (n ln(n/mu) with mu -> 0) and blind to B.
+    for kind in okM:
+        S0, n = S[kind][0], counts[kind]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mu0 = S0 * (n[okM[kind]].sum() / S0[okM[kind]].sum())
+        okM[kind] &= np.nan_to_num(mu0).min(1) >= args.fit_ab_min_model
+    for kind in okM:
+        used = np.where(okM[kind])[0]
+        print(f"  {kind}: {len(used)} mass bins enter the fit, logM "
+              f"{logM[used.min()]:.2f}-{logM[used.max()]:.2f} (model >= "
+              f"{args.fit_ab_min_model:g} galaxies per cell, > "
+              f"{args.fit_hod_min_host} halos per cell)")
+
+    def cell_sums(form, kind, B, amp, bins):
+        """Per-cell expected counts for mass bins `bins` (bool over nM)."""
+        if form == "mass":
+            if bins.all():
+                w = np.asarray(models[kind](B * fe), dtype=np.float64)
+                mu = np.bincount(cell, weights=w, minlength=ncell)
+            else:
+                mu = np.zeros(ncell)
+                for m in np.where(bins)[0]:
+                    idx = order[bin_starts[m]:bin_starts[m + 1]]
+                    if len(idx) == 0:
+                        continue
+                    shift = B * fe[idx]
+                    w = np.asarray(
+                        ELG_mHMQ(lm[idx], th["Ac"], th["Mmin"] + shift,
+                                 th["sig_M"], th["gamma"]) if kind == "cen"
+                        else ELG_satellite_cutoff(
+                            lm[idx], th["As"], th["M1"] + shift, th["alpha"],
+                            th["Mcut"], th["Mmax"]), dtype=np.float64)
+                    mu += np.bincount(cell[idx], weights=w, minlength=ncell)
+            return amp * mu.reshape(nM, nE)[bins]
+        S0, S1, S2 = S[kind]
+        if kind == "cen":
+            mu = amp * S0 + amp * B * S1 - amp * amp * B * S2
+        else:
+            mu = amp * (S0 + B * S1)
+        return mu[bins]
+
+    def profile(form, kind, B, bins):
+        """min over amp of the deviance at this B -> (C, amp)."""
+        n = counts[kind][bins]
+        mu1 = cell_sums(form, kind, B, 1.0, bins)
+        a0 = n.sum() / mu1.sum()
+        if form == "mass" or kind == "sat":
+            return _poisson_dev(a0 * mu1, n), a0      # mu linear in amp
+        r = minimize_scalar(
+            lambda la: _poisson_dev(cell_sums(form, kind, B, np.exp(la), bins),
+                                    n),
+            bracket=(np.log(a0) - 0.3, np.log(a0) + 0.3))
+        return r.fun, float(np.exp(r.x))
+
+    def fit(form, kind, bins):
+        lo, hi = _FIT_AB_BOUNDS[form]
+        f = lambda B: profile(form, kind, B, bins)[0]
+        r = minimize_scalar(f, bounds=(lo, hi), method="bounded",
+                            options={"xatol": 1e-4})
+        Bb, Cmin = float(r.x), float(r.fun)
+        _, amp = profile(form, kind, Bb, bins)
+        err = []
+        for a, b in ((lo, Bb), (Bb, hi)):
+            g = lambda B: f(B) - Cmin - 1.0
+            edge = a if a != Bb else b
+            if abs(edge - Bb) < 1e-6 or g(edge) < 0:
+                err.append(np.nan)                     # hits the bound
+            else:
+                err.append(abs(brentq(g, a, b, xtol=1e-4) - Bb))
+        return dict(B=Bb, err_lo=err[0], err_hi=err[1], amp=amp, C=Cmin,
+                    C0=f(0.0), n_cells=int(bins.sum() * nE))
+
+    print(f"  {'form':>8} {'component':>10} {'B':>8} {'-1sig':>7} {'+1sig':>7}"
+          f" {'amp':>7} {'C/dof':>10} {'dC(B=0)':>9} {'cells':>6}")
+    glob = {}
+    for form in ("mass", "variant"):
+        for kind in ("cen", "sat"):
+            r = fit(form, kind, okM[kind])
+            glob[(form, kind)] = r
+            dof = r["n_cells"] - 2
+            print(f"  {form:>8} {('centrals' if kind == 'cen' else 'satellites'):>10}"
+                  f" {r['B']:8.3f} {r['err_lo']:7.3f} {r['err_hi']:7.3f}"
+                  f" {r['amp']:7.3f} {r['C'] / dof:10.2f}"
+                  f" {r['C0'] - r['C']:9.1f} {r['n_cells']:6d}")
+    print("  'mass': logMmin/logM1 += B*fE (dex; B<0 raises occupation at high "
+          "fE).  'variant': N *= 1 + B*fE (B>0 raises it).")
+    print("  amp: rescale of the JSON's Ac/As (the chains' /10 convention -> "
+          "~10 expected).  dC(B=0): deviance drop from B=0, ~ (n sigma)^2.")
+    print("  err = nan: the 1-sigma interval reaches the fit bound "
+          f"({_FIT_AB_BOUNDS['mass']} mass, {_FIT_AB_BOUNDS['variant']} variant).")
+
+    # Per mass bin: what B this bin alone wants, amplitude free per bin, and
+    # the hi/lo quantile ratio the GLOBAL fit predicts there vs the measured.
+    print(f"\n  per mass bin (amp free per bin; hi/lo = top/bottom quantile; "
+          f"glob = hi/lo the single global B predicts there):")
+    blk = (f" {'N_gal':>7} {'hi/lo':>7} | {'mass B_m':>9} {'-':>5} {'+':>5}"
+           f" {'glob':>6} | {'var B_m':>8} {'-':>5} {'+':>5} {'glob':>6}   ||")
+    print(f"  {'':>6}{'CENTRALS':^{len(blk)}}{'SATELLITES':^{len(blk)}}")
+    print(f"  {'logM':>6}{blk}{blk}")
+    local = {("mass", "cen"): [], ("mass", "sat"): [],
+             ("variant", "cen"): [], ("variant", "sat"): []}
+    ratio_glob = {}
+    for form, kind in glob:
+        g = glob[(form, kind)]
+        mu = cell_sums(form, kind, g["B"], g["amp"], np.ones(nM, bool))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio_glob[(form, kind)] = mu[:, -1] / mu[:, 0]
+    for m in range(nM):
+        row = f"  {logM[m]:6.2f}"
+        for kind in ("cen", "sat"):
+            n = counts[kind][m]
+            if not okM[kind][m]:
+                for form in ("mass", "variant"):
+                    local[(form, kind)].append((np.nan, np.nan, np.nan))
+                row += f" {n.sum():7.0f} {'':>7} | {'':>9} {'':>5} {'':>5} {'':>6}" \
+                       f" | {'':>8} {'':>5} {'':>5} {'':>6}   ||"
+                continue
+            bins = np.zeros(nM, bool); bins[m] = True
+            meas = n[-1] / n[0] if n[0] > 0 else np.nan
+            row += f" {n.sum():7.0f} {meas:7.3f}"
+            for form in ("mass", "variant"):
+                r = fit(form, kind, bins)
+                local[(form, kind)].append((r["B"], r["err_lo"], r["err_hi"]))
+                row += (f" | {r['B']:9.3f} {r['err_lo']:5.2f} {r['err_hi']:5.2f}"
+                        f" {ratio_glob[(form, kind)][m]:6.3f}")
+            row += "   ||"
+        print(row)
+    print("  A B_m that runs with mass is a form the data reject.")
+
+    out = os.path.splitext(args.output)[0] + "_fit_ab.npz"
+    np.savez(out, logM=logM, n_env_bins=nE, env_column=args.env_column,
+             label=label, truth_params=json.dumps(th),
+             **{f"global_{f}_{k}_{key}": np.array(v)
+                for (f, k), r in glob.items() for key, v in r.items()},
+             **{f"local_{f}_{k}": np.array(v) for (f, k), v in local.items()},
+             **{f"ratio_global_{f}_{k}": v for (f, k), v in ratio_glob.items()},
+             ok_cen=okM["cen"], ok_sat=okM["sat"])
+    print(f"Saved B fits -> {out}")
+
+    # ---- plot: measured hi/lo ratio vs the two global fits; local B_m -------
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
+    M = 10.0 ** logM
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for ax, kind, c in ((axes[0], "cen", "tab:blue"),
+                            (axes[1], "sat", "tab:red")):
+            n = counts[kind]
+            r = n[:, -1] / n[:, 0]
+            re = r * np.sqrt(1.0 / np.maximum(n[:, -1], 1)
+                             + 1.0 / np.maximum(n[:, 0], 1))
+            ok = okM[kind]
+            ax.errorbar(M[ok], r[ok], yerr=re[ok], fmt="o", ms=4, color="k",
+                        label="measured")
+            for form, ls in (("mass", "-"), ("variant", "--")):
+                g = glob[(form, kind)]
+                ax.plot(M[ok], ratio_glob[(form, kind)][ok], ls, color=c,
+                        lw=1.8, label=f"{form}: B={g['B']:+.3f}")
+            ax.axhline(1.0, color="k", lw=0.8, ls=":")
+            ax.set_xscale("log")
+            ax.set_xlabel(r"$M_{\rm 200m}\;[M_\odot/h]$")
+            ax.set_ylabel(r"$\langle N\rangle$(top q) / $\langle N\rangle$(bottom q)")
+            ax.set_title("centrals" if kind == "cen" else "satellites")
+            ax.grid(alpha=0.3, which="both", ls=":"); ax.legend(fontsize=8)
+        ax = axes[2]
+        for (form, kind), c, mk in ((("mass", "cen"), "tab:blue", "o"),
+                                    (("mass", "sat"), "tab:red", "o"),
+                                    (("variant", "cen"), "tab:blue", "s"),
+                                    (("variant", "sat"), "tab:red", "s")):
+            v = np.array(local[(form, kind)])
+            ok = np.isfinite(v[:, 0])
+            ax.errorbar(M[ok], v[ok, 0],
+                        yerr=[np.nan_to_num(v[ok, 1]), np.nan_to_num(v[ok, 2])],
+                        fmt=mk, ms=4, color=c, mfc=(c if form == "mass" else "none"),
+                        label=f"{form} {kind}")
+            ax.axhline(glob[(form, kind)]["B"], color=c, lw=0.8,
+                       ls=("-" if form == "mass" else "--"))
+        ax.axhline(0.0, color="k", lw=0.8, ls=":")
+        ax.set_xscale("log"); ax.set_xlabel(r"$M_{\rm 200m}\;[M_\odot/h]$")
+        ax.set_ylabel("B per mass bin (lines: global fit)")
+        ax.grid(alpha=0.3, which="both", ls=":"); ax.legend(fontsize=7, ncol=2)
+    fig.suptitle(f"B fitted to the NISP occupation split by {args.env_column} "
+                 f"({label})", fontsize=13)
+    fig.tight_layout()
+    fig.savefig(os.path.splitext(out)[0] + ".png", dpi=150)
+    print(f"Saved plot -> {os.path.splitext(out)[0] + '.png'}")
 
 
 # ============================================================================
