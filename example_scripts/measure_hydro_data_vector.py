@@ -1211,7 +1211,7 @@ def _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen, n_sat,
                 ax.plot(M[ok], ratio_glob[(form, kind)][ok], ls, color=c,
                         lw=1.8, label=f"{form}: B={g['B']:+.3f}")
             ax.axhline(1.0, color="k", lw=0.8, ls=":")
-            ax.set_xscale("log")
+            ax.set_xscale("log"); ax.set_yscale("log")
             ax.set_xlabel(r"$M_{\rm 200m}\;[M_\odot/h]$")
             ax.set_ylabel(r"$\langle N\rangle$(top q) / $\langle N\rangle$(bottom q)")
             ax.set_title("centrals" if kind == "cen" else "satellites")
