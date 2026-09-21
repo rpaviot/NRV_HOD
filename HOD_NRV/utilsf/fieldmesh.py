@@ -620,8 +620,17 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
                                      rvir_factor: float = 2.25,
                                      fixed_radii: Optional[Sequence[float]] = None,
                                      mass_bins: Union[int, np.ndarray] = 30,
-                                     threads: int = 32) -> dict:
-    """High-level wrapper: load halos/particles, compute (δ, q_R²) at halo positions, normalize."""
+                                     threads: int = 32,
+                                     particle_type: Optional[Sequence[int]] = None,
+                                     type_column: str = 'type') -> dict:
+    """High-level wrapper: load halos/particles, compute (δ, q_R²) at halo positions, normalize.
+
+    ``particle_type`` keeps only those values of ``type_column`` when the
+    particles come from a parquet file (hydro: 0 = DM, 1 = stars, 2 = gas).
+    The mesh is a particle COUNT, so in a hydro box gas and stars carry half
+    the weight while DM carries 84% of the mass; a DM-only field is the check
+    that an occupation-vs-environment trend is not the galaxy's own baryons.
+    """
     print("Loading data...")
 
     if isinstance(halo_catalogue, str):
@@ -653,14 +662,25 @@ def compute_assembly_bias_properties(halo_catalogue: Union[str, pd.DataFrame],
         # second float64 copy of three of them before the cast to float32 --
         # ~15 GB of peak for 2.8 GB of data, on top of the mesh. Filling in
         # place holds one column (1.9 GB) above the output.
+        keep = None
+        if particle_type is not None:
+            t = pd.read_parquet(particle_positions, columns=[type_column])[type_column].values
+            keep = np.isin(t, np.asarray(particle_type, dtype=t.dtype))
+            print(f"  particle types {list(particle_type)}: keeping "
+                  f"{keep.sum():,} of {len(t):,}")
+            del t
+            gc.collect()
         particle_pos = None
         for i, col in enumerate(position_columns):
             v = pd.read_parquet(particle_positions, columns=[col])[col].values
+            if keep is not None:
+                v = v[keep]
             if particle_pos is None:
                 particle_pos = np.empty((len(v), 3), dtype=np.float32)
             particle_pos[:, i] = v
             del v
             gc.collect()
+        del keep
         print(f"  particles: {len(particle_pos):,}")
     else:
         particle_pos = particle_positions

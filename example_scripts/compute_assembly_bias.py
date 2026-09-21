@@ -64,6 +64,10 @@ _p.add_argument("--fixed_radii", type=float, nargs="*",
                 default=[0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
                 help="Fixed smoothing scales to save alongside the adaptive "
                      "one. Free: the R grid is built anyway.")
+_p.add_argument("--particle_type", type=int, nargs="*", default=None,
+                help="Keep only these values of the particle file's 'type' "
+                     "column (hydro: 0 DM, 1 stars, 2 gas). Default: all. "
+                     "'--particle_type 0' paints a DM-only field.")
 _args = _p.parse_args()
 HALO_PATH, PARTICLE_PATH, OUTPUT_PATH = (
     _args.halo_path, _args.particle_path, _args.output)
@@ -93,6 +97,7 @@ print(f"Smoothing     : {RVIR_FACTOR} × Rvir  (grid {R_MIN}–{R_MAX} Mpc/h, st
 print(f"Nmesh         : {NMESH},  Lbox = {LBOX} Mpc/h,  "
       f"cell = {LBOX / NMESH:.3f} Mpc/h")
 print(f"Fixed radii   : {_args.fixed_radii}")
+print(f"Particle types: {_args.particle_type if _args.particle_type is not None else 'all'}")
 if R_MIN < 0.5 * LBOX / NMESH:
     print(f"  WARNING: r_min = {R_MIN} is below half a cell "
           f"({0.5 * LBOX / NMESH:.3f}) -- the Gaussian filters nothing there")
@@ -115,6 +120,7 @@ results = compute_assembly_bias_properties(
     dr=DR,
     fixed_radii=_args.fixed_radii,
     threads=THREADS,
+    particle_type=_args.particle_type,
 )
 
 # ---------------------------------------------------------------------------
