@@ -260,7 +260,8 @@ class HaloOccupation:
             test_satellites.run_all_tests()
 
     def set_halo_model(self, hod_type: str, conformity: bool = False,
-                       elg_satellite: bool = False, ab_method: str = "mass"):
+                       elg_satellite: bool = False, ab_method: str = "mass",
+                       ab_rank: bool = False, ab_rank_dlogM: float = 0.1):
         """
         Configure the Halo Occupation Distribution model.
 
@@ -291,9 +292,16 @@ class HaloOccupation:
               the ranking is discarded. That both caps how much of a real
               assembly-bias signal the parametrisation can reach and imprints
               the smoothing scale of the environment field on the prediction.
-            - "variant": paper Eq. 12-13 with continuous fE.
+            - "variant": Hadzhiyska+2023 Eq. 12-13, N_cen*(1 + B*fE*(1-N_cen))
+              and N_sat*(1 + B*fE). The paper defines fE as the RANK within
+              0.1 dex mass bins -- pass ab_rank=True for that; on the
+              value-normalised fs_norm columns it is a different model.
             "mass" matches the default of the underlying Occupation; this
             argument used to default to "direct" and silently override it.
+        ab_rank : bool, default=False
+            Replace fI/fE by their rank within ab_rank_dlogM mass bins
+            (uniform in [-1, 1]) inside the Occupation. self.fI/self.fE keep
+            the raw columns, which is what the tabulation bins are cut on.
 
         Examples
         --------
@@ -317,7 +325,8 @@ class HaloOccupation:
             elg_satellite=elg_satellite,
             fI=self.fI, fE=self.fE,
             ab_method=ab_method,
-            logM_halos=self.logM if self.assembly_bias else None
+            logM_halos=self.logM if self.assembly_bias else None,
+            ab_rank=ab_rank, ab_rank_dlogM=ab_rank_dlogM,
         )
 
     def populate_haloes(self, dict_params: Dict[str, float],

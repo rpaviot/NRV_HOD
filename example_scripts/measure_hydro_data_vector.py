@@ -187,6 +187,13 @@ def parse_args():
     p.add_argument("--fit_ab_label", default=None,
                    help="Which entry of the --fit_ab JSON list to use "
                         "(default: the first).")
+    p.add_argument("--fit_ab_rank", action="store_true",
+                   help="Fit B on the within-mass-bin RANK of --env_column "
+                        "(uniform in [-1, 1], the same --dlogM bins), which "
+                        "is how Hadzhiyska+2023 / AbacusHOD define the "
+                        "variable and what run_tabulated_chains --ab_rank "
+                        "feeds the chains. The quantile cells are unchanged "
+                        "(the rank is monotonic in the value).")
     p.add_argument("--fit_ab_min_model", type=float, default=5.0,
                    help="Drop mass bins where the unshifted truth model "
                         "predicts fewer galaxies than this in some quantile "
@@ -1016,6 +1023,11 @@ def _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen, n_sat,
     nM, nE = n_host.shape
     ncell = nM * nE
     sel = flat >= 0
+    if args.fit_ab_rank:
+        from HOD_NRV.HOD_numerical.HOD_models import rank_within_mass_bins
+        env = rank_within_mass_bins(env, logM_h, args.dlogM)
+        print(f"  B acts on the within-mass-bin rank of {args.env_column} "
+              f"(uniform in [-1, 1], {args.dlogM} dex bins)")
     lm = jnp.asarray(logM_h[sel], dtype=jnp.float64)
     fe = jnp.asarray(env[sel], dtype=jnp.float64)
     fe_np = np.asarray(fe)
@@ -1183,7 +1195,8 @@ def _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen, n_sat,
         print(row)
     print("  A B_m that runs with mass is a form the data reject.")
 
-    out = os.path.splitext(args.output)[0] + "_fit_ab.npz"
+    out = os.path.splitext(args.output)[0] + (
+        "_fit_ab_rank.npz" if args.fit_ab_rank else "_fit_ab.npz")
     np.savez(out, logM=logM, n_env_bins=nE, env_column=args.env_column,
              label=label, truth_params=json.dumps(th),
              **{f"global_{f}_{k}_{key}": np.array(v)
@@ -1233,8 +1246,9 @@ def _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen, n_sat,
         ax.set_xscale("log"); ax.set_xlabel(r"$M_{\rm 200m}\;[M_\odot/h]$")
         ax.set_ylabel("B per mass bin (lines: global fit)")
         ax.grid(alpha=0.3, which="both", ls=":"); ax.legend(fontsize=7, ncol=2)
-    fig.suptitle(f"B fitted to the NISP occupation split by {args.env_column} "
-                 f"({label})", fontsize=13)
+    fig.suptitle(f"B fitted to the NISP occupation split by {args.env_column}"
+                 f"{' (rank)' if args.fit_ab_rank else ''} ({label})",
+                 fontsize=13)
     fig.tight_layout()
     fig.savefig(os.path.splitext(out)[0] + ".png", dpi=150)
     print(f"Saved plot -> {os.path.splitext(out)[0] + '.png'}")

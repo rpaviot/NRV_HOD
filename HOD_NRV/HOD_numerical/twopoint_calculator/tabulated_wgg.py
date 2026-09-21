@@ -658,6 +658,14 @@ class TabulatedWgg:
                 probS = probS * (1.0 + ab_s)
                 lam1 = lam1 * (1.0 + ab_s)
                 lam0 = lam0 * (1.0 + ab_s)
+            elif has_ab and ab_method == "variant":
+                ab_c = params.get(cen_coef, 0.0) * j_prop_cell
+                ab_s = params.get(sat_coef, 0.0) * j_prop_cell
+                probC = jnp.minimum(probC, 1.0)
+                probC = probC * (1.0 + ab_c * (1.0 - probC))
+                probS = probS * (1.0 + ab_s)
+                lam1 = lam1 * (1.0 + ab_s)
+                lam0 = lam0 * (1.0 + ab_s)
             probC = jnp.minimum(probC, 1.0)
 
             wC = probC * j_N_cell

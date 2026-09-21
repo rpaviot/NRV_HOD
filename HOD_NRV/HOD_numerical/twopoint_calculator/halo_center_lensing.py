@@ -1000,6 +1000,15 @@ def build_occupation_cells(halo, logM_edges, fI_edges,
     median 1.7e-5; 9 -> 15 ms/call), where the logM sub-division becomes
     the floor. 32 is the default.
 
+    Under ``ab_method='variant'`` (Hadzhiyska+2023 Eq. 12-13) the AB factor is
+    LINEAR in the property, so the per-cell mean is exact along the property
+    axis (the occupation before AB depends on logM only); the logM
+    sub-division is the whole error. With ``Occupation(ab_rank=True)`` the
+    property the coefficient multiplies is the within-mass-bin rank while the
+    tabulation bins are still cut on the raw column: ``prop_bin`` (from the
+    HaloOccupation, raw) places halos in the ``fI_edges`` bins, ``prop`` (from
+    the Occupation, rank or raw) is what ``prop_cell`` averages.
+
     Returns a dict with the cell assignment (``cell``, one entry per halo),
     the grid shape (``n_mc``, ``n_fc``, ``n_cells``, ``n_sub_logM``,
     ``n_sub_fI``), per-cell counts and means (``N_cell``, ``logM_cell``,
@@ -1007,12 +1016,12 @@ def build_occupation_cells(halo, logM_edges, fI_edges,
     coefficient names that multiply it (``prop``, ``cen_coef``, ``sat_coef``).
     """
     occ = halo.HOD
-    if occ.assembly_bias and occ.ab_method not in ("mass", "direct"):
+    if occ.assembly_bias and occ.ab_method not in ("mass", "direct", "variant"):
         raise NotImplementedError(
-            "occupation cells support ab_method 'mass' or 'direct'.")
+            "occupation cells support ab_method 'mass', 'direct' or 'variant'.")
 
     # ── AB property and the coefficient names that multiply it ──
-    prop = None
+    prop = prop_bin = None
     cen_coef = sat_coef = None
     if occ.assembly_bias:
         if occ.fI is not None and occ.fE is not None:
@@ -1020,8 +1029,10 @@ def build_occupation_cells(halo, logM_edges, fI_edges,
                 "occupation cells support a single AB property (fI or fE).")
         if occ.fI is not None:
             prop, cen_coef, sat_coef = np.asarray(occ.fI), "A_cent", "A_sat"
+            prop_bin = np.asarray(halo.fI)
         else:
             prop, cen_coef, sat_coef = np.asarray(occ.fE), "B_cent", "B_sat"
+            prop_bin = np.asarray(halo.fE)
 
     # ── Fine occupation grid nested in the tabulation bins ──
     logM = np.asarray(halo.logM)
@@ -1038,7 +1049,7 @@ def build_occupation_cells(halo, logM_edges, fI_edges,
         if prop is None:
             raise ValueError("Tabulation has fI bins but the HOD has no fI/fE.")
         fI_edges = np.asarray(fI_edges)
-        i_f = np.clip(np.digitize(prop, fI_edges) - 1, 0, n_f - 1)
+        i_f = np.clip(np.digitize(prop_bin, fI_edges) - 1, 0, n_f - 1)
         n_fc = n_f * n_sub_fI
         i_fc = np.empty(len(prop), dtype=np.int64)
         eps = 1e-9
@@ -1047,13 +1058,14 @@ def build_occupation_cells(halo, logM_edges, fI_edges,
         for f in range(n_f):
             sel = i_f == f
             if fI_sub == "width":
-                q = np.linspace(prop[sel].min(), prop[sel].max(), n_sub_fI + 1)
+                q = np.linspace(prop_bin[sel].min(), prop_bin[sel].max(),
+                                n_sub_fI + 1)
             else:
-                q = np.quantile(prop[sel], np.linspace(0, 1, n_sub_fI + 1))
+                q = np.quantile(prop_bin[sel], np.linspace(0, 1, n_sub_fI + 1))
             q[0] -= eps
             q[-1] += eps
             i_fc[sel] = f * n_sub_fI + np.clip(
-                np.digitize(prop[sel], q) - 1, 0, n_sub_fI - 1)
+                np.digitize(prop_bin[sel], q) - 1, 0, n_sub_fI - 1)
     else:
         n_fc, n_sub_fI = 1, 1
         i_fc = np.zeros(len(logM), dtype=np.int64)
@@ -1418,6 +1430,12 @@ class TabulatedDeltaSigma:
                 ab_s = params.get(sat_coef, 0.0) * j_sign_cell
                 probC = probC + ab_c * jnp.minimum(probC, 1.0 - probC)
                 probS = probS * (1.0 + ab_s)
+            elif has_ab and ab_method == "variant":
+                ab_c = params.get(cen_coef, 0.0) * j_prop_cell
+                ab_s = params.get(sat_coef, 0.0) * j_prop_cell
+                probC = jnp.minimum(probC, 1.0)
+                probC = probC * (1.0 + ab_c * (1.0 - probC))
+                probS = probS * (1.0 + ab_s)
             probC = jnp.minimum(probC, 1.0)
             return jnp.sum((probC + probS) * j_N_cell) / Lbox3
 
@@ -1438,8 +1456,10 @@ class TabulatedDeltaSigma:
         evaluated at the per-cell mean (logM, fI) instead of per halo.
 
         The ngal/fsat catalog sums use the same fine grid. AB is supported
-        for ``ab_method`` 'mass' or 'direct' with a single AB property
-        (fI or fE); 'direct' uses exact per-cell means of sign(prop).
+        for ``ab_method`` 'mass', 'direct' or 'variant' with a single AB
+        property (fI or fE); 'direct' uses exact per-cell means of
+        sign(prop), 'variant' the per-cell mean of the property (exact for
+        its linear factor; the rank when the Occupation has ``ab_rank``).
         """
         import jax
         import jax.numpy as jnp
@@ -1512,6 +1532,12 @@ class TabulatedDeltaSigma:
                 ab_c = params.get(cen_coef, 0.0) * j_sign_cell
                 ab_s = params.get(sat_coef, 0.0) * j_sign_cell
                 probC = probC + ab_c * jnp.minimum(probC, 1.0 - probC)
+                probS = probS * (1.0 + ab_s)
+            elif has_ab and ab_method == "variant":
+                ab_c = params.get(cen_coef, 0.0) * j_prop_cell
+                ab_s = params.get(sat_coef, 0.0) * j_prop_cell
+                probC = jnp.minimum(probC, 1.0)
+                probC = probC * (1.0 + ab_c * (1.0 - probC))
                 probS = probS * (1.0 + ab_s)
             probC = jnp.minimum(probC, 1.0)
 

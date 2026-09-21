@@ -130,6 +130,16 @@ def _base_name(case_name):
     return case_name[:-3] if case_name.endswith("_AB") else case_name
 
 
+def _ab_tag(args):
+    """Output-name suffix for a non-default assembly-bias scheme."""
+    tag = ""
+    if getattr(args, "ab_method", "mass") != "mass":
+        tag += f"_{args.ab_method}"
+    if getattr(args, "ab_rank", False):
+        tag += "_rank"
+    return tag
+
+
 def _fix_tag(args):
     """Output-name suffix recording which parameters were pinned by --fix.
 
@@ -139,11 +149,18 @@ def _fix_tag(args):
     """
     fix_map = getattr(args, "fix_map", None)
     if not fix_map:
-        return ""
-    return "_fix" + "-".join(sorted(fix_map))
+        return _ab_tag(args)
+    return _ab_tag(args) + "_fix" + "-".join(sorted(fix_map))
 
 
-def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False, fixed=None):
+# 'variant' multiplies the occupation by 1 + B*fE (times 1 - N_cen for
+# centrals) with fE in [-1, 1], so |B| <= 1 is the positivity bound
+# (Hadzhiyska+2023 Note 2: |a| + |b| <= 2 on their [-0.5, 0.5] rank).
+VARIANT_B_RANGE = (-1.0, 1.0)
+
+
+def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False, fixed=None,
+                       ab_method="mass"):
     """Same prior structure as run_emulator_chains.py --full_bb (elg_satellite).
 
     ``fixed`` is a {name: value} override applied last: a scalar in
@@ -177,6 +194,10 @@ def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False, fixed=None
 
     for name in active:
         cfg[name] = PRIOR_RANGES[name]
+    if ab_method == "variant":
+        for name in ("B_cent", "B_sat"):
+            if name in active:
+                cfg[name] = VARIANT_B_RANGE
 
     for name, value in (fixed or {}).items():
         if name not in cfg:
@@ -191,11 +212,15 @@ def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False, fixed=None
 # Model builders
 # ============================================================================
 
-def build_halo_occupation(fit_case, halo_path, ab_column=None):
+def build_halo_occupation(fit_case, halo_path, ab_column=None,
+                          ab_method="mass", ab_rank=False):
     """HaloOccupation with the assembly-bias column mapped as fE.
 
     assembly_bias is always on so the fI tabulation bins resolve; non-AB
-    cases simply fix B_cent = B_sat = 0.
+    cases simply fix B_cent = B_sat = 0. ``ab_method`` selects how B acts
+    ('mass': logMmin/logM1 shift; 'variant': Hadzhiyska+2023 Eq. 12-13
+    amplitude factor) and ``ab_rank`` feeds it the within-mass-bin rank of
+    the column instead of its value (the papers' definition).
     """
     cmap = dict(COLUMN_MAPPING)
     cmap["fE"] = ab_column or AB_COLUMN
@@ -215,6 +240,7 @@ def build_halo_occupation(fit_case, halo_path, ab_column=None):
         "ELG_mHMQ",
         conformity=(fit_case == FitCase.CONFORMITY),
         elg_satellite=True,
+        ab_method=ab_method, ab_rank=ab_rank,
     )
     return halo
 
@@ -437,7 +463,7 @@ def run_case(case_name, fit_case, halo, tab, args):
 
         param_config = build_param_config(
             fit_case, assembly_bias=assembly_bias, gaussian_ab=args.gaussian_ab,
-            fixed=args.fix_map)
+            fixed=args.fix_map, ab_method=args.ab_method)
 
         fitter = TabulatedFitter(
             tabulated_ds=tab,
@@ -627,6 +653,20 @@ def parse_args():
                         "ranking of proxies is fs_norm_R1 (tidal shear at 1 "
                         "Mpc/h, 118.7%% of the assembly bias in DeltaSigma) > "
                         "delta_norm_R3 (89%%) > fs_norm at 6 Mpc/h (36%%).")
+    p.add_argument("--ab_method", default="mass",
+                   choices=["mass", "direct", "variant"],
+                   help="How B_cent/B_sat act on the occupation. 'mass' "
+                        "(default): logMmin/logM1 += B*fE, B in dex. "
+                        "'variant': Hadzhiyska+2023 Eq. 12-13, "
+                        "N_cen*(1+B*fE*(1-N_cen)) and N_sat*(1+B*fE), priors "
+                        f"{VARIANT_B_RANGE}. Output names carry the scheme.")
+    p.add_argument("--ab_rank", action="store_true",
+                   help="Feed the AB scheme the within-mass-bin RANK of "
+                        "--ab_column (uniform in [-1, 1], 0.1 dex bins) "
+                        "instead of its value -- the definition in "
+                        "Hadzhiyska+2023 and AbacusHOD. The tabulation bins "
+                        "are still cut on the column's values, so no "
+                        "re-tabulation is needed.")
     p.add_argument("--per_bin", action="store_true",
                    help="Print per-bin residuals and chi2 contributions for "
                         "DeltaSigma and wgg (diagnostic; pairs with "
@@ -695,7 +735,17 @@ def predict_at(case_name, fit_case, halo, tab, args):
 
     param_config = build_param_config(
         fit_case, assembly_bias=case_name.endswith("_AB"),
-        gaussian_ab=args.gaussian_ab, fixed=args.fix_map)
+        gaussian_ab=args.gaussian_ab, fixed=args.fix_map,
+        ab_method=args.ab_method)
+
+    tab_wgg = None
+    if args.wgg_tab:
+        tab_wgg = TabulatedWgg(WggTabulation.load(args.wgg_tab), halo,
+                               sat_kernel_weighting=args.sat_kernel_weighting)
+        print(f"  wgg: {tab_wgg} (rp_min_wgg={args.rp_min_wgg})")
+    if halo.assembly_bias:
+        print(f"  assembly bias: ab_method={halo.HOD.ab_method!r}, "
+              f"ab_rank={halo.HOD.ab_rank}, column={args.ab_column!r}")
 
     for rp_min in args.rp_min_values:
         fitter = TabulatedFitter(
@@ -705,6 +755,10 @@ def predict_at(case_name, fit_case, halo, tab, args):
             data_path=args.data_path, rp_min=rp_min, rp_max=None,
             param_config=param_config, Ac_fiducial=AC_FIDUCIAL,
             ngal_anchor="mass_function",
+            **({"tabulated_wgg": tab_wgg, "data_path_wgg": args.data_path,
+                "rp_min_wgg": args.rp_min_wgg, "rp_max_wgg": args.rp_max_wgg,
+                "n_wgg_threads": args.n_wgg_threads}
+               if tab_wgg is not None else {}),
         )
         print(f"\n  rp_min = {rp_min}: {fitter.n_bins} bins in "
               f"[{fitter.rp_obs[0]:.3f}, {fitter.rp_obs[-1]:.2f}] Mpc/h")
@@ -726,6 +780,16 @@ def predict_at(case_name, fit_case, halo, tab, args):
                            fitter.cov_inv)
             print(f"  {label}: chi2 = {chi2:.2f} over {fitter.n_bins} bins "
                   f"(chi2/N = {chi2 / fitter.n_bins:.3f}, no free parameters)")
+            if tab_wgg is not None:
+                _, wgg, _ = tab_wgg.predict(spec, fitter.rp_bins_wgg)
+                rw = np.asarray(wgg) - fitter.wgg_obs
+                chi2_w = float(rw @ fitter.cov_inv_wgg @ rw)
+                _print_per_bin(f"{label} wgg", fitter.rp_obs_wgg,
+                               fitter.wgg_obs, np.asarray(wgg),
+                               fitter.cov_inv_wgg)
+                print(f"  {label}: chi2_wgg = {chi2_w:.2f} over "
+                      f"{len(fitter.wgg_obs)} bins "
+                      f"(chi2/N = {chi2_w / len(fitter.wgg_obs):.3f})")
             print(f"  {label}: ngal = {info['ngal']:.4e}, "
                   f"fsat = {info['fsat']:.4f}")
             print(f"  {label}: params = {spec}")
@@ -745,7 +809,8 @@ def main():
             fit_case = FIT_CASE_OF[_base_name(case_name)]
             print(f"\nLoading halo catalogue for case {case_name} ...")
             halo = build_halo_occupation(fit_case, args.halo_path,
-                                         args.ab_column)
+                                         args.ab_column, args.ab_method,
+                                         args.ab_rank)
             predict_at(case_name, fit_case, halo,
                        TabulatedDeltaSigma(cache, halo), args)
         return
@@ -758,9 +823,13 @@ def main():
         fit_case = FIT_CASE_OF[_base_name(case_name)]
         print(f"\nLoading halo catalogue for case {case_name} ...")
         halo = build_halo_occupation(fit_case, args.halo_path,
-                                     args.ab_column)
+                                     args.ab_column, args.ab_method,
+                                     args.ab_rank)
         tab = TabulatedDeltaSigma(cache, halo)
         print(f"  {tab}")
+        if halo.assembly_bias:
+            print(f"  assembly bias: ab_method={halo.HOD.ab_method!r}, "
+                  f"ab_rank={halo.HOD.ab_rank}, column={args.ab_column!r}")
 
         rp_all, bestfits, logM_bins = run_case(case_name, fit_case, halo,
                                                tab, args)

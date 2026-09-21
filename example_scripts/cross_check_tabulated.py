@@ -86,6 +86,13 @@ def parse_args():
     p.add_argument("--particle_path", default=PARTICLE_PATH)
     p.add_argument("--params_json", default=None,
                    help="HOD parameters for --direct, as JSON.")
+    p.add_argument("--ab_method", default="mass",
+                   choices=["mass", "direct", "variant"],
+                   help="Assembly-bias scheme for every HaloOccupation built "
+                        "here (--jax, --direct, --wgg).")
+    p.add_argument("--ab_rank", action="store_true",
+                   help="Rank the AB column within 0.1 dex mass bins before "
+                        "the scheme sees it (Hadzhiyska+2023 definition).")
     p.add_argument("--ab_column", default=None,
                    help="Map this column as fE (needed when the cache carries "
                         "an fI tabulation dimension).")
@@ -207,7 +214,8 @@ def run_jax_check(args, halo, cache):
         case = case.replace("+wgg", "")
         conformity = case == "CONF"
         halo.set_halo_model("ELG_mHMQ", conformity=conformity,
-                            elg_satellite=True)
+                            elg_satellite=True, ab_method=args.ab_method,
+                            ab_rank=args.ab_rank)
         tab = TabulatedDeltaSigma(cache, halo)
         occ_rescale = Occupation(
             "ELG_mHMQ", halo.logM_bins, halo.mass_function,
@@ -487,9 +495,11 @@ def run_direct_check(args):
         assembly_bias=bool(args.ab_column), apply_rsd=False, do_test=False,
         population_backend="numba",
     )
-    halo.set_halo_model("ELG_mHMQ", elg_satellite=True)
+    halo.set_halo_model("ELG_mHMQ", elg_satellite=True,
+                        ab_method=args.ab_method, ab_rank=args.ab_rank)
     print(f"  assembly_bias={halo.assembly_bias}"
-          + (f", ab_method={halo.HOD.ab_method!r}, column={args.ab_column!r}"
+          + (f", ab_method={halo.HOD.ab_method!r}, ab_rank={halo.HOD.ab_rank}"
+             f", column={args.ab_column!r}"
              if halo.assembly_bias else ""))
     if RHO_M_cache and abs(halo.RHO_M / RHO_M_cache - 1) > 1e-3:
         raise SystemExit(f"RHO_M mismatch: halo {halo.RHO_M:.6e} vs cache "
@@ -642,7 +652,8 @@ def main():
         particle_fraction=args.particle_fraction,
         population_backend="numba", mass_function="Despali16",
     )
-    halo.set_halo_model("ELG_mHMQ")
+    halo.set_halo_model("ELG_mHMQ", ab_method=args.ab_method,
+                        ab_rank=args.ab_rank)
 
     if args.wgg:
         cases = dict(CASES)

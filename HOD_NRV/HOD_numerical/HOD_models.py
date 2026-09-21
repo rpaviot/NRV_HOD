@@ -132,16 +132,19 @@ def assembly_bias_direct_sat(Nsat, AB_value):
 
 
 def assembly_bias_variant_cen(Ncen, A_cent, fI, B_cent, fE):
-    """N_hat_cen = [1 + (A_cent·fI + B_cent·fE) · (1 − N_cen)] · N_cen  (paper Eq. 12)
+    """N_hat_cen = [1 + (A_cent·fI + B_cent·fE) · (1 − N_cen)] · N_cen
+    (Hadzhiyska+2023 Eq. 12)
 
-    fI, fE are continuous values in [-1, 1] (log+percentile normalization).
-    Physical constraint: |A_cent| + |B_cent| ≤ 1.
+    fI, fE in [-1, 1]; the paper defines them as the RANK within 0.1 dex mass
+    bins (``Occupation(ab_rank=True)``), on [-0.5, 0.5] -- its coefficients
+    are twice ours. Physical constraint: |A_cent| + |B_cent| ≤ 1.
     """
+    Ncen = jnp.minimum(Ncen, 1.0)   # a Bernoulli probability; keeps N_hat in [0, 1] for |A|+|B| <= 1
     return Ncen * (1.0 + _ab_combine(A_cent, fI, B_cent, fE) * (1.0 - Ncen))
 
 
 def assembly_bias_variant_sat(Nsat, A_sat, fI, B_sat, fE):
-    """N_hat_sat = [1 + (A_sat·fI + B_sat·fE)] · N_sat  (paper Eq. 13)"""
+    """N_hat_sat = [1 + (A_sat·fI + B_sat·fE)] · N_sat  (Hadzhiyska+2023 Eq. 13)"""
     return Nsat * (1.0 + _ab_combine(A_sat, fI, B_sat, fE))
 
 
@@ -153,6 +156,57 @@ def _ab_combine(A, fI, B, fE):
 def assembly_bias_mass(logM, A, B, fI, fE):
     """Shift mass threshold by A*fI + B*fE."""
     return logM + _ab_combine(A, fI, B, fE)
+
+
+def rank_within_mass_bins(prop, logM, dlogM=0.1, min_count=1000):
+    """Rank ``prop`` among the halos of its mass bin, mapped to [-1, 1].
+
+    Hadzhiyska+2023 (arXiv:2210.10072, Sect. 3.1) and AbacusHOD (Yuan+2022
+    Eqs. 10-11) both define the secondary property entering the occupation as
+    the RANK within narrow (0.1 dex) mass bins, uniform by construction, with
+    the median at 0 -- not the property's value. The Flamingo ELG occupation
+    responds linearly to the rank and saturates in the value of fs_norm_R1
+    (2026-09-21), so the value-normalised column must not be fed to Eq. 12-13
+    directly. Ranks are (i + 0.5) / n over the n halos of the bin, so the
+    lowest halo gets -1 + 1/n and the highest 1 - 1/n; the paper's [-0.5, 0.5]
+    convention is this divided by 2 (coefficients twice ours).
+
+    Bins with fewer than ``min_count`` halos are merged with their lower
+    neighbour (from the top of the mass range down) before ranking. In a
+    sparse bin the value -> rank map is noisy, so two halos of the same
+    property value in adjacent bins get visibly different ranks; the jit
+    twins evaluate the occupation per (logM, value) cell and the satellite
+    pair terms weight the massive end, where a laptop-size subsample has a
+    few halos per 0.1 dex -- unmerged, that showed as a 6e-3 wgg parity
+    error against 2e-4 for the value-based form. The paper leaves its top
+    400 halos unmodified for the same reason.
+    """
+    prop = np.asarray(prop, dtype=np.float64)
+    logM = np.asarray(logM, dtype=np.float64)
+    ibin = np.floor((logM - logM.min()) / dlogM).astype(np.int64)
+    if min_count and min_count > 1:
+        counts = np.bincount(ibin)
+        remap = np.arange(len(counts))
+        # walk down from the top: a bin below min_count joins the one below it
+        for b in range(len(counts) - 1, 0, -1):
+            if counts[b] < min_count:
+                counts[b - 1] += counts[b]
+                counts[b] = 0
+                remap[remap == b] = b - 1
+        # the bottom bin can only join upward
+        if counts[0] < min_count and len(counts) > 1:
+            nxt = np.nonzero(counts[1:])[0]
+            if len(nxt):
+                remap[remap == 0] = nxt[0] + 1
+        ibin = remap[ibin]
+    order = np.lexsort((prop, ibin))          # by bin, then by prop
+    ib_sorted = ibin[order]
+    starts = np.searchsorted(ib_sorted, np.arange(ibin.max() + 2))
+    counts = np.diff(starts)
+    pos = np.arange(len(prop)) - np.repeat(starts[:-1], counts)
+    f = np.empty(len(prop))
+    f[order] = 2.0 * (pos + 0.5) / np.repeat(counts, counts) - 1.0
+    return f
 
 
 def compute_ngal_with_fiducial_Ac(hod_model, params, Ac_fiducial=1.0):
@@ -235,7 +289,12 @@ class Occupation:
 
     def __init__(self, hod_type, logM_bins, mass_function, assembly_bias=False,
                  conformity=False, elg_satellite=False, fI=None, fE=None,
-                 ab_method="mass", logM_halos=None):
+                 ab_method="mass", logM_halos=None, ab_rank=False,
+                 ab_rank_dlogM=0.1, ab_rank_min_count=1000):
+        """``ab_rank=True`` replaces fI/fE by their rank within ``ab_rank_dlogM``
+        mass bins (uniform in [-1, 1], see :func:`rank_within_mass_bins`),
+        which is what 'variant' (Hadzhiyska+2023 Eq. 12-13) is defined on.
+        The raw arrays stay on the HaloOccupation for the tabulation bins."""
 
         if hod_type not in self.central_funcs:
             raise AttributeError(f"Unknown HOD type: {hod_type}")
@@ -282,6 +341,15 @@ class Occupation:
         if assembly_bias and logM_halos is None:
             raise ValueError("assembly_bias=True requires logM_halos (per-halo logM array).")
         self.logM_halos = logM_halos
+        self.ab_rank = bool(ab_rank) and assembly_bias
+        self.ab_rank_dlogM = ab_rank_dlogM
+        if self.ab_rank:
+            if self.fI is not None:
+                self.fI = jnp.asarray(rank_within_mass_bins(
+                    self.fI, logM_halos, ab_rank_dlogM, ab_rank_min_count))
+            if self.fE is not None:
+                self.fE = jnp.asarray(rank_within_mass_bins(
+                    self.fE, logM_halos, ab_rank_dlogM, ab_rank_min_count))
 
     def set_params(self, dict_params):
         required_keys = set(self.central_params + self._sat_param_names)
