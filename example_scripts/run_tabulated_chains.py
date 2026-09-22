@@ -61,6 +61,7 @@ RP_MIN_VALUES     = [0.2, 0.5, 1.0, 2.0]
 N_LIVE            = 1_000
 N_EFF             = 30_000
 N_PROFILE_SAMPLES = 2_000
+N_DERIVED_SAMPLES = 400
 
 M1_FIXED      = 13.0
 MMAX_FIXED    = 15.0
@@ -329,6 +330,45 @@ def compute_hod_profiles_from_chain(points, weights, fitter, occupation, halo,
     return logM, ncen_med, ncen_sig, nsat_med, nsat_sig
 
 
+def compute_derived_from_chain(points, weights, fitter, occupation, halo,
+                               n_samples=N_DERIVED_SAMPLES):
+    """Posterior distribution of Meff / fsat / ngal.
+
+    The MAP values printed alongside carry no error, which makes them hard to
+    read against the measured truth (is fsat 0.39 vs 0.283 a tension or a wide
+    posterior?). Here ``compute_meff_fsat`` -- the *same* per-halo, AB-on,
+    post-rescale summation used for the point estimate, not a cheaper
+    approximation -- is evaluated on weighted posterior draws.
+
+    Draws are already weighted, so plain percentiles over them are the
+    posterior quantiles. Each draw pays one (Ac, As) -> target_ngal rescale
+    plus one occupation pass over every halo, so the cost is linear in
+    ``n_samples`` and dominates a ``--postprocess`` run.
+    """
+    w = np.asarray(weights, dtype=float)
+    w /= w.sum()
+    rng = np.random.default_rng(42)
+    samples = points[rng.choice(len(w), size=n_samples, replace=True, p=w)]
+
+    Meff = np.empty(n_samples)
+    fsat = np.empty(n_samples)
+    ngal = np.empty(n_samples)
+    for i, theta in enumerate(samples):
+        theta_dict = dict(zip(fitter.param_names, theta))
+        theta_dict["M1"] = fitter.M1_fixed
+        Meff[i], fsat[i], ngal[i] = compute_meff_fsat(occupation, theta_dict,
+                                                      fitter, halo)
+
+    out = {}
+    for name, arr in (("Meff", Meff), ("log10Meff", np.log10(Meff)),
+                      ("fsat", fsat), ("ngal", ngal)):
+        q16, q50, q84 = np.percentile(arr, [16, 50, 84])
+        out[f"{name}_q16"] = q16
+        out[f"{name}_q50"] = q50
+        out[f"{name}_q84"] = q84
+    return out
+
+
 def plot_hod_profiles(case_name, logM, profiles_by_rp_min, output_dir):
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), sharex=True)
     ax_cen, ax_sat = axes
@@ -566,6 +606,19 @@ def run_case(case_name, fit_case, halo, tab, args):
         print(f"  ngal (AB per-halo sum) = {ngal_ab:.4e}  "
               f"(target {TARGET_NGAL:.3e}, drift {ngal_drift:+.2f}%)")
 
+        derived = {}
+        if args.n_derived_samples > 0:
+            derived = compute_derived_from_chain(
+                points, weights, fitter, occupation_full, halo,
+                n_samples=args.n_derived_samples)
+            print(f"  posterior ({args.n_derived_samples} draws): "
+                  f"log10(Meff) = {derived['log10Meff_q50']:.3f} "
+                  f"(+{derived['log10Meff_q84'] - derived['log10Meff_q50']:.3f}"
+                  f"/-{derived['log10Meff_q50'] - derived['log10Meff_q16']:.3f})"
+                  f"   fsat = {derived['fsat_q50']:.3f} "
+                  f"(+{derived['fsat_q84'] - derived['fsat_q50']:.3f}"
+                  f"/-{derived['fsat_q50'] - derived['fsat_q16']:.3f})")
+
         logM_bins, ncen_med, ncen_sig, nsat_med, nsat_sig = \
             compute_hod_profiles_from_chain(points, weights, fitter,
                                             occupation_full, halo)
@@ -576,6 +629,7 @@ def run_case(case_name, fit_case, halo, tab, args):
             'Meff': Meff, 'fsat': fsat, 'ngal': ngal_ab,
             'ncen_med': ncen_med, 'ncen_sig': ncen_sig,
             'nsat_med': nsat_med, 'nsat_sig': nsat_sig,
+            **derived,
         }
 
         label = (f"$r_{{\\rm min}}={rp_min}$ Mpc/$h$   "
@@ -682,6 +736,11 @@ def parse_args():
                    help="With --ab_method variant: also sample a logM slope "
                         "of B_cent and B_sat (B + slope*(logM - 12.5), "
                         f"priors {VARIANT_SLOPE_RANGE} per dex).")
+    p.add_argument("--n_derived_samples", type=int, default=N_DERIVED_SAMPLES,
+                   metavar="N",
+                   help="posterior draws for the Meff/fsat/ngal error bars "
+                        "(0 disables). Each draw is a full per-halo "
+                        "occupation pass, so this dominates --postprocess.")
     p.add_argument("--per_bin", action="store_true",
                    help="Print per-bin residuals and chi2 contributions for "
                         "DeltaSigma and wgg (diagnostic; pairs with "
@@ -864,6 +923,11 @@ def main():
             all_bestfits_arrays[f"{prefix}_ncen_sig"] = vals['ncen_sig']
             all_bestfits_arrays[f"{prefix}_nsat_med"] = vals['nsat_med']
             all_bestfits_arrays[f"{prefix}_nsat_sig"] = vals['nsat_sig']
+            for k in ('Meff', 'log10Meff', 'fsat', 'ngal'):
+                for q in ('q16', 'q50', 'q84'):
+                    if f"{k}_{q}" in vals:
+                        all_bestfits_arrays[f"{prefix}_{k}_{q}"] = \
+                            np.array(vals[f"{k}_{q}"])
 
     if all_bestfits_arrays:
         tag = names[0] if len(names) == 1 else "all"
