@@ -272,6 +272,14 @@ def parse_args():
     p.add_argument("--n_prop_bins", type=int, default=5,
                    help="Quantiles of each --shuffle_within column, taken "
                         "WITHIN each mass bin.")
+    p.add_argument("--split_data", nargs=2, default=None,
+                   metavar=("CEN_NPZ", "SAT_NPZ"),
+                   help="With --truth_ds: data vectors measured on the "
+                        "centrals and on the satellites alone (this script "
+                        "with --gal_type 0 / 1 and the tabulation rp grid). "
+                        "Each is compared with the matching term of the "
+                        "truth prediction, so a small-scale deficit can be "
+                        "pinned on the central or the satellite term.")
     p.add_argument("--truth_profile", type=float, nargs=3,
                    metavar=("F_EXP", "TAU", "LAMBDA_NFW"),
                    default=(0.0, 5.0, 1.0),
@@ -491,6 +499,45 @@ def _link_galaxies_to_hosts(args, halo_pos, gal_pos):
     return idx, dist
 
 
+def _compare_split(paths, rp, ds_obs, terms, fsat):
+    """Data vs truth prediction, central and satellite terms separately.
+
+    The model's central term is each host's own tabulated profile about its
+    centre of potential; its satellite term is the host's Sigma convolved with
+    the satellite offset profile, with no mass at the satellite itself. So a
+    deficit in the central column is a halo-profile / centring problem and a
+    deficit in the satellite column is the missing subhalo.
+    """
+    data = {}
+    for kind, path in zip(("cen", "sat"), paths):
+        d = np.load(path)
+        rpd, dsd = np.asarray(d["rp_centers"]), np.asarray(d["delta_sigma"])
+        j = np.array([np.argmin(np.abs(np.log(rpd / r))) for r in rp])
+        if np.max(np.abs(np.log(rpd[j] / rp))) > 1e-4:
+            raise SystemExit(f"{path}: rp grid does not match the data "
+                             f"vector's -- measure it with --rp_min 0.1 "
+                             f"--rp_max 50 --n_rp 26")
+        data[kind] = dsd[j]
+    recomb = (1.0 - fsat) * data["cen"] + fsat * data["sat"]
+    print(f"\n  --- central / satellite split (fsat = {fsat:.4f}) ---")
+    print(f"  {'rp':>8} {'data_cen':>10} {'model_cen':>10} {'ratio':>7} "
+          f"{'data_sat':>10} {'model_sat':>10} {'ratio':>7} "
+          f"{'missing':>8} {'sat share':>9} {'recomb/obs':>10}")
+    for k in range(len(rp)):
+        miss_c = (1.0 - fsat) * (data["cen"][k] - terms["cen"][k])
+        miss_s = fsat * (data["sat"][k] - terms["sat"][k])
+        miss = miss_c + miss_s
+        share = miss_s / miss if miss != 0 else np.nan
+        print(f"  {rp[k]:8.3f} {data['cen'][k]:10.4f} {terms['cen'][k]:10.4f} "
+              f"{data['cen'][k] / terms['cen'][k]:7.3f} "
+              f"{data['sat'][k]:10.4f} {terms['sat'][k]:10.4f} "
+              f"{data['sat'][k] / terms['sat'][k]:7.3f} "
+              f"{miss:8.4f} {share:9.2f} {recomb[k] / ds_obs[k]:10.4f}")
+    print("  missing = data - model, fsat-weighted; 'sat share' is the part of "
+          "it the satellite term carries. recomb/obs checks that the two "
+          "measured halves add back up to the full data vector.")
+
+
 def predict_truth_deltasigma(args):
     """DeltaSigma at the occupation the box actually realised.
 
@@ -612,11 +659,14 @@ def predict_truth_deltasigma(args):
     print(f"data: {fitter.n_bins} bins in [{fitter.rp_obs[0]:.3f}, "
           f"{fitter.rp_obs[-1]:.2f}] Mpc/h from {args.data_path}")
 
-    def _predict(nc, ns, label):
+    def _predict(nc, ns, label, terms=None):
         rp_full, ds_full, info = tab.predict_occupation(
             nc, ns, f_exp=f_exp, tau=tau, lambda_NFW=lambda_NFW)
         sel = np.isin(np.round(rp_full, 8), np.round(fitter.rp_obs, 8))
         ds = np.asarray(ds_full)[sel]
+        if terms is not None:
+            terms["cen"] = np.asarray(info["ds_cen"])[sel]
+            terms["sat"] = np.asarray(info["ds_sat"])[sel]
         if len(ds) != fitter.n_bins:
             raise SystemExit(f"bin mismatch: model {len(ds)} vs data "
                              f"{fitter.n_bins}")
@@ -627,9 +677,13 @@ def predict_truth_deltasigma(args):
               f"over {fitter.n_bins} bins (no free parameters)")
         return ds, chi2
 
-    ds_truth, chi2_truth = _predict(N_cen, N_sat, "truth")
+    truth_terms = {}
+    ds_truth, chi2_truth = _predict(N_cen, N_sat, "truth", truth_terms)
     _print_per_bin("truth occupation", fitter.rp_obs, fitter.ds_obs,
                    ds_truth, fitter.cov_inv)
+    if args.split_data:
+        _compare_split(args.split_data, fitter.rp_obs, fitter.ds_obs,
+                       truth_terms, N_sat.sum() / (N_cen.sum() + N_sat.sum()))
 
     # ---- mass-only control -------------------------------------------------
     ds_shuf = None
@@ -739,6 +793,7 @@ def predict_truth_deltasigma(args):
     out = args.output
     np.savez(out, rp=fitter.rp_obs, ds_obs=fitter.ds_obs, ds_truth=ds_truth,
              ds_shuffled=ds_shuf if ds_shuf is not None else np.zeros(0),
+             ds_truth_cen=truth_terms["cen"], ds_truth_sat=truth_terms["sat"],
              N_cen=N_cen.astype(np.int32), N_sat=N_sat.astype(np.int32),
              chi2_truth=chi2_truth, logM=logM_h.astype(np.float32),
              shuffle_dlogM=args.shuffle_dlogM,
