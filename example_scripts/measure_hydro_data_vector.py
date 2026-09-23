@@ -475,27 +475,85 @@ def measure_hod(args):
 # ---------------------------------------------------------------------------
 
 
-def _link_galaxies_to_hosts(args, halo_pos, gal_pos):
-    """Nearest host halo for every NISP galaxy, in the periodic box.
+def _read_galaxies(args):
+    """NISP galaxies, plus the true-host geometry when the catalogue has it.
+
+    The catalogue rebuilt by `precompute_subhalo_catalogue.py --nisp` carries
+    r_host (distance to the SOAP host's CoP) and the host's M200m; the older
+    NISP_catalogue_flamingo.parquet does not, and then only the
+    nearest-centre link is possible.
+    """
+    import pyarrow.parquet as _pq
+    have = set(_pq.read_schema(args.nisp_path).names)
+    extra = [c for c in ("r_host", "mass_200m") if c in have]
+    return pd.read_parquet(args.nisp_path,
+                           columns=["x", "y", "z", "type"] + extra)
+
+
+def _link_galaxies_to_hosts(args, halo_pos, gal_pos, halo_logM=None,
+                            gal=None):
+    """Host halo row for every NISP galaxy, in the periodic box.
 
     The NISP catalogue carries a host M200m but no host index, and M200m is
     quantised in units of the particle mass (9.18M halos share only 5,559
-    distinct values), so the host cannot be recovered by matching on mass.
-    Position works instead: a central sits on its halo centre to ~1 kpc/h.
+    distinct values), so the host cannot be recovered by matching on mass
+    alone. The nearest halo centre is right for centrals (they sit on their
+    CoP to ~1 kpc/h) but WRONG for 11.6% of satellites: those beyond ~Rvir
+    land on a neighbour ~1.8 dex lighter than their host, which drags the
+    satellites' host mass (and their large-scale bias) down.
+
+    When `gal` carries r_host and mass_200m (the rebuilt catalogue), the host
+    is instead the halo at exactly distance r_host with exactly that mass --
+    the SOAP host, recovered without the SOAP index.
     """
-    if args.link_cache and os.path.exists(args.link_cache):
-        z = np.load(args.link_cache)
-        if len(z["idx"]) == len(gal_pos):
-            print(f"galaxy->host link from cache: {args.link_cache}")
+    exact = (gal is not None and halo_logM is not None
+             and "r_host" in gal and "mass_200m" in gal)
+    cache = args.link_cache
+    if cache and exact:
+        cache = os.path.splitext(cache)[0] + "_soap.npz"
+    if cache and os.path.exists(cache):
+        z = np.load(cache)
+        if len(z["idx"]) == len(gal_pos) and "n_halo" in z.files \
+                and int(z["n_halo"]) == len(halo_pos):
+            print(f"galaxy->host link from cache: {cache}")
             return z["idx"], z["dist"]
-        print("  (cached link has the wrong length -- rebuilding)")
+        print("  (cached link does not match these catalogues -- rebuilding)")
     print("linking galaxies to host halos (periodic KD-tree) ...")
     tree = cKDTree(halo_pos, boxsize=LBOX)
     dist, idx = tree.query(gal_pos, k=1, workers=-1)
-    if args.link_cache:
-        np.savez(args.link_cache, idx=idx.astype(np.int64),
-                 dist=dist.astype(np.float32))
-        print(f"  cached -> {args.link_cache}")
+    if exact:
+        r_true = gal["r_host"].values.astype(np.float64)
+        lm_true = np.log10(gal["mass_200m"].values.astype(np.float64))
+        tol_r, tol_m = 2e-3, 1e-4       # Mpc/h (float32 positions), dex
+        ok = (np.abs(dist - r_true) < tol_r) & \
+             (np.abs(halo_logM[idx] - lm_true) < tol_m)
+        bad = np.nonzero(~ok)[0]
+        print(f"  nearest centre is the SOAP host for {100 * ok.mean():.2f}% "
+              f"of galaxies; searching r_host shells for the other "
+              f"{len(bad):,}")
+        cands = tree.query_ball_point(gal_pos[bad], r_true[bad] + tol_r,
+                                      workers=-1)
+        n_miss = 0
+        for k, (g_i, cand) in enumerate(zip(bad, cands)):
+            cand = np.asarray(cand, dtype=np.int64)
+            if len(cand):
+                dv = halo_pos[cand] - gal_pos[g_i]
+                dv -= LBOX * np.round(dv / LBOX)
+                dc = np.linalg.norm(dv, axis=1)
+                good = (np.abs(dc - r_true[g_i]) < tol_r) & \
+                       (np.abs(halo_logM[cand] - lm_true[g_i]) < tol_m)
+                if good.any():
+                    j = np.argmin(np.where(good, np.abs(dc - r_true[g_i]),
+                                           np.inf))
+                    idx[g_i], dist[g_i] = cand[j], dc[j]
+                    continue
+            n_miss += 1
+        print(f"  SOAP host recovered for all but {n_miss:,} galaxies "
+              f"(those keep the nearest centre)")
+    if cache:
+        np.savez(cache, idx=idx.astype(np.int64),
+                 dist=dist.astype(np.float32), n_halo=len(halo_pos))
+        print(f"  cached -> {cache}")
     return idx, dist
 
 
@@ -584,14 +642,15 @@ def predict_truth_deltasigma(args):
                 f"{args.hydro_host_path} has {len(halo_df):,} -- the "
                 f"candidate columns cannot be matched to the halos.")
         print(f"candidate columns from {args.shuffle_within_path}")
-    gal = pd.read_parquet(args.nisp_path, columns=["x", "y", "z", "type"])
+    gal = _read_galaxies(args)
     print(f"hosts: {len(halo_df):,}   galaxies: {len(gal):,}")
 
     hp = np.ascontiguousarray(halo_df[["x", "y", "z"]].values,
                               dtype=np.float64) % LBOX
     gp = np.ascontiguousarray(gal[["x", "y", "z"]].values,
                               dtype=np.float64) % LBOX
-    idx, dist = _link_galaxies_to_hosts(args, hp, gp)
+    idx, dist = _link_galaxies_to_hosts(
+        args, hp, gp, np.log10(halo_df["mass"].values.astype(np.float64)), gal)
     del hp, gp
 
     is_sat = gal["type"].values == 1
@@ -823,12 +882,13 @@ def measure_hod_environment(args):
     halo = pd.read_parquet(
         args.hydro_host_path,
         columns=["x", "y", "z", "mass", "rvir", args.env_column])
-    gal = pd.read_parquet(args.nisp_path, columns=["x", "y", "z", "type"])
+    gal = _read_galaxies(args)
     print(f"hosts: {len(halo):,}   galaxies: {len(gal):,}")
 
     hp = np.ascontiguousarray(halo[["x", "y", "z"]].values, dtype=np.float64) % LBOX
     gp = np.ascontiguousarray(gal[["x", "y", "z"]].values, dtype=np.float64) % LBOX
-    idx, dist = _link_galaxies_to_hosts(args, hp, gp)
+    idx, dist = _link_galaxies_to_hosts(
+        args, hp, gp, np.log10(halo["mass"].values.astype(np.float64)), gal)
     del hp, gp
 
     is_sat = gal["type"].values == 1
