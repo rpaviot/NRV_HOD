@@ -17,7 +17,6 @@ utils_functions.py    JAX samplers, 200-pt Gauss-Legendre quadrature
 Files held locally but not tracked (in `.gitignore`):
 
 ```
-subhalo_catalogue.py  Subhalo / NISP catalogue builder (used by internal/precompute_subhalo_catalogue.py)
 emulator_utils.py     Deprecated NN-emulator LHS grid tools
 emulator_nn_flax.py   Deprecated NN emulator
 ```

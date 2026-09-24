@@ -119,7 +119,7 @@ def run_nisp(args):
     """Rebuild the NISP ELG catalogue from SOAP and measure its occupation."""
     import numpy as np
     import pandas as pd
-    from HOD_NRV.utilsf.subhalo_catalogue import build_nisp_catalogue
+    from internal.subhalo_catalogue import build_nisp_catalogue
 
     print(f"Building NISP catalogue from {args.soap_path}")
     cat = build_nisp_catalogue(
@@ -226,7 +226,7 @@ def main():
         run_nisp(args)
         return
 
-    from HOD_NRV.utilsf.subhalo_catalogue import (
+    from internal.subhalo_catalogue import (
         build_halo_and_subhalo_catalogues,
         save_catalogues,
     )
