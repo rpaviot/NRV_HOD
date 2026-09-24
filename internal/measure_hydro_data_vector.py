@@ -300,6 +300,17 @@ def parse_args():
                         "kept). real/rotated = matter tied to the satellite's "
                         "actual position, which no HOD can carry.")
     p.add_argument("--rotate_seeds", type=int, nargs="+", default=[1, 2])
+    p.add_argument("--xi_hh", action="store_true",
+                   help="3D xi_hh and xi_hm of mass-threshold halo samples for "
+                        "each --xi_catalogues entry, against Dark Emulator "
+                        "(get_xiauto/xicross_massthreshold). Tests the halo "
+                        "convention (FOF vs distinct) at small r.")
+    p.add_argument("--xi_catalogues", nargs="+", default=[],
+                   metavar="LABEL=PARQUET")
+    p.add_argument("--xi_log_mthr", type=float, nargs="+",
+                   default=[12.0, 12.5, 13.0, 13.5],
+                   help="log10 M200m thresholds [Msun/h] (Dark Emulator is "
+                        "trained above ~1e12).")
     p.add_argument("--rotate_split_rvir", action="store_true",
                    help="With --rotate_satellites: repeat real vs rotated for "
                         "satellites inside (3D r < host Rvir) and outside.")
@@ -2295,6 +2306,59 @@ def measure_rotated_satellites(args):
     print(f"\nSaved -> {args.output}")
 
 
+def measure_xi_hh_vs_emulator(args):
+    """xi_hh(r), xi_hm(r) of M200m-threshold halo samples vs Dark Emulator.
+
+    Dark Emulator's halos are distinct Rockstar halos; FLAMINGO's SOAP hosts
+    are HBT+ FOF centrals, which absorb every object in the FOF group however
+    far beyond R200m. If that convention is what starves the simulation of
+    small-scale clustering, the distinct-halo catalogue should close the gap
+    at r ~ 1-2 R200m while agreeing on large scales.
+    """
+    from dark_emulator import darkemu
+    from HOD_NRV.HOD_numerical.twopoint_calculator.standard_two_point_calculator import compute_corr
+
+    c = COSMO_PARAMS; h = c["h"]
+    emu = darkemu.base_class()
+    emu.set_cosmology(np.array([
+        c["Omb"] * h ** 2, c["Omc"] * h ** 2,
+        1.0 - (c["Omc"] + c["Omb"] + c.get("Omnu", 0.0)),
+        np.log(1e10 * c["A_s"]), c["n_s"], -1.0]))
+    r_edges = np.geomspace(0.1, 50.0, 31)
+    r = np.sqrt(r_edges[1:] * r_edges[:-1])
+
+    pos_p, w_p = _load_particles(args)
+    out = {"r": r, "r_edges": r_edges, "log_mthr": np.asarray(args.xi_log_mthr)}
+    for lm in args.xi_log_mthr:
+        Mthr = 10.0 ** lm
+        xi_e = np.asarray(emu.get_xiauto_massthreshold(r, Mthr, ZEFF))
+        xim_e = np.asarray(emu.get_xicross_massthreshold(r, Mthr, ZEFF))
+        out[f"emu_hh_{lm}"], out[f"emu_hm_{lm}"] = xi_e, xim_e
+        res = {}
+        for entry in args.xi_catalogues:
+            label, path = entry.split("=", 1)
+            df = pd.read_parquet(path, columns=["x", "y", "z", "mass"])
+            pos = np.ascontiguousarray(
+                df.loc[df["mass"] >= Mthr, ["x", "y", "z"]].values,
+                dtype=np.float64) % LBOX
+            _, xi = compute_corr("s", pos, r_edges, boxsize=LBOX)
+            _, xim = compute_corr("s", pos, r_edges, catalog2=pos_p,
+                                  boxsize=LBOX, weights2=w_p)
+            res[label] = (len(pos), np.asarray(xi), np.asarray(xim))
+            out[f"{label}_hh_{lm}"], out[f"{label}_hm_{lm}"] = res[label][1:]
+            out[f"{label}_n_{lm}"] = len(pos)
+        labels = list(res)
+        print(f"\n=== M200m >= 10^{lm} Msun/h: " + ", ".join(
+            f"{k} {v[0]:,} halos" for k, v in res.items()) + " ===")
+        print(f"{'r':>7}" + "".join(f" {k + ' hh/emu':>16}" for k in labels)
+              + "".join(f" {k + ' hm/emu':>16}" for k in labels))
+        for j in range(len(r)):
+            print(f"{r[j]:7.3f}" + "".join(f" {res[k][1][j] / xi_e[j]:16.3f}" for k in labels)
+                  + "".join(f" {res[k][2][j] / xim_e[j]:16.3f}" for k in labels))
+    np.savez(args.output, **out)
+    print(f"\nSaved -> {args.output}")
+
+
 def main():
     args = parse_args()
 
@@ -2320,6 +2384,13 @@ def main():
             args.output = os.path.join(os.path.dirname(REF_PATH),
                                        "hydro_measured_satellite_profile.npz")
         measure_satellite_profile(args)
+        return
+
+    if args.xi_hh:
+        if args.output == default_out:
+            args.output = os.path.join(os.path.dirname(REF_PATH),
+                                       "hydro_xi_hh_vs_emulator.npz")
+        measure_xi_hh_vs_emulator(args)
         return
 
     if args.rotate_satellites:
