@@ -300,6 +300,9 @@ def parse_args():
                         "kept). real/rotated = matter tied to the satellite's "
                         "actual position, which no HOD can carry.")
     p.add_argument("--rotate_seeds", type=int, nargs="+", default=[1, 2])
+    p.add_argument("--rotate_split_rvir", action="store_true",
+                   help="With --rotate_satellites: repeat real vs rotated for "
+                        "satellites inside (3D r < host Rvir) and outside.")
     p.add_argument("--profile", action="store_true",
                    help="Measure the SATELLITE RADIAL PROFILE of the NISP "
                         "sample around its true hosts, and fit the "
@@ -2190,6 +2193,32 @@ def _load_particles(args):
     return pos_p, w_p
 
 
+def _real_vs_rotated(_ds, pos_s, host, rho, a, b, seeds, rp_bins):
+    """Satellite DeltaSigma at the real positions and at random azimuths
+    about the LOS through each host (projected distance and LOS offset kept)."""
+    print("DeltaSigma, real satellite positions ...")
+    ds_real = _ds(pos_s)
+    ds_rot = []
+    for seed in seeds:
+        phi = np.random.default_rng(seed).uniform(0.0, 2.0 * np.pi, len(pos_s))
+        rot = pos_s.copy()
+        rot[:, a] = host[:, a] + rho * np.cos(phi)
+        rot[:, b] = host[:, b] + rho * np.sin(phi)
+        rot %= LBOX
+        print(f"DeltaSigma, rotated (seed {seed}) ...")
+        ds_rot.append(_ds(rot))
+    ds_rot = np.array(ds_rot)
+
+    rp = np.sqrt(rp_bins[1:] * rp_bins[:-1])
+    print(f"\n{'rp':>8} {'real':>10} " + " ".join(f"{'rot s' + str(s):>10}" for s in seeds)
+          + f" {'real/rot':>9} {'seed spread%':>12}")
+    for j in range(len(rp)):
+        m = ds_rot[:, j].mean()
+        print(f"{rp[j]:8.3f} {ds_real[j]:10.4f} " + " ".join(f"{v:10.4f}" for v in ds_rot[:, j])
+              + f" {ds_real[j] / m:9.3f} {100 * np.ptp(ds_rot[:, j]) / abs(m):12.2f}")
+    return ds_real, ds_rot
+
+
 def measure_rotated_satellites(args):
     """Satellite DeltaSigma at the real vs randomly rotated positions.
 
@@ -2217,7 +2246,8 @@ def measure_rotated_satellites(args):
     if "r_host" not in gal:
         raise SystemExit("--rotate_satellites needs the rebuilt NISP catalogue "
                          "(r_host, mass_200m) for the SOAP host link.")
-    halo_df = pd.read_parquet(args.hydro_host_path, columns=["x", "y", "z", "mass"])
+    halo_df = pd.read_parquet(args.hydro_host_path,
+                              columns=["x", "y", "z", "mass", "rvir"])
     hp = np.ascontiguousarray(halo_df[["x", "y", "z"]].values, dtype=np.float64) % LBOX
     gp = np.ascontiguousarray(gal[["x", "y", "z"]].values, dtype=np.float64) % LBOX
     idx, _ = _link_galaxies_to_hosts(
@@ -2231,8 +2261,10 @@ def measure_rotated_satellites(args):
     ax = "xyz".index(args.rsd_axis)
     a, b = [k for k in range(3) if k != ax]
     rho = np.hypot(d[:, a], d[:, b])
+    x3d = np.linalg.norm(d, axis=1) / (halo_df["rvir"].values[idx[sat]] / 1e3)
     print(f"satellites: {len(sat):,}; projected host offset median "
-          f"{np.median(rho):.3f} Mpc/h")
+          f"{np.median(rho):.3f} Mpc/h; {100 * np.mean(x3d >= 1):.1f}% beyond "
+          f"host Rvir (3D)")
 
     pos_p, w_p = _load_particles(args)
     bins_comp = np.geomspace(5e-3, 120, 201)   # as the data vector
@@ -2243,30 +2275,23 @@ def measure_rotated_satellites(args):
             weights_part=w_p, chi_max=args.chi_max, bins_comp=bins_comp)
         return np.asarray(ds)
 
-    print("DeltaSigma, real satellite positions ...")
-    ds_real = _ds(pos_s)
-    ds_rot = []
-    for seed in args.rotate_seeds:
-        phi = np.random.default_rng(seed).uniform(0.0, 2.0 * np.pi, len(sat))
-        rot = pos_s.copy()
-        rot[:, a] = host[:, a] + rho * np.cos(phi)
-        rot[:, b] = host[:, b] + rho * np.sin(phi)
-        rot %= LBOX
-        print(f"DeltaSigma, rotated (seed {seed}) ...")
-        ds_rot.append(_ds(rot))
-    ds_rot = np.array(ds_rot)
-
+    subsets = {"all": np.ones(len(sat), bool)}
+    if args.rotate_split_rvir:
+        subsets["inside"] = x3d < 1.0
+        subsets["outside"] = x3d >= 1.0
+    out = {}
+    for name, m in subsets.items():
+        print(f"\n##### subset {name}: {m.sum():,} satellites #####")
+        ds_real, ds_rot = _real_vs_rotated(
+            _ds, pos_s[m], host[m], rho[m], a, b, args.rotate_seeds, rp_bins)
+        out[f"ds_real_{name}"], out[f"ds_rotated_{name}"] = ds_real, ds_rot
+        out[f"n_sat_{name}"] = int(m.sum())
     rp = np.sqrt(rp_bins[1:] * rp_bins[:-1])
-    print(f"\n{'rp':>8} {'real':>10} " + " ".join(f"{'rot s' + str(s):>10}" for s in args.rotate_seeds)
-          + f" {'real/rot':>9} {'seed spread%':>12}")
-    for j in range(len(rp)):
-        m = ds_rot[:, j].mean()
-        print(f"{rp[j]:8.3f} {ds_real[j]:10.4f} " + " ".join(f"{v:10.4f}" for v in ds_rot[:, j])
-              + f" {ds_real[j] / m:9.3f} {100 * np.ptp(ds_rot[:, j]) / abs(m):12.2f}")
-    np.savez(args.output, rp_centers=rp, rp_bins=rp_bins, ds_real=ds_real,
-             ds_rotated=ds_rot, seeds=np.asarray(args.rotate_seeds),
+    np.savez(args.output, rp_centers=rp, rp_bins=rp_bins,
+             ds_real=out["ds_real_all"], ds_rotated=out["ds_rotated_all"],
+             seeds=np.asarray(args.rotate_seeds),
              particle_fraction=args.particle_fraction, chi_max=args.chi_max,
-             n_sat=len(sat))
+             n_sat=len(sat), **out)
     print(f"\nSaved -> {args.output}")
 
 
