@@ -1287,6 +1287,7 @@ class TabulatedDeltaSigma:
         tau: float = 6.0,
         lambda_NFW: float = 1.0,
         rp_bins: Optional[np.ndarray] = None,
+        sat_offsets: Optional[Dict[int, Tuple[np.ndarray, np.ndarray]]] = None,
     ) -> Tuple[np.ndarray, np.ndarray, Dict]:
         """
         Predict DeltaSigma from an EXPLICIT per-halo occupation.
@@ -1312,6 +1313,11 @@ class TabulatedDeltaSigma:
             Satellite radial profile parameters.
         rp_bins : np.ndarray, optional
             Projected bin edges; defaults to (and must match) cache.rp_bins.
+        sat_offsets : dict, optional
+            ``{logM bin m: (rho, w)}`` projected satellite offsets [Mpc/h] and
+            their weights, replacing the analytic (f_exp, tau, lambda_NFW)
+            family -- e.g. the measured offsets of the satellites whose counts
+            are in ``probS``. Every bin with satellites must have an entry.
 
         Returns
         -------
@@ -1346,7 +1352,11 @@ class TabulatedDeltaSigma:
 
         Sigma_sat = np.zeros_like(self.R_out)
         for m in np.nonzero(w_M > 0)[0]:
-            rho, w_rho = self._offset_nodes(m, f_exp, tau, lambda_NFW)
+            if sat_offsets is None:
+                rho, w_rho = self._offset_nodes(m, f_exp, tau, lambda_NFW)
+            else:
+                rho, w_rho = sat_offsets[m]
+                w_rho = np.asarray(w_rho, dtype=np.float64) / np.sum(w_rho)
             # dist(R_out, rho, phi): azimuthal + offset average of Sigma_M[m]
             d2 = (self.R_out[:, None, None] ** 2 + rho[None, :, None] ** 2
                   + 2.0 * self.R_out[:, None, None] * rho[None, :, None]

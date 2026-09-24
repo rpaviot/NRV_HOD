@@ -286,6 +286,12 @@ def parse_args():
                    help="Satellite profile for the --truth_ds prediction. "
                         "Irrelevant above rp ~ 2 (identical to 4 significant "
                         "figures), which is where the deficit lives.")
+    p.add_argument("--truth_offsets", action="store_true",
+                   help="With --truth_ds: replace the analytic satellite profile "
+                        "by the MEASURED projected offset of every NISP "
+                        "satellite from its linked host (perpendicular to "
+                        "--rsd_axis). Separates a wrong profile family from "
+                        "wrong offset physics (host-centred matter only).")
     p.add_argument("--profile", action="store_true",
                    help="Measure the SATELLITE RADIAL PROFILE of the NISP "
                         "sample around its true hosts, and fit the "
@@ -651,9 +657,19 @@ def predict_truth_deltasigma(args):
                               dtype=np.float64) % LBOX
     idx, dist = _link_galaxies_to_hosts(
         args, hp, gp, np.log10(halo_df["mass"].values.astype(np.float64)), gal)
-    del hp, gp
 
     is_sat = gal["type"].values == 1
+    if args.truth_offsets:
+        # projected satellite-host offsets, perpendicular to the line of sight
+        # the data vector is projected along
+        perp = [a for a in range(3) if a != "xyz".index(args.rsd_axis)]
+        sat_rows = np.nonzero(is_sat)[0]
+        dv = gp[sat_rows][:, perp] - hp[idx[sat_rows]][:, perp]
+        dv -= LBOX * np.round(dv / LBOX)
+        rho_sat = np.hypot(dv[:, 0], dv[:, 1])
+        host_sat = idx[sat_rows]
+        del dv
+    del hp, gp
     rvir = halo_df["rvir"].values / 1e3
     inside = dist < rvir[idx]
     print(f"link quality: centrals median {np.median(dist[~is_sat]):.4f} Mpc/h, "
@@ -703,7 +719,24 @@ def predict_truth_deltasigma(args):
           f"(float32 round-trip; a permutation would give O(1))")
     tab = TabulatedDeltaSigma(cache, halo)
     f_exp, tau, lambda_NFW = args.truth_profile
-    print(f"satellite profile: f_exp={f_exp} tau={tau} lambda_NFW={lambda_NFW}")
+    sat_off = None
+    if args.truth_offsets:
+        # one node per satellite, equal weight within its host's logM bin --
+        # exactly how that satellite's count enters N_sat
+        m_sat = (tab.bin_index // tab.n_f)[host_sat]
+        order = np.argsort(m_sat, kind="stable")
+        bins, starts = np.unique(m_sat[order], return_index=True)
+        sat_off = {int(b): (rho_sat[g], np.ones(len(g)))
+                   for b, g in zip(bins, np.split(order, starts[1:]))}
+        Rv_h = halo_df["rvir"].values[host_sat] / 1e3
+        print(f"satellite profile: MEASURED projected offsets of "
+              f"{len(rho_sat):,} satellites in {len(sat_off)} logM bins "
+              f"(median {np.median(rho_sat):.3f} Mpc/h; beyond 1/2/3 Rvir "
+              f"projected: " + "/".join(f"{100 * np.mean(rho_sat > t * Rv_h):.1f}"
+                                         for t in (1, 2, 3)) + "%)")
+    else:
+        print(f"satellite profile: f_exp={f_exp} tau={tau} "
+              f"lambda_NFW={lambda_NFW}")
 
     fitter = TabulatedFitter(
         tabulated_ds=tab,
@@ -720,7 +753,8 @@ def predict_truth_deltasigma(args):
 
     def _predict(nc, ns, label, terms=None):
         rp_full, ds_full, info = tab.predict_occupation(
-            nc, ns, f_exp=f_exp, tau=tau, lambda_NFW=lambda_NFW)
+            nc, ns, f_exp=f_exp, tau=tau, lambda_NFW=lambda_NFW,
+            sat_offsets=sat_off)
         sel = np.isin(np.round(rp_full, 8), np.round(fitter.rp_obs, 8))
         ds = np.asarray(ds_full)[sel]
         if terms is not None:
@@ -857,6 +891,7 @@ def predict_truth_deltasigma(args):
              chi2_truth=chi2_truth, logM=logM_h.astype(np.float32),
              shuffle_dlogM=args.shuffle_dlogM,
              profile=np.asarray(args.truth_profile),
+             truth_offsets=bool(args.truth_offsets),
              **{f"ds_cond_{c}": v for c, v in
                 (ladder.items() if args.n_shuffle > 0 else [])},
              **{f"ds_cond_real_{c}": v for c, v in
