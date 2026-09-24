@@ -28,8 +28,11 @@ import gc
 import os
 import numpy as np
 import pandas as pd
-import swiftsimio as sw
-import unyt as u
+try:                        # swiftsimio-based builders only (swiftenv);
+    import swiftsimio as sw  # build_distinct_halo_catalogue needs just h5py,
+    import unyt as u         # so it also runs in NRV_ENV, which has scipy
+except ImportError:
+    sw = u = None
 
 
 def get_vrms_halo(SOAP_catalogue):
