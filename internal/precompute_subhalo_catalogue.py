@@ -80,6 +80,11 @@ def parse_args():
                              "halo (Rockstar-like) convention, satellites beyond "
                              "their FOF host's R200m promoted with an aperture "
                              "M200m (see build_distinct_halo_catalogue).")
+    parser.add_argument("--distinct_nisp", type=str, default="",
+                        help="With --distinct: a rebuilt NISP catalogue "
+                             "(precompute --nisp) to re-host under the distinct "
+                             "convention; writes NISP_catalogue_distinct.parquet "
+                             "and prints its occupation next to the FOF one.")
     parser.add_argument("--log_mstar_min", type=float, default=10.1,
                         help="log10 stellar mass floor [Msun]. The catalogue "
                              "on disk used 10.1; the notebook used 10.0.")
@@ -118,6 +123,119 @@ def _occupation(mass_gal, is_sat_gal, mass_host, counts_per_host, bins):
         if Ni.size > 1 and Ni.mean() > 0:
             ratio[i] = np.sqrt(Ni.var(ddof=1)) / np.sqrt(Ni.mean())
     return ncen, nsat, ratio, n_cen, n_sat, n_host
+
+
+def _nisp_soap_rows(args):
+    """The rebuilt NISP catalogue plus each galaxy's OWN SOAP row.
+
+    The catalogue stores host_row, which is the galaxy's own row only for
+    centrals; a satellite's is recovered by matching its stellar centre of
+    mass (ExclusiveSphere/300kpc, what the builder stored as x, y, z) and
+    checked against its HostHaloIndex.
+    """
+    import h5py
+    import numpy as np
+    import pandas as pd
+    from scipy.spatial import cKDTree
+
+    gal = pd.read_parquet(args.distinct_nisp)
+    is_sat = gal["type"].values == 1
+    rows = gal["host_row"].values.astype(np.int64).copy()
+    with h5py.File(args.soap_path, "r") as f:
+        ms = f["ExclusiveSphere/300kpc/StellarMass"][:]           # 1e10 Msun
+        pool = np.nonzero(ms >= 10.0 ** (args.log_mstar_min - 10.0) * 0.999)[0]
+        del ms
+        com = f["ExclusiveSphere/300kpc/StellarCentreOfMass"][:][pool]  # cMpc
+        hidx = f["SOAP/HostHaloIndex"][:]
+    com = (args.h * com) % args.Lbox                               # Mpc/h
+    tree = cKDTree(com, boxsize=args.Lbox)
+    xyz = gal[["x", "y", "z"]].values[is_sat].astype(np.float64) % args.Lbox
+    dist, j = tree.query(xyz, k=1, workers=-1)
+    own = pool[j]
+    ok = (dist < 1e-4) & (hidx[own] == rows[is_sat])
+    print(f"  satellite -> own SOAP row: {100 * ok.mean():.3f}% matched "
+          f"(stellar CoM within 1e-4 Mpc/h AND same FOF host); "
+          f"max matched offset {dist[ok].max():.2e} Mpc/h")
+    if not ok.all():
+        raise SystemExit(f"{(~ok).sum():,} satellites unmatched")
+    rows[is_sat] = own
+    return gal, rows
+
+
+def run_distinct_nisp(args, gal, rows, halos, assign):
+    """NISP occupation re-hosted under the distinct-halo convention."""
+    import numpy as np
+    import h5py
+
+    fof_sat = gal["type"].values == 1
+    row, cen_d, case = assign["row"], assign["central"], assign["case"]
+    sat_d = ~cen_d
+    ok = row >= 0
+    m_d = np.full(len(gal), np.nan)
+    m_d[ok] = halos["mass"].values[row[ok]]
+    # a centre of a sub-threshold halo: its own M200m is below the threshold
+    # (or undefined); it cannot enter a HOD built on the listed halos
+    print(f"\n=== NISP galaxies re-hosted under the distinct convention ===")
+    print(f"  placed by: own candidate {np.sum(case == 0):,}, inside FOF host "
+          f"R200m {np.sum(case == 1):,}, containment {np.sum(case == 2):,}")
+    print(f"  {'FOF -> distinct':>16} {'central':>9} {'satellite':>10} "
+          f"{'sub-thr cen':>12}")
+    for lab, s in (("central", ~fof_sat), ("satellite", fof_sat)):
+        print(f"  {lab:>16} {np.sum(s & cen_d & ok):9,} {np.sum(s & sat_d):10,} "
+              f"{np.sum(s & ~ok):12,}")
+    print(f"  satellites whose host changes: "
+          f"{np.sum(fof_sat & sat_d & (halos['soap_index'].values[np.maximum(row, 0)] != gal['host_row'].values)):,}")
+
+    use = ok
+    fsat_f, fsat_d = fof_sat.mean(), sat_d[use].mean()
+    mf = gal["mass_200m"].values
+    print(f"  fsat: FOF {fsat_f:.4f}  distinct {fsat_d:.4f} "
+          f"({np.sum(~ok):,} sub-threshold centres dropped)")
+    print(f"  Meff(cen): FOF {np.mean(mf[~fof_sat]):.4e}  distinct "
+          f"{np.mean(m_d[use & cen_d]):.4e} Msun/h")
+    print(f"  Meff(all): FOF {np.mean(mf):.4e}  distinct "
+          f"{np.mean(m_d[use]):.4e} Msun/h")
+
+    with h5py.File(args.soap_path, "r") as f:
+        hidx = f["SOAP/HostHaloIndex"][:]
+        m_fof = args.h * 1e10 * f["SO/200_mean/TotalMass"][:][hidx == -1].astype(np.float64)
+    bins = np.geomspace(args.hod_mmin, args.hod_mmax, args.hod_nbins)
+    centers = np.sqrt(bins[1:] * bins[:-1])
+    cnt_f = np.zeros(len(m_fof), np.int64)       # Poisson ratio not needed here
+    occ_f = _occupation(mf, fof_sat, m_fof, cnt_f, bins)
+    cnt_d = np.bincount(row[use & sat_d], minlength=len(halos))
+    occ_d = _occupation(m_d[use], sat_d[use], halos["mass"].values, cnt_d, bins)
+    for tag, o in (("FOF", occ_f), ("distinct", occ_d)):
+        p = np.nanargmax(o[0])
+        print(f"  peak <Ncen> {tag}: {o[0][p]:.4f} at logM {np.log10(centers[p]):.3f}")
+    print(f"\n{'logM':>7} {'Nh FOF':>9} {'Nh dist':>9} {'<Nc> FOF':>9} "
+          f"{'<Nc> dist':>9} {'ratio':>6} {'<Ns> FOF':>9} {'<Ns> dist':>9} "
+          f"{'ratio':>6} {'Poiss dist':>10}")
+    for i in range(len(centers)):
+        if occ_d[5][i] < 50:
+            continue
+        rc = occ_d[0][i] / occ_f[0][i] if occ_f[0][i] > 0 else np.nan
+        rs = occ_d[1][i] / occ_f[1][i] if occ_f[1][i] > 0 else np.nan
+        print(f"{np.log10(centers[i]):7.3f} {occ_f[5][i]:9d} {occ_d[5][i]:9d} "
+              f"{occ_f[0][i]:9.5f} {occ_d[0][i]:9.5f} {rc:6.3f} "
+              f"{occ_f[1][i]:9.5f} {occ_d[1][i]:9.5f} {rs:6.3f} "
+              f"{occ_d[2][i]:10.4f}")
+
+    out = gal.copy()
+    out["own_row"] = rows
+    out["type_distinct"] = sat_d.astype(np.int32)
+    out["mass_200m_distinct"] = m_d
+    out["distinct_row"] = row
+    out["distinct_case"] = case
+    p = os.path.join(args.output_dir, "NISP_catalogue_distinct.parquet")
+    out.to_parquet(p, index=False)
+    q = os.path.join(args.output_dir, "NISP_occupation_distinct.npz")
+    np.savez(q, bins=bins, centers=centers,
+             ncen_fof=occ_f[0], nsat_fof=occ_f[1], nhost_fof=occ_f[5],
+             ncen_distinct=occ_d[0], nsat_distinct=occ_d[1],
+             nhost_distinct=occ_d[5], poisson_distinct=occ_d[2],
+             fsat_fof=fsat_f, fsat_distinct=fsat_d)
+    print(f"\nSaved -> {p}\n      -> {q}")
 
 
 def run_nisp(args):
@@ -236,15 +354,22 @@ def main():
         t0 = time.time()
         print(f"Distinct-halo catalogue from {args.soap_path} "
               f"(M200m >= {args.mass_threshold:.1e} Msun/h)")
-        df = build_distinct_halo_catalogue(args.soap_path, h=args.h,
-                                           Lbox=args.Lbox,
-                                           mass_threshold=args.mass_threshold)
+        gal = rows = None
+        if args.distinct_nisp:
+            gal, rows = _nisp_soap_rows(args)
+        res = build_distinct_halo_catalogue(args.soap_path, h=args.h,
+                                            Lbox=args.Lbox,
+                                            mass_threshold=args.mass_threshold,
+                                            gal_rows=rows)
+        df, assign = res if gal is not None else (res, None)
         if len(df) == 0:
             raise SystemExit("empty distinct-halo catalogue")
         os.makedirs(args.output_dir, exist_ok=True)
         out = os.path.join(args.output_dir, "host_catalogue_distinct.parquet")
         df.to_parquet(out, index=False)
         print(f"Saved {len(df):,} halos -> {out}  ({time.time() - t0:.0f}s)")
+        if gal is not None:
+            run_distinct_nisp(args, gal, rows, df, assign)
         return
 
     from internal.subhalo_catalogue import (

@@ -418,7 +418,7 @@ def _m200m_from_apertures(M_ap, r_ap, rho_thr):
 
 
 def build_distinct_halo_catalogue(filepath, h=0.681, Lbox=681.0,
-                                  mass_threshold=1e11):
+                                  mass_threshold=1e11, gal_rows=None):
     """Host catalogue under a DISTINCT-halo (Rockstar-like) convention.
 
     SOAP here sits on HBT+: a host is a FOF group and every other subhalo in
@@ -445,6 +445,13 @@ def build_distinct_halo_catalogue(filepath, h=0.681, Lbox=681.0,
     comoving CoP], vx, vy, vz [km/s], mass [M200m, Msun/h], rvir [kpc/h], c,
     vrms) plus soap_index and promoted (was an HBT+ satellite). Promoted halos
     have no SO concentration (c = NaN); vrms is NaN for all rows.
+
+    gal_rows : optional SOAP rows of a galaxy sample's own subhalos. Then
+    returns (df, assign) where assign holds, per galaxy, `row` (the
+    DataFrame row of its top-level distinct halo, -1 for a halo below the
+    threshold), `central` (the galaxy is that halo's centre) and `case`
+    (0 own subhalo is a candidate, 1 inside its FOF host's R200m, 2 placed by
+    containment).
     """
     import h5py
     from scipy.spatial import cKDTree
@@ -497,8 +504,35 @@ def build_distinct_halo_catalogue(filepath, h=0.681, Lbox=681.0,
     print(f"  candidates >= {mass_threshold:.1e} Msun/h: {len(c_idx):,} centrals "
           f"+ {len(s_idx):,} outside-R200m satellites")
 
+    # Galaxies (gal_rows) are re-hosted in three ways: (0) their own subhalo
+    # is a candidate; (1) it sits inside its FOF host's R200m, so it follows
+    # that host; (2) anything else (an outside-R200m satellite below the
+    # threshold or with no M200m, or a sub-threshold central) is a satellite
+    # of the most massive candidate whose R200m contains it, else the centre
+    # of a halo below the threshold.
+    if gal_rows is not None:
+        g = np.asarray(gal_rows, dtype=np.int64)
+        cand_of = np.full(len(host_idx), -1, np.int64)
+        cand_of[idx] = np.arange(len(idx))
+        k_g = cand_of[g]
+        case = np.full(len(g), 2, np.int8)
+        case[k_g >= 0] = 0
+        hg = host_idx[g]
+        b = np.nonzero((k_g < 0) & (hg >= 0))[0]
+        dd = cop[g[b]] - cop[hg[b]]
+        dd -= L * np.round(dd / L)
+        inside = np.linalg.norm(dd, axis=1) < R[hg[b]]
+        case[b[inside & (cand_of[hg[b]] >= 0)]] = 1
+        c2 = np.nonzero(case == 2)[0]
+        gtree = cKDTree(cop[g[c2]] % L, boxsize=L)
+        container = np.full(len(c2), -1, np.int64)
+        del dd, inside
+
     tree = cKDTree(pos, boxsize=L)
     absorbed = np.zeros(len(idx), bool)
+    # most massive candidate whose R200m contains this one (Rockstar's upid
+    # before it is followed to the top level)
+    absorber = np.full(len(idx), -1, np.int64)
     order = np.argsort(-m)                                   # biggest spheres first
     chunk = 200_000
     for k0 in range(0, len(order), chunk):
@@ -507,7 +541,17 @@ def build_distinct_halo_catalogue(filepath, h=0.681, Lbox=681.0,
         for j, lst in zip(js, nb):
             if len(lst) > 1:
                 lst = np.asarray(lst)
-                absorbed[lst[m[lst] < m[j]]] = True
+                lst = lst[m[lst] < m[j]]
+                absorbed[lst] = True
+                lst = lst[absorber[lst] < 0]
+                absorber[lst] = j
+        if gal_rows is not None:
+            nbg = gtree.query_ball_point(pos[js], r200[js], workers=-1)
+            for j, lst in zip(js, nbg):
+                if len(lst):
+                    lst = np.asarray(lst)
+                    lst = lst[container[lst] < 0]
+                    container[lst] = j
     distinct = ~absorbed
     print(f"  distinct: {distinct.sum():,} = {(distinct & ~promoted).sum():,} "
           f"centrals + {(distinct & promoted).sum():,} promoted; "
@@ -525,7 +569,7 @@ def build_distinct_halo_catalogue(filepath, h=0.681, Lbox=681.0,
     f.close()
 
     xyz = h * pos[sel]
-    return pd.DataFrame({
+    df = pd.DataFrame({
         "x": xyz[:, 0], "y": xyz[:, 1], "z": xyz[:, 2],
         "vx": v[:, 0], "vy": v[:, 1], "vz": v[:, 2],
         "mass": h * 1e10 * m[sel],                           # Msun/h
@@ -535,6 +579,30 @@ def build_distinct_halo_catalogue(filepath, h=0.681, Lbox=681.0,
         "soap_index": gi.astype(np.int64),
         "promoted": promoted[sel],
     })
+    if gal_rows is None:
+        return df
+
+    # follow absorbers up to the top level (masses strictly increase)
+    top = np.arange(len(idx))
+    while True:
+        up = absorbed[top]
+        if not up.any():
+            break
+        top[up] = absorber[top[up]]
+    row_of = np.full(len(idx), -1, np.int64)
+    row_of[sel] = np.arange(len(sel))
+
+    row = np.full(len(g), -1, np.int64)
+    central = np.zeros(len(g), bool)
+    i0 = np.nonzero(case == 0)[0]
+    row[i0] = row_of[top[k_g[i0]]]
+    central[i0] = distinct[k_g[i0]]
+    i1 = np.nonzero(case == 1)[0]
+    row[i1] = row_of[top[cand_of[hg[i1]]]]
+    has = container >= 0
+    row[c2[has]] = row_of[top[container[has]]]
+    central[c2[~has]] = True
+    return df, {"row": row, "central": central, "case": case}
 
 
 def save_catalogues(host_cat, sub_cat, csr, output_dir,
