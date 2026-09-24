@@ -75,6 +75,11 @@ def parse_args():
              "ELG galaxy catalogue from the same SOAP file and measure its "
              "occupation on BOTH M200m and M200c."
     )
+    parser.add_argument("--distinct", action="store_true",
+                        help="Write host_catalogue_distinct.parquet: distinct-"
+                             "halo (Rockstar-like) convention, satellites beyond "
+                             "their FOF host's R200m promoted with an aperture "
+                             "M200m (see build_distinct_halo_catalogue).")
     parser.add_argument("--log_mstar_min", type=float, default=10.1,
                         help="log10 stellar mass floor [Msun]. The catalogue "
                              "on disk used 10.1; the notebook used 10.0.")
@@ -224,6 +229,22 @@ def main():
 
     if args.nisp:
         run_nisp(args)
+        return
+
+    if args.distinct:
+        from internal.subhalo_catalogue import build_distinct_halo_catalogue
+        t0 = time.time()
+        print(f"Distinct-halo catalogue from {args.soap_path} "
+              f"(M200m >= {args.mass_threshold:.1e} Msun/h)")
+        df = build_distinct_halo_catalogue(args.soap_path, h=args.h,
+                                           Lbox=args.Lbox,
+                                           mass_threshold=args.mass_threshold)
+        if len(df) == 0:
+            raise SystemExit("empty distinct-halo catalogue")
+        os.makedirs(args.output_dir, exist_ok=True)
+        out = os.path.join(args.output_dir, "host_catalogue_distinct.parquet")
+        df.to_parquet(out, index=False)
+        print(f"Saved {len(df):,} halos -> {out}  ({time.time() - t0:.0f}s)")
         return
 
     from internal.subhalo_catalogue import (

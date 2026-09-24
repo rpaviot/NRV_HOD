@@ -378,6 +378,162 @@ def build_halo_and_subhalo_catalogues(
     return host_cat, sub_cat, csr
 
 
+def _m200m_from_apertures(M_ap, r_ap, rho_thr):
+    """M200m from an enclosed-mass profile sampled at a few radii.
+
+    SOAP section 6 finds R_SO where the mean enclosed density crosses
+    rho_thr on the full particle profile. Satellites have no SO masses, but
+    every subhalo carries InclusiveSphere masses (all particles, bound or not)
+    at fixed apertures, so the same crossing is taken on that coarse profile,
+    log-log between the bracketing apertures. Reproduces SO/200_mean on
+    centrals to <= 0.014 dex bias, 0.01-0.04 dex scatter (logM 9.75-13.25).
+
+    M_ap : (N, n_ap) enclosed masses, 0 where the aperture is absent
+    r_ap : (n_ap,) aperture radii in the units of rho_thr's length
+    Returns M200m (N,), NaN where the profile never crosses rho_thr.
+    """
+    N = len(M_ap)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rho = M_ap / (4.0 / 3.0 * np.pi * r_ap[None, :] ** 3)
+    have = M_ap > 0
+    below = have & (rho < rho_thr)
+    # first aperture below threshold, previous (present) aperture above it
+    j = np.argmax(below, axis=1)
+    ok = below.any(axis=1) & (j > 0)
+    out = np.full(N, np.nan)
+    rows = np.nonzero(ok)[0]
+    j = j[rows]
+    # previous PRESENT aperture (apertures are nested: small ones always exist)
+    jp = j - 1
+    ok2 = have[rows, jp] & (rho[rows, jp] >= rho_thr)
+    rows, j, jp = rows[ok2], j[ok2], jp[ok2]
+    l0, l1 = np.log(rho[rows, jp]), np.log(rho[rows, j])
+    t = (np.log(rho_thr) - l0) / (l1 - l0)
+    lr = np.log(r_ap[jp]) + t * (np.log(r_ap[j]) - np.log(r_ap[jp]))
+    out[rows] = rho_thr * 4.0 / 3.0 * np.pi * np.exp(lr) ** 3
+    return out
+
+
+def build_distinct_halo_catalogue(filepath, h=0.681, Lbox=681.0,
+                                  mass_threshold=1e11):
+    """Host catalogue under a DISTINCT-halo (Rockstar-like) convention.
+
+    SOAP here sits on HBT+: a host is a FOF group and every other subhalo in
+    it is a satellite, however far beyond R200m (backsplash objects, filament
+    bridges). Dark Emulator uses distinct halos -- an object is its own halo
+    unless its centre lies inside R200m of a more massive one. The two
+    conventions disagree on 36.5% of the NISP satellites, and those carry all
+    of the satellite lensing deficit beyond ~1.5 Mpc/h.
+
+    Rule:
+    1. Candidates: every central, plus every satellite whose centre lies
+       OUTSIDE its own FOF host's R200m. Satellites inside it are subhalos by
+       construction and are excluded outright -- their inclusive-sphere mass
+       is dominated by the host's particles and would let them absorb
+       neighbours.
+    2. Satellite candidates get M200m from the InclusiveSphere apertures
+       (_m200m_from_apertures); centrals keep SO/200_mean.
+    3. A candidate with M200m >= mass_threshold is distinct unless its centre
+       lies inside R200m of a MORE MASSIVE candidate (order-independent, as
+       Rockstar's upid). Candidates below the threshold cannot absorb anything
+       above it, so they are dropped first.
+
+    Returns a DataFrame with the host-catalogue columns (x, y, z [Mpc/h,
+    comoving CoP], vx, vy, vz [km/s], mass [M200m, Msun/h], rvir [kpc/h], c,
+    vrms) plus soap_index and promoted (was an HBT+ satellite). Promoted halos
+    have no SO concentration (c = NaN); vrms is NaN for all rows.
+    """
+    import h5py
+    from scipy.spatial import cKDTree
+
+    f = h5py.File(filepath, "r")
+    a = float(np.atleast_1d(f["SWIFT/Header"].attrs["Scale-factor"])[0])
+    host_idx = f["SOAP/HostHaloIndex"][:]
+    cen = host_idx == -1
+    cop = f["InputHalos/HaloCentre"][:]                      # comoving Mpc
+    M = f["SO/200_mean/TotalMass"][:].astype(np.float64)     # 1e10 Msun
+    R = f["SO/200_mean/SORadius"][:].astype(np.float64)      # comoving Mpc
+    ok = cen & (M > 0) & (R > 0)
+    rho_thr = float(np.median(M[ok] / (4.0 / 3.0 * np.pi * R[ok] ** 3)))
+    print(f"  200 rho_m = {rho_thr:.4e} (1e10 Msun / cMpc^3), a = {a}")
+
+    # 1. satellites outside their own host's R200m
+    sat = np.nonzero(host_idx >= 0)[0]
+    hsat = host_idx[sat]
+    d = cop[sat] - cop[hsat]
+    L = Lbox / h                                             # box in cMpc
+    d -= L * np.round(d / L)
+    r_sat = np.linalg.norm(d, axis=1)
+    out_sat = sat[r_sat >= R[hsat]]
+    print(f"  satellites {len(sat):,}; outside own host R200m {len(out_sat):,} "
+          f"({100 * len(out_sat) / len(sat):.1f}%)")
+    del d, r_sat, hsat
+
+    # 2. their M200m from the inclusive apertures
+    aps = [int(k[:-3]) for k in f["InclusiveSphere"].keys() if k.endswith("kpc")]
+    aps = sorted(aps)
+    r_ap = np.array(aps) / 1e3 / a                           # phys kpc -> cMpc
+    M_ap = np.stack([f[f"InclusiveSphere/{r}kpc/TotalMass"][:][out_sat]
+                     for r in aps], axis=1).astype(np.float64)
+    M_prom = _m200m_from_apertures(M_ap, r_ap, rho_thr)
+    del M_ap
+    print(f"  M200m interpolated for {100 * np.isfinite(M_prom).mean():.1f}% "
+          f"of them")
+
+    # 3. distinct-halo selection among candidates above the threshold
+    thr = mass_threshold / h / 1e10                          # -> 1e10 Msun
+    c_idx = np.nonzero(cen & (M >= thr))[0]
+    s_keep = np.isfinite(M_prom) & (M_prom >= thr)
+    s_idx = out_sat[s_keep]
+    idx = np.concatenate([c_idx, s_idx])
+    m = np.concatenate([M[c_idx], M_prom[s_keep]])
+    r200 = np.concatenate([R[c_idx],
+                           (M_prom[s_keep] / (4.0 / 3.0 * np.pi * rho_thr)) ** (1 / 3)])
+    promoted = np.concatenate([np.zeros(len(c_idx), bool), np.ones(len(s_idx), bool)])
+    pos = cop[idx] % L
+    print(f"  candidates >= {mass_threshold:.1e} Msun/h: {len(c_idx):,} centrals "
+          f"+ {len(s_idx):,} outside-R200m satellites")
+
+    tree = cKDTree(pos, boxsize=L)
+    absorbed = np.zeros(len(idx), bool)
+    order = np.argsort(-m)                                   # biggest spheres first
+    chunk = 200_000
+    for k0 in range(0, len(order), chunk):
+        js = order[k0:k0 + chunk]
+        nb = tree.query_ball_point(pos[js], r200[js], workers=-1)
+        for j, lst in zip(js, nb):
+            if len(lst) > 1:
+                lst = np.asarray(lst)
+                absorbed[lst[m[lst] < m[j]]] = True
+    distinct = ~absorbed
+    print(f"  distinct: {distinct.sum():,} = {(distinct & ~promoted).sum():,} "
+          f"centrals + {(distinct & promoted).sum():,} promoted; "
+          f"{(absorbed & ~promoted).sum():,} FOF centrals demoted "
+          f"(inside a more massive halo's R200m)")
+
+    sel = np.nonzero(distinct)[0]
+    gi = idx[sel]
+    v = f["BoundSubhalo/CentreOfMassVelocity"][:][gi] * a    # km/s, physical
+    v_so = f["SO/200_mean/CentreOfMassVelocity"][:][gi] * a
+    is_c = ~promoted[sel]
+    v[is_c] = v_so[is_c]                                     # as the FOF builder
+    conc = np.full(len(sel), np.nan)
+    conc[is_c] = f["SO/200_mean/Concentration"][:][gi[is_c]]
+    f.close()
+
+    xyz = h * pos[sel]
+    return pd.DataFrame({
+        "x": xyz[:, 0], "y": xyz[:, 1], "z": xyz[:, 2],
+        "vx": v[:, 0], "vy": v[:, 1], "vz": v[:, 2],
+        "mass": h * 1e10 * m[sel],                           # Msun/h
+        "rvir": h * 1e3 * r200[sel],                         # kpc/h (comoving)
+        "c": conc,
+        "vrms": np.full(len(sel), np.nan),
+        "soap_index": gi.astype(np.int64),
+        "promoted": promoted[sel],
+    })
+
+
 def save_catalogues(host_cat, sub_cat, csr, output_dir,
                     ranking='r_descending', hybrid_alpha=0.5):
     """
