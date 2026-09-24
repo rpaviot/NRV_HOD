@@ -19,7 +19,7 @@ scale cuts, outputs) so posteriors are directly comparable to the
 grid+emulator chains (chains_BARYON / FULL_* generations).
 
 Usage (cluster):
-    python example_scripts/run_tabulated_chains.py NFW \
+    python internal/run_tabulated_chains.py NFW \
         --cache_path /sps/euclid/Users/rpaviot/flamingo/tabulated_cache_DMO.h5 \
         --output_dir /sps/euclid/Users/rpaviot/flamingo/chains_TABULATED_DMO
 """

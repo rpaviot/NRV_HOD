@@ -1,24 +1,21 @@
 """
 Nautilus nested sampler for fitting galaxy-galaxy lensing (and optionally w_gg)
-with the ELG_mHMQ HOD model, backed by a pre-trained DeltaSigma emulator.
+with the ELG_mHMQ HOD model, backed by the tabulated (TabCorr-style)
+DeltaSigma / w_gg predictors.
 
 Supports three progressively complex fit cases:
 1. STANDARD_NFW — standard NFW satellite profiles with Ac/As rescaling
 2. EXTENDED_PROFILE — adds exponential cutoff (f_exp, tau)
 3. CONFORMITY — adds AbacusHOD-style conformity (kappa_EE)
 
-All cases fix the galaxy number density (via the Ac/As rescaling baked into the
-training grid) and fix M1 = 13.0 by default.
+All cases fix the galaxy number density (via an (Ac, As) rescaling to
+``target_ngal``) and fix M1 = 13.0 by default.
 """
 
 import warnings
 import numpy as np
 from enum import IntEnum
 from typing import Dict, Optional, Tuple
-
-from interpax import Interpolator1D
-
-from .emulator_nn_flax import load_emulator, predict_dsigma, predict_wgg
 
 
 class FitCase(IntEnum):
@@ -102,526 +99,14 @@ def _parse_param_config(param_config: dict):
     return priors, fixed_params
 
 
-# ---------------------------------------------------------------------------
-# EmulatorFitter — Nautilus sampler backed by a pre-trained DeltaSigmaEmulator
-# ---------------------------------------------------------------------------
-
-# Module-level state for fork-safe pool parallelism. Set by EmulatorFitter.run()
+# Module-level state for fork-safe pool parallelism. Set by TabulatedFitter.run()
 # before the pool is created; inherited by worker processes via fork COW.
-_emulator_fitter_instance = None
+_fitter_instance = None
 
 
-def _emulator_likelihood(theta):
-    """Module-level wrapper for EmulatorFitter, picklable by name."""
-    return _emulator_fitter_instance.log_likelihood(theta)
-
-
-class EmulatorFitter:
-    """
-    Nautilus nested sampler backed by a pre-trained DeltaSigma emulator
-    (and optionally a w_gg emulator for joint fits).
-
-    Emulator calls are ~μs, so a full Nautilus run completes in minutes.
-
-    Parameters
-    ----------
-    emulator_path : str
-        Path to the DeltaSigma emulator ``.npz`` file written by train_emulator().
-    fit_case : FitCase
-        Which model complexity to use (determines free parameters).
-    data_path : str, optional
-        Path to .npz file with observed DeltaSigma data. Flexible key names:
-        ``rp`` / ``rp_centers``, ``rp_bins`` / ``rp_edges``,
-        ``delta_sigma`` / ``dsigma``, ``cov_delta_sigma`` / ``cov_dsigma``.
-        Provide either ``data_path`` or all three of (``ds_obs``, ``cov_inv``,
-        ``rp_obs``).
-    ds_obs, cov_inv, rp_obs : np.ndarray, optional
-        Direct-array alternative to ``data_path``.
-    param_names_ordered : list of str, optional
-        Ordered list of HOD parameter names as stored in the emulator grid.
-        Must match the column order of the param_grid used during training.
-        Defaults to the order read from the emulator metadata.
-    M1_fixed : float, default=13.0
-        Fixed log10(M1) value.
-    rp_min, rp_max : float, optional
-        Scale cuts for DeltaSigma [Mpc/h].
-    emulator_wgg_path : str, optional
-        Path to the w_gg emulator ``.npz`` file. When provided, enables joint
-        DeltaSigma + w_gg fitting.
-    data_path_wgg : str, optional
-        Path to .npz file with observed w_gg data.
-    wgg_obs, cov_inv_wgg, rp_obs_wgg : np.ndarray, optional
-        Direct-array alternative to ``data_path_wgg``.
-    rp_min_wgg, rp_max_wgg : float, optional
-        Scale cuts for w_gg [Mpc/h].
-    param_config : dict, optional
-        ``{name: (low, high)}`` for free params, ``{name: scalar}`` for fixed.
-    max_fsat : float, optional
-        f_sat hard prior: matches the rejection rule applied in
-        ``generate_hod_parameter_grid()`` at grid build time. Requires
-        ``hod_occupation``.
-    Ac_fiducial : float, default=0.01
-        Same Ac fiducial used at grid build time (compute_fsat_batched is
-        invariant under joint (Ac, As) rescaling).
-    hod_occupation : object, optional
-        Pass ``halo.HOD`` so ``compute_fsat_batched`` is available for the
-        f_sat truncation prior.
-    """
-
-    def __init__(
-        self,
-        emulator_path: str,
-        fit_case: FitCase = FitCase.STANDARD_NFW,
-        # --- Data: provide EITHER data_path OR (ds_obs + cov_inv + rp_obs) ---
-        data_path: str = "",
-        ds_obs: Optional[np.ndarray] = None,
-        cov_inv: Optional[np.ndarray] = None,
-        rp_obs: Optional[np.ndarray] = None,
-        # --- Remaining params ---
-        param_names_ordered: Optional[list] = None,
-        M1_fixed: float = 13.0,
-        rp_min: Optional[float] = None,
-        rp_max: Optional[float] = None,
-        # --- Optional wgg emulator & data ---
-        emulator_wgg_path: str = "",
-        data_path_wgg: str = "",
-        wgg_obs: Optional[np.ndarray] = None,
-        cov_inv_wgg: Optional[np.ndarray] = None,
-        rp_obs_wgg: Optional[np.ndarray] = None,
-        rp_min_wgg: Optional[float] = None,
-        rp_max_wgg: Optional[float] = None,
-        # --- Custom priors ---
-        param_config: Optional[dict] = None,
-        # --- f_sat truncation prior (mirrors grid-time rejection) ---
-        max_fsat: Optional[float] = None,
-        Ac_fiducial: float = 0.01,
-        hod_occupation=None,
-    ):
-        self.fit_case = FitCase(fit_case)
-        self.M1_fixed = M1_fixed
-        self.fixed_params_dict = {"M1": M1_fixed}
-        self.rp_min = rp_min
-        self.rp_max = rp_max
-
-        self.max_fsat = max_fsat
-        self.Ac_fiducial = Ac_fiducial
-        self.hod_occupation = hod_occupation
-        if max_fsat is not None and hod_occupation is None:
-            raise ValueError(
-                "max_fsat requires hod_occupation (pass halo.HOD, an Occupation "
-                "instance) so f_sat can be evaluated via compute_fsat_batched."
-            )
-
-        # Load emulator
-        self.model, self.norm_stats = load_emulator(emulator_path)
-        self.emulator_rp = self.norm_stats["rp_centers"]  # shape (n_rp_emulator,)
-
-        # Free parameters for this case
-        self.free_params = _get_free_params(self.fit_case)
-        self.param_names = [p[0] for p in self.free_params]
-        self.n_params = len(self.free_params)
-
-        # Parameter order expected by the emulator (column order of training grid)
-        if param_names_ordered is not None:
-            self.emulator_param_order = param_names_ordered
-        else:
-            self.emulator_param_order = list(self.norm_stats["param_names"])
-
-        # Load observed data
-        if data_path:
-            self._load_data(data_path)
-        elif ds_obs is not None and cov_inv is not None and rp_obs is not None:
-            self.rp_obs = np.asarray(rp_obs)
-            self.ds_obs = np.asarray(ds_obs)
-            self.cov_inv = np.asarray(cov_inv)
-
-            mask = np.ones(len(self.rp_obs), dtype=bool)
-            if rp_min is not None:
-                mask &= (self.rp_obs >= rp_min)
-            if rp_max is not None:
-                mask &= (self.rp_obs <= rp_max)
-            if not mask.all():
-                self.rp_obs  = self.rp_obs[mask]
-                self.ds_obs  = self.ds_obs[mask]
-                self.cov_inv = self.cov_inv[np.ix_(mask, mask)]
-
-            self.n_bins = len(self.ds_obs)
-        else:
-            raise ValueError(
-                "Provide either data_path or all three of (ds_obs, cov_inv, rp_obs)."
-            )
-
-        self._setup_interp()
-
-        # --- Optional wgg emulator ---
-        self.rp_min_wgg = rp_min_wgg
-        self.rp_max_wgg = rp_max_wgg
-        self._fit_wgg = False
-
-        if emulator_wgg_path:
-            self.model_wgg, self.norm_stats_wgg = load_emulator(emulator_wgg_path)
-            self.emulator_rp_wgg = self.norm_stats_wgg["rp_centers"]
-
-            if data_path_wgg:
-                self._load_data_wgg(data_path_wgg)
-            elif wgg_obs is not None and cov_inv_wgg is not None and rp_obs_wgg is not None:
-                self.rp_obs_wgg = np.asarray(rp_obs_wgg)
-                self.wgg_obs = np.asarray(wgg_obs)
-                self.cov_inv_wgg = np.asarray(cov_inv_wgg)
-                mask = np.ones(len(self.rp_obs_wgg), dtype=bool)
-                if rp_min_wgg is not None:
-                    mask &= (self.rp_obs_wgg >= rp_min_wgg)
-                if rp_max_wgg is not None:
-                    mask &= (self.rp_obs_wgg <= rp_max_wgg)
-                if not mask.all():
-                    self.rp_obs_wgg  = self.rp_obs_wgg[mask]
-                    self.wgg_obs     = self.wgg_obs[mask]
-                    self.cov_inv_wgg = self.cov_inv_wgg[np.ix_(mask, mask)]
-            else:
-                raise ValueError(
-                    "emulator_wgg_path given but no wgg data provided. "
-                    "Supply data_path_wgg or (wgg_obs, cov_inv_wgg, rp_obs_wgg)."
-                )
-
-            self._setup_interp_wgg()
-            self._fit_wgg = True
-
-        if param_config is not None:
-            priors, fixed = _parse_param_config(param_config)
-            self.set_priors(priors, fixed)
-
-    def _load_data(self, data_path: str):
-        """Load observed DeltaSigma data from .npz file."""
-        data = np.load(data_path)
-
-        for key in ("rp", "rp_centers"):
-            if key in data:
-                self.rp_obs = data[key]
-                break
-        else:
-            raise KeyError("Data file must contain 'rp' or 'rp_centers'")
-
-        for key in ("rp_bins", "rp_edges"):
-            if key in data:
-                self.rp_bins = data[key]
-                break
-        else:
-            log_rp = np.log10(self.rp_obs)
-            dlog = np.diff(log_rp)[0] / 2
-            edges = np.concatenate([
-                [log_rp[0] - dlog],
-                (log_rp[:-1] + log_rp[1:]) / 2,
-                [log_rp[-1] + dlog]
-            ])
-            self.rp_bins = 10**edges
-
-        for key in ("delta_sigma", "dsigma"):
-            if key in data:
-                self.ds_obs = data[key]
-                break
-        else:
-            raise KeyError("Data file must contain 'delta_sigma' or 'dsigma'")
-
-        for key in ("cov_delta_sigma", "cov_dsigma"):
-            if key in data:
-                self.cov = data[key]
-                break
-        else:
-            raise KeyError("Data file must contain 'cov_delta_sigma' or 'cov_dsigma'")
-
-        mask = np.ones(len(self.rp_obs), dtype=bool)
-        if self.rp_min is not None:
-            mask &= (self.rp_obs >= self.rp_min)
-        if self.rp_max is not None:
-            mask &= (self.rp_obs <= self.rp_max)
-
-        if not mask.all():
-            self.rp_obs  = self.rp_obs[mask]
-            self.ds_obs  = self.ds_obs[mask]
-            self.cov     = self.cov[np.ix_(mask, mask)]
-            idx = np.where(mask)[0]
-            self.rp_bins = self.rp_bins[idx[0] : idx[-1] + 2]
-
-        self.cov_inv = np.linalg.inv(self.cov)
-        self.n_bins = len(self.ds_obs)
-
-    def _setup_interp(self):
-        self._log_rp_emu = np.log(self.emulator_rp)
-        self._log_rp_obs = np.log(self.rp_obs)
-
-    def _load_data_wgg(self, data_path_wgg: str):
-        """Load observed w_gg data from .npz file."""
-        data = np.load(data_path_wgg)
-
-        for key in ("rp", "rp_centers"):
-            if key in data:
-                self.rp_obs_wgg = data[key]
-                break
-        else:
-            raise KeyError("wgg data file must contain 'rp' or 'rp_centers'")
-
-        for key in ("wgg", "wp", "w_gg"):
-            if key in data:
-                self.wgg_obs = data[key]
-                break
-        else:
-            raise KeyError("wgg data file must contain 'wgg', 'wp', or 'w_gg'")
-
-        for key in ("cov_wgg", "cov_wp", "cov_w_gg"):
-            if key in data:
-                self.cov_wgg = data[key]
-                break
-        else:
-            raise KeyError("wgg data file must contain 'cov_wgg', 'cov_wp', or 'cov_w_gg'")
-
-        mask = np.ones(len(self.rp_obs_wgg), dtype=bool)
-        if self.rp_min_wgg is not None:
-            mask &= (self.rp_obs_wgg >= self.rp_min_wgg)
-        if self.rp_max_wgg is not None:
-            mask &= (self.rp_obs_wgg <= self.rp_max_wgg)
-        if not mask.all():
-            self.rp_obs_wgg = self.rp_obs_wgg[mask]
-            self.wgg_obs    = self.wgg_obs[mask]
-            self.cov_wgg    = self.cov_wgg[np.ix_(mask, mask)]
-
-        self.cov_inv_wgg = np.linalg.inv(self.cov_wgg)
-
-    def _setup_interp_wgg(self):
-        self._log_rp_emu_wgg = np.log(self.emulator_rp_wgg)
-        self._log_rp_obs_wgg = np.log(self.rp_obs_wgg)
-
-    def set_priors(self, priors, fixed_params=()):
-        """Override free-parameter bounds and fixed values after construction."""
-        self.fixed_params_dict = dict(fixed_params)
-        if "M1" not in self.fixed_params_dict:
-            self.fixed_params_dict["M1"] = self.M1_fixed
-        else:
-            self.M1_fixed = self.fixed_params_dict["M1"]
-
-        emulator_params = set(self.emulator_param_order)
-        active = []
-        for entry in priors:
-            if len(entry) == 3:
-                name, a, b = entry
-                kind = "uniform"
-            else:
-                name, a, b, kind = entry
-            if name not in _ALL_KNOWN_PARAMS:
-                warnings.warn(
-                    f"set_priors: '{name}' is not a recognized HOD parameter; ignoring."
-                )
-            elif name not in emulator_params:
-                pass  # valid param, not in this emulator — silently skip
-            else:
-                active.append((name, float(a), float(b), kind))
-
-        covered = {p[0] for p in active} | set(self.fixed_params_dict)
-        missing = [p for p in self.emulator_param_order if p not in covered]
-        if missing:
-            warnings.warn(
-                f"set_priors: emulator params {missing} are neither free nor fixed. "
-                "Likelihood evaluation will fail for those params."
-            )
-
-        self.free_params = active
-        self.param_names = [p[0] for p in active]
-        self.n_params = len(active)
-
-    def log_likelihood(self, theta) -> float:
-        """Log-likelihood using the emulator forward pass."""
-        if isinstance(theta, dict):
-            free_dict = dict(theta)
-        else:
-            free_dict = dict(zip(self.param_names, theta))
-
-        # f_sat truncation prior — identical rejection criterion to the one
-        # used in generate_hod_parameter_grid() at grid build time.
-        if self.max_fsat is not None:
-            try:
-                params_arrays = {
-                    name: np.array([value])
-                    for name, value in {**self.fixed_params_dict, **free_dict}.items()
-                }
-                fsat = float(self.hod_occupation.compute_fsat_batched(
-                    params_arrays, self.Ac_fiducial
-                )[0])
-            except Exception:
-                return -1e100
-            if not np.isfinite(fsat) or fsat > self.max_fsat:
-                return -1e100
-
-        try:
-            theta_vec = np.array([
-                self.fixed_params_dict[p] if p in self.fixed_params_dict else free_dict[p]
-                for p in self.emulator_param_order
-            ], dtype=np.float32)
-            ds_pred = predict_dsigma(self.model, self.norm_stats, theta_vec)
-        except Exception:
-            return -1e100
-
-        if not np.all(np.isfinite(ds_pred)):
-            return -1e100
-
-        log_ds_emu = np.log(ds_pred)
-        log_ds_at_obs = np.array(
-            Interpolator1D(self._log_rp_emu, log_ds_emu, method='cubic')(self._log_rp_obs)
-        )
-        ds_at_obs = np.exp(log_ds_at_obs)
-
-        residual = ds_at_obs - self.ds_obs
-        chi2 = residual @ self.cov_inv @ residual
-
-        if self._fit_wgg:
-            try:
-                theta_vec_wgg = np.array([
-                    self.fixed_params_dict[p] if p in self.fixed_params_dict else free_dict[p]
-                    for p in list(self.norm_stats_wgg["param_names"])
-                ], dtype=np.float32)
-                wgg_pred = predict_wgg(self.model_wgg, self.norm_stats_wgg, theta_vec_wgg)
-            except Exception:
-                return -1e100
-            if not np.all(np.isfinite(wgg_pred)):
-                return -1e100
-            log_wgg_emu = np.log(wgg_pred)
-            log_wgg_at_obs = np.array(
-                Interpolator1D(self._log_rp_emu_wgg, log_wgg_emu, method='cubic')(self._log_rp_obs_wgg)
-            )
-            wgg_at_obs = np.exp(log_wgg_at_obs)
-            residual_wgg = wgg_at_obs - self.wgg_obs
-            chi2 += residual_wgg @ self.cov_inv_wgg @ residual_wgg
-
-        return -0.5 * chi2
-
-    def run(
-        self,
-        n_live: int = 500,
-        n_eff: int = 5000,
-        filepath: Optional[str] = None,
-        verbose: bool = True,
-        n_workers: int = 1,
-        vectorized: bool = False,
-        **nautilus_kwargs,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-        """Run the Nautilus nested sampler with the emulator likelihood.
-
-        With ``vectorized=True`` the sampler uses the jit/vmap-batched
-        likelihood from :meth:`build_batched_loglike` in a single process
-        (``vectorized=True, pool=None``) — no fork, no JAX-after-fork
-        deadlock; parallelism comes from XLA's own threading.
-        """
-        import nautilus
-        import HOD_NRV.utilsf.numerical_sampler as _self_mod
-
-        from scipy.stats import norm as _norm
-        prior = nautilus.Prior()
-        for name, a, b, kind in self.free_params:
-            if kind == "gaussian":
-                prior.add_parameter(name, dist=_norm(loc=a, scale=b))
-            else:
-                prior.add_parameter(name, dist=(a, b))
-
-        _self_mod._emulator_fitter_instance = self
-
-        if vectorized:
-            likelihood, _ = self.build_batched_loglike()
-            pool_arg = None
-            # n_batch=128 matches the loglike's pad_to multiple: no padding waste
-            vec_kwargs = dict(vectorized=True, n_batch=128)
-        else:
-            likelihood = _emulator_likelihood
-            pool_arg = n_workers if n_workers > 1 else None
-            vec_kwargs = {}
-
-        try:
-            sampler = nautilus.Sampler(
-                prior,
-                likelihood,
-                n_live=n_live,
-                filepath=filepath,
-                pool=pool_arg,
-                pass_dict=False,
-                **vec_kwargs,
-            )
-            sampler.run(n_eff=n_eff, verbose=verbose, **nautilus_kwargs)
-        finally:
-            _self_mod._emulator_fitter_instance = None
-
-        points, log_w, log_l = sampler.posterior()
-        weights = np.exp(log_w - log_w.max())
-        weights /= weights.sum()
-        log_z = sampler.evidence()
-
-        return points, weights, log_l, log_z
-
-    def get_best_fit(self, points: np.ndarray, log_l: np.ndarray) -> Dict[str, float]:
-        """Return the MAP (maximum a-posteriori) parameter estimate."""
-        idx_best = np.argmax(log_l)
-        theta_best = points[idx_best]
-        result = dict(zip(self.param_names, theta_best))
-        result["M1"] = self.M1_fixed
-        return result
-
-    def get_posterior_summary(
-        self, points: np.ndarray, weights: np.ndarray
-    ) -> Dict[str, Dict[str, float]]:
-        """Compute weighted posterior summary statistics."""
-        summary = {}
-        for i, name in enumerate(self.param_names):
-            vals = points[:, i]
-            w = weights
-
-            mean = np.average(vals, weights=w)
-            std = np.sqrt(np.average((vals - mean) ** 2, weights=w))
-
-            sorted_idx = np.argsort(vals)
-            vals_sorted = vals[sorted_idx]
-            w_sorted = w[sorted_idx]
-            cumw = np.cumsum(w_sorted)
-            cumw /= cumw[-1]
-
-            median = vals_sorted[np.searchsorted(cumw, 0.5)]
-            q16 = vals_sorted[np.searchsorted(cumw, 0.16)]
-            q84 = vals_sorted[np.searchsorted(cumw, 0.84)]
-
-            summary[name] = {
-                "mean": mean,
-                "std": std,
-                "median": median,
-                "q16": q16,
-                "q84": q84,
-            }
-        return summary
-
-    def save_results(
-        self,
-        path: str,
-        points: np.ndarray,
-        weights: np.ndarray,
-        log_l: np.ndarray,
-        log_z: float,
-    ):
-        """Save sampler results to .npz file."""
-        arrays = dict(
-            points=points,
-            weights=weights,
-            log_l=log_l,
-            log_z=log_z,
-            param_names=self.param_names,
-            fit_case=int(self.fit_case),
-            M1_fixed=self.M1_fixed,
-            rp_obs=self.rp_obs,
-            ds_obs=self.ds_obs,
-        )
-        if hasattr(self, "cov"):
-            arrays["cov"] = self.cov
-        if hasattr(self, "rp_bins"):
-            arrays["rp_bins"] = self.rp_bins
-        if self._fit_wgg:
-            arrays["rp_obs_wgg"] = self.rp_obs_wgg
-            arrays["wgg_obs"]    = self.wgg_obs
-            if hasattr(self, "cov_wgg"):
-                arrays["cov_wgg"] = self.cov_wgg
-        np.savez(path, **arrays)
+def _fitter_likelihood(theta):
+    """Module-level wrapper for TabulatedFitter, picklable by name."""
+    return _fitter_instance.log_likelihood(theta)
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +163,7 @@ def _make_ngal_mf_jax(occ):
     return ngal_fn
 
 
-class TabulatedFitter(EmulatorFitter):
+class TabulatedFitter:
     """
     Nautilus sampler calling TabulatedDeltaSigma.predict() directly.
 
@@ -716,8 +201,8 @@ class TabulatedFitter(EmulatorFitter):
         the wrong Ac/As ratio rather than just the wrong absolute scale.
     target_ngal : float
         Galaxy number density the (Ac, As) pair is rescaled to.
-    Other arguments are as in EmulatorFitter (data_path / arrays, rp cuts,
-    param_config, max_fsat, ...). ``emulator_path`` is not used.
+    data_path / (ds_obs, cov_inv, rp_obs), rp_min / rp_max, param_config,
+    max_fsat: data vector, scale cuts, priors, f_sat truncation prior.
     """
 
     def __init__(
@@ -827,8 +312,199 @@ class TabulatedFitter(EmulatorFitter):
             priors, fixed = _parse_param_config(param_config)
             self.set_priors(priors, fixed)
 
+    def _load_data(self, data_path: str):
+        """Load observed DeltaSigma data from .npz file."""
+        data = np.load(data_path)
+
+        for key in ("rp", "rp_centers"):
+            if key in data:
+                self.rp_obs = data[key]
+                break
+        else:
+            raise KeyError("Data file must contain 'rp' or 'rp_centers'")
+
+        for key in ("rp_bins", "rp_edges"):
+            if key in data:
+                self.rp_bins = data[key]
+                break
+        else:
+            log_rp = np.log10(self.rp_obs)
+            dlog = np.diff(log_rp)[0] / 2
+            edges = np.concatenate([
+                [log_rp[0] - dlog],
+                (log_rp[:-1] + log_rp[1:]) / 2,
+                [log_rp[-1] + dlog]
+            ])
+            self.rp_bins = 10**edges
+
+        for key in ("delta_sigma", "dsigma"):
+            if key in data:
+                self.ds_obs = data[key]
+                break
+        else:
+            raise KeyError("Data file must contain 'delta_sigma' or 'dsigma'")
+
+        for key in ("cov_delta_sigma", "cov_dsigma"):
+            if key in data:
+                self.cov = data[key]
+                break
+        else:
+            raise KeyError("Data file must contain 'cov_delta_sigma' or 'cov_dsigma'")
+
+        mask = np.ones(len(self.rp_obs), dtype=bool)
+        if self.rp_min is not None:
+            mask &= (self.rp_obs >= self.rp_min)
+        if self.rp_max is not None:
+            mask &= (self.rp_obs <= self.rp_max)
+
+        if not mask.all():
+            self.rp_obs  = self.rp_obs[mask]
+            self.ds_obs  = self.ds_obs[mask]
+            self.cov     = self.cov[np.ix_(mask, mask)]
+            idx = np.where(mask)[0]
+            self.rp_bins = self.rp_bins[idx[0] : idx[-1] + 2]
+
+        self.cov_inv = np.linalg.inv(self.cov)
+        self.n_bins = len(self.ds_obs)
+
+    def _setup_interp(self):
+        self._log_rp_emu = np.log(self.emulator_rp)
+        self._log_rp_obs = np.log(self.rp_obs)
+
+    def run(
+        self,
+        n_live: int = 500,
+        n_eff: int = 5000,
+        filepath: Optional[str] = None,
+        verbose: bool = True,
+        n_workers: int = 1,
+        vectorized: bool = False,
+        **nautilus_kwargs,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+        """Run the Nautilus nested sampler with the tabulated likelihood.
+
+        With ``vectorized=True`` the sampler uses the jit/vmap-batched
+        likelihood from :meth:`build_batched_loglike` in a single process
+        (``vectorized=True, pool=None``) — no fork, no JAX-after-fork
+        deadlock; parallelism comes from XLA's own threading.
+        """
+        import nautilus
+        import HOD_NRV.utilsf.numerical_sampler as _self_mod
+
+        from scipy.stats import norm as _norm
+        prior = nautilus.Prior()
+        for name, a, b, kind in self.free_params:
+            if kind == "gaussian":
+                prior.add_parameter(name, dist=_norm(loc=a, scale=b))
+            else:
+                prior.add_parameter(name, dist=(a, b))
+
+        _self_mod._fitter_instance = self
+
+        if vectorized:
+            likelihood, _ = self.build_batched_loglike()
+            pool_arg = None
+            # n_batch=128 matches the loglike's pad_to multiple: no padding waste
+            vec_kwargs = dict(vectorized=True, n_batch=128)
+        else:
+            likelihood = _fitter_likelihood
+            pool_arg = n_workers if n_workers > 1 else None
+            vec_kwargs = {}
+
+        try:
+            sampler = nautilus.Sampler(
+                prior,
+                likelihood,
+                n_live=n_live,
+                filepath=filepath,
+                pool=pool_arg,
+                pass_dict=False,
+                **vec_kwargs,
+            )
+            sampler.run(n_eff=n_eff, verbose=verbose, **nautilus_kwargs)
+        finally:
+            _self_mod._fitter_instance = None
+
+        points, log_w, log_l = sampler.posterior()
+        weights = np.exp(log_w - log_w.max())
+        weights /= weights.sum()
+        log_z = sampler.evidence()
+
+        return points, weights, log_l, log_z
+
+    def get_best_fit(self, points: np.ndarray, log_l: np.ndarray) -> Dict[str, float]:
+        """Return the MAP (maximum a-posteriori) parameter estimate."""
+        idx_best = np.argmax(log_l)
+        theta_best = points[idx_best]
+        result = dict(zip(self.param_names, theta_best))
+        result["M1"] = self.M1_fixed
+        return result
+
+    def get_posterior_summary(
+        self, points: np.ndarray, weights: np.ndarray
+    ) -> Dict[str, Dict[str, float]]:
+        """Compute weighted posterior summary statistics."""
+        summary = {}
+        for i, name in enumerate(self.param_names):
+            vals = points[:, i]
+            w = weights
+
+            mean = np.average(vals, weights=w)
+            std = np.sqrt(np.average((vals - mean) ** 2, weights=w))
+
+            sorted_idx = np.argsort(vals)
+            vals_sorted = vals[sorted_idx]
+            w_sorted = w[sorted_idx]
+            cumw = np.cumsum(w_sorted)
+            cumw /= cumw[-1]
+
+            median = vals_sorted[np.searchsorted(cumw, 0.5)]
+            q16 = vals_sorted[np.searchsorted(cumw, 0.16)]
+            q84 = vals_sorted[np.searchsorted(cumw, 0.84)]
+
+            summary[name] = {
+                "mean": mean,
+                "std": std,
+                "median": median,
+                "q16": q16,
+                "q84": q84,
+            }
+        return summary
+
+    def save_results(
+        self,
+        path: str,
+        points: np.ndarray,
+        weights: np.ndarray,
+        log_l: np.ndarray,
+        log_z: float,
+    ):
+        """Save sampler results to .npz file."""
+        arrays = dict(
+            points=points,
+            weights=weights,
+            log_l=log_l,
+            log_z=log_z,
+            param_names=self.param_names,
+            fit_case=int(self.fit_case),
+            M1_fixed=self.M1_fixed,
+            rp_obs=self.rp_obs,
+            ds_obs=self.ds_obs,
+        )
+        if hasattr(self, "cov"):
+            arrays["cov"] = self.cov
+        if hasattr(self, "rp_bins"):
+            arrays["rp_bins"] = self.rp_bins
+        if self._fit_wgg:
+            arrays["rp_obs_wgg"] = self.rp_obs_wgg
+            arrays["wgg_obs"]    = self.wgg_obs
+            if hasattr(self, "cov_wgg"):
+                arrays["cov_wgg"] = self.cov_wgg
+        np.savez(path, **arrays)
+
+
     def set_priors(self, priors, fixed_params=()):
-        """As EmulatorFitter.set_priors but without emulator-name filtering."""
+        """Override free-parameter bounds and fixed values after construction."""
         self.fixed_params_dict = dict(fixed_params)
         if "M1" not in self.fixed_params_dict:
             self.fixed_params_dict["M1"] = self.M1_fixed

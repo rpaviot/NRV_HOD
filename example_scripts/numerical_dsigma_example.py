@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 
 from HOD_NRV.HOD_numerical.HOD import HaloOccupation
-from HOD_NRV.utilsf.emulator_utils import rescale_Ac_to_target_ngal
+from HOD_NRV.HOD_numerical.HOD_models import rescale_Ac_to_target_ngal
 
 # ============================================================================
 # Configuration

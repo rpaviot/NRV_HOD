@@ -29,7 +29,10 @@ No formal test suite, linting, or build commands are configured.
 HOD_NRV/
     HOD_analytical/     Semi-analytical power spectra, projected statistics, fitting
     HOD_numerical/      Numerical halo population, clustering, lensing
-    utilsf/             Shared utilities (data I/O, assembly bias, Hankel transforms)
+    utilsf/             Shared utilities (data I/O, assembly bias, Hankel transforms, sampler)
+example_scripts/        Validation tests only (see example_scripts/CLAUDE.md)
+internal/               Production pipeline: catalogue building, tabulation, covariance,
+                        chains, hydro measurements. Cluster slurm drivers there are gitignored.
 ```
 
 ## Module Documentation
@@ -54,7 +57,7 @@ Numerical HOD framework for populating dark matter halos with galaxies from simu
 
 ### Shared Utilities (`utilsf/`)
 
-Common functions used by both modules: data I/O (`data_reader.py`), assembly bias environment ranking (`assembly_bias_environment.py`), Hankel transforms (`hankel_transforms.py`), JAX random samplers and GL quadrature (`utils_functions.py`), and emulator helpers (`emulator_utils.py`).
+Common functions used by both modules: data I/O (`data_reader.py`), assembly bias environment ranking (`assembly_bias_environment.py`), Hankel transforms (`hankel_transforms.py`), JAX random samplers and GL quadrature (`utils_functions.py`), and the tabulated-likelihood Nautilus sampler (`numerical_sampler.py`).
 
 ## Technology Stack
 
@@ -88,9 +91,9 @@ Common functions used by both modules: data I/O (`data_reader.py`), assembly bia
 
 ## Test Status
 
-- **`HOD_analytical/null_test.py`**: Last successful run **2026-02-03**. All tests pass: P_gg and P_gm agree with pyccl reference to <0.4% in both natural and h-units. Note: when `units_per_h=True`, `HaloModel` now expects the input `k_array` in h/Mpc (not 1/Mpc).
-- **`HOD_numerical/twopoint_calculator/halo_center_lensing.py`**: Recommended fast-lensing path (`HaloCenterLensingCache` + `precompute_halo_center_lensing`). The older interpolation-based `fast_two_point.py`/`precompute_deltasigma.py` modules were removed.
-- **`example_scripts/cross_check_numerical.py`**: Fast numerical regression test. Uses optimal downsampling (5% particles, 10% galaxies, 5 realizations) to validate the numerical DeltaSigma pipeline against the full-resolution baseline in ~3s/realization. Pass threshold: 5% max deviation.
+- **`example_scripts/null_test_analytical.py`**: Last successful run **2026-02-03**. All tests pass: P_gg and P_gm agree with pyccl reference to <0.4% in both natural and h-units. Note: when `units_per_h=True`, `HaloModel` now expects the input `k_array` in h/Mpc (not 1/Mpc).
+- **`example_scripts/cross_check_analytical_numerical.py`**: Analytical vs numerical DeltaSigma for one HOD parameter set (needs `baseline_dsigma_cache.npz` from `numerical_dsigma_example.py`). Does not fully pass at 1-10 Mpc/h; suspected beta^NL.
+- **`example_scripts/cross_check_tabulated.py`**: Tabulated method (`TabulatedDeltaSigma` / `TabulatedWgg` in `HOD_numerical/twopoint_calculator/`) vs the full Monte-Carlo calculation.
 
 ## Data Dependencies
 

@@ -22,7 +22,7 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 
 FLAM=/sps/euclid/Users/rpaviot/flamingo
 
-python example_scripts/run_tabulated_chains.py ${1:-} \
+python internal/run_tabulated_chains.py ${1:-} \
     --cache_path $FLAM/tabulated_cache_DMO.h5 \
     --output_dir $FLAM/chains_TABULATED_DMO \
     ${2:+--rp_min_values $2}

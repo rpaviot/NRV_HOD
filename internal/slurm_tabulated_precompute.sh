@@ -18,7 +18,7 @@ export PYTHONPATH=$PWD:$PYTHONPATH
 FLAM=/sps/euclid/Users/rpaviot/flamingo
 PARTICLES=${PARTICLES:-$FLAM/snapshots_DMO/particle_catalogue_DMO.parquet}
 
-python example_scripts/precompute_halo_center_cache.py \
+python internal/precompute_halo_center_cache.py \
     --halo_path $FLAM/snapshots_DMO/host_catalogue_ab.parquet \
     --particle_path $PARTICLES \
     --output $FLAM/tabulated_cache_DMO.h5 \

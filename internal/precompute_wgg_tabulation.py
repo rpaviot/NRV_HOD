@@ -4,7 +4,7 @@ precompute_wgg_tabulation.py
 
 Precompute + save the wgg wp_ij(rp) tabulation between all (logM [x fI]) bins of
 RSD halo centers (pycorr, Kaiser + exclusion built in). This is the wgg analog of
-example_scripts/precompute_halo_center_cache.py.
+internal/precompute_halo_center_cache.py.
 
 The tabulation is *field-independent* — it depends only on the halo catalogue
 (positions, velocities, logM, fs_norm), not on the matter field — so a single
@@ -23,7 +23,7 @@ tabulated_cache_HYDRO.h5; tabulated_cache_HYDRO_R1.h5 is on fs_norm_R1 and
 needs its own.)
 
 Usage (cluster):
-    python example_scripts/precompute_wgg_tabulation.py \
+    python internal/precompute_wgg_tabulation.py \
         --output /sps/euclid/Users/rpaviot/flamingo/wgg_tabulation_AB.npz
 """
 
@@ -35,7 +35,7 @@ import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from example_scripts.run_tabulated_chains import (
+from internal.run_tabulated_chains import (
     build_halo_occupation, HALO_PATH_DEFAULT, FLAMINGO_DIR, LBOX, AB_COLUMN)
 from HOD_NRV.utilsf.numerical_sampler import FitCase
 from HOD_NRV.HOD_numerical.twopoint_calculator.tabulated_wgg import (

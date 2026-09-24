@@ -50,14 +50,14 @@ it reads the catalogue rebuilt by `precompute_subhalo_catalogue.py --nisp`
 (which carries r_host/rvir_host/c_host), not NISP_catalogue_flamingo.parquet.
 
 Usage (cluster):
-    python example_scripts/measure_hydro_data_vector.py \
+    python internal/measure_hydro_data_vector.py \
         --particle_fraction 0.02 --pi_max 100 \
         --output /sps/euclid/Users/rpaviot/flamingo/hydro_measured_data_vector.npz
 
-    python example_scripts/precompute_subhalo_catalogue.py --nisp \
+    python internal/precompute_subhalo_catalogue.py --nisp \
         --soap_path /sps/euclid/Users/rpaviot/flamingo/snapshots_hydro/halo_properties_0058.hdf5 \
         --output_dir /sps/euclid/Users/rpaviot/flamingo/snapshots_hydro
-    python example_scripts/measure_hydro_data_vector.py --profile \
+    python internal/measure_hydro_data_vector.py --profile \
         --nisp_path /sps/euclid/Users/rpaviot/flamingo/snapshots_hydro/NISP_catalogue_rebuilt.parquet
 """
 
@@ -86,7 +86,7 @@ from HOD_NRV.HOD_numerical.twopoint_calculator.standard_two_point_calculator imp
 from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import (
     HaloCenterLensingCache, TabulatedDeltaSigma)
 from HOD_NRV.utilsf.numerical_sampler import TabulatedFitter, FitCase
-from example_scripts.run_tabulated_chains import (
+from internal.run_tabulated_chains import (
     COSMO_PARAMS, ZEFF, LBOX, MASS_DEFINITION, AC_FIDUCIAL, TARGET_NGAL,
     build_halo_occupation, build_param_config, _make_rescale_occupation,
     _print_per_bin)
@@ -1614,7 +1614,7 @@ def measure_satellite_profile(args):
         raise SystemExit(
             f"{args.nisp_path} lacks {missing}.\nThe profile needs the exact "
             f"SOAP host link. Rebuild the catalogue with:\n"
-            f"  python example_scripts/precompute_subhalo_catalogue.py --nisp "
+            f"  python internal/precompute_subhalo_catalogue.py --nisp "
             f"--soap_path {args.soap_path} "
             f"--output_dir {os.path.dirname(args.nisp_path)}\n"
             f"then point --nisp_path at the NISP_catalogue_rebuilt.parquet "

@@ -112,7 +112,7 @@ def parse_args():
                         "and the joint batched likelihood against the NumPy "
                         "path, with the satellite profile pinned.")
     p.add_argument("--n_logM_bins_wgg", type=int, default=24,
-                   help="24 validated; 16 leaves ~6% cc binning errors")
+                   help="24 validated; 16 leaves ~6%% cc binning errors")
     p.add_argument("--sat_kernel_weighting", default="occupation",
                    choices=("occupation", "static"),
                    help="2-halo satellite kernel centre for --wgg. "

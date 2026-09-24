@@ -58,8 +58,8 @@ reproduces the reference cov_wgg exactly; only the inputs and items 4/7 change i
 
 Usage
 -----
-    python example_scripts/compute_gaussian_covariance.py            # tabulation binning
-    python example_scripts/compute_gaussian_covariance.py --validate # reproduce the old cov
+    python internal/compute_gaussian_covariance.py            # tabulation binning
+    python internal/compute_gaussian_covariance.py --validate # reproduce the old cov
 """
 
 import argparse
@@ -73,7 +73,7 @@ from scipy.interpolate import interp1d
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from HOD_NRV.HOD_analytical.halo_model import HaloModel
-from example_scripts.run_tabulated_chains import COSMO_PARAMS, ZEFF, LBOX
+from internal.run_tabulated_chains import COSMO_PARAMS, ZEFF, LBOX
 
 FLAM = "/sps/euclid/Users/rpaviot/flamingo"
 N_PART_CATALOGUE = 232982044          # rows in hydro_..._0.1percent.parquet

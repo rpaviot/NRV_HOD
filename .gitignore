@@ -206,21 +206,28 @@ HOD_NRV/utilsf/subhalo_catalogue.py
 HOD_NRV/utilsf/measure_beta_nl.py
 HOD_NRV/utilsf/measure_beta_nl_xi.py
 HOD_NRV/HOD_analytical/emu_numerical.py
-example_scripts/compare_beta_nl_emulator_vs_sim.py
 #common_test/precompute_subhalo_catalogue.py
 #common_test/cross_check_nfw_vs_subhalo.py  
-example_scripts/cross_check_emulator_grid.py
-example_scripts/cross_check_emulator_grid_wgg.py
-example_scripts/run_chains_all.py
-example_scripts/run_emulator_grid_wgg.py 
-example_scripts/run_emulator_grid_wgg.sh
-example_scripts/baryonify_snapshot.py
-example_scripts/baryonified_particles_*.parquet
 param_grid_full.parquet
 # Local validation scratch
-example_scripts/check_xi_tree_one_case.py
-example_scripts/test_bias.py
-example_scripts/precompute_xi_tree_grid.py
-example_scripts/check_xi_threshold_continuity.py
-example_scripts/inspect_xi_hh_cache.py
 check_xi_tree_one_case.png
+
+# example_scripts/ ships only the validation tests; everything else there is
+# local scratch (deprecated NN-emulator grids, benchmarks, one-off comparisons)
+example_scripts/*
+!example_scripts/CLAUDE.md
+!example_scripts/null_test_analytical.py
+!example_scripts/cross_check_analytical_numerical.py
+!example_scripts/numerical_dsigma_example.py
+!example_scripts/cross_check_tabulated.py
+
+# internal/ is the tracked production pipeline; its cluster drivers are not
+internal/slurm_*.sh
+!internal/slurm_tabulated_chains.sh
+!internal/slurm_tabulated_precompute.sh
+internal/dbg_*
+
+# Deprecated NN emulator (superseded by the tabulated method)
+HOD_NRV/utilsf/emulator_nn_flax.py
+HOD_NRV/utilsf/emulator_utils.py
+EMULATOR_README.md

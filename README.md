@@ -2,8 +2,8 @@
 
 
 **NRV stands for Nextgen Realisations of Virialized structures.**
-This is an HOD code wrapped around an emulator that can performs halo occupation fit 
-to projected clustering and galaxy-galaxy lensing 2-point functions.
+This is an HOD code that performs halo occupation fits to projected clustering
+and galaxy-galaxy lensing 2-point functions.
 
 The code is divided in two parts:
 
