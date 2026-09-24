@@ -2317,6 +2317,8 @@ def measure_xi_hh_vs_emulator(args):
     """
     from dark_emulator import darkemu
     from HOD_NRV.HOD_numerical.twopoint_calculator.standard_two_point_calculator import compute_corr
+    # beta^NL tooling (local module, gitignored: scp it where this runs)
+    from HOD_NRV.utilsf.measure_beta_nl_xi import measure_xi_hh_thresholds
 
     c = COSMO_PARAMS; h = c["h"]
     emu = darkemu.base_class()
@@ -2328,33 +2330,42 @@ def measure_xi_hh_vs_emulator(args):
     r = np.sqrt(r_edges[1:] * r_edges[:-1])
 
     pos_p, w_p = _load_particles(args)
-    out = {"r": r, "r_edges": r_edges, "log_mthr": np.asarray(args.xi_log_mthr)}
-    for lm in args.xi_log_mthr:
-        Mthr = 10.0 ** lm
-        xi_e = np.asarray(emu.get_xiauto_massthreshold(r, Mthr, ZEFF))
-        xim_e = np.asarray(emu.get_xicross_massthreshold(r, Mthr, ZEFF))
-        out[f"emu_hh_{lm}"], out[f"emu_hm_{lm}"] = xi_e, xim_e
-        res = {}
-        for entry in args.xi_catalogues:
-            label, path = entry.split("=", 1)
-            df = pd.read_parquet(path, columns=["x", "y", "z", "mass"])
-            pos = np.ascontiguousarray(
-                df.loc[df["mass"] >= Mthr, ["x", "y", "z"]].values,
-                dtype=np.float64) % LBOX
-            _, xi = compute_corr("s", pos, r_edges, boxsize=LBOX)
-            _, xim = compute_corr("s", pos, r_edges, catalog2=pos_p,
+    lthr = np.asarray(args.xi_log_mthr, dtype=np.float64)
+    out = {"r": r, "r_edges": r_edges, "log_mthr": lthr}
+    emu_hh = {lm: np.asarray(emu.get_xiauto_massthreshold(r, 10.0 ** lm, ZEFF)) for lm in lthr}
+    emu_hm = {lm: np.asarray(emu.get_xicross_massthreshold(r, 10.0 ** lm, ZEFF)) for lm in lthr}
+    for lm in lthr:
+        out[f"emu_hh_{lm}"], out[f"emu_hm_{lm}"] = emu_hh[lm], emu_hm[lm]
+
+    res = {}
+    for entry in args.xi_catalogues:
+        label, path = entry.split("=", 1)
+        df = pd.read_parquet(path, columns=["x", "y", "z", "mass"])
+        pos = np.ascontiguousarray(df[["x", "y", "z"]].values, dtype=np.float64) % LBOX
+        logM = np.log10(df["mass"].values.astype(np.float64))
+        print(f"\n{label}: {path}")
+        # the beta^NL tooling's threshold xi_hh (all threshold pairs)
+        hh = measure_xi_hh_thresholds(pos, logM, lthr, LBOX, r_edges)
+        hm = []
+        for lm in lthr:
+            _, xim = compute_corr("s", pos[logM >= lm], r_edges, catalog2=pos_p,
                                   boxsize=LBOX, weights2=w_p)
-            res[label] = (len(pos), np.asarray(xi), np.asarray(xim))
-            out[f"{label}_hh_{lm}"], out[f"{label}_hm_{lm}"] = res[label][1:]
-            out[f"{label}_n_{lm}"] = len(pos)
-        labels = list(res)
+            hm.append(np.asarray(xim))
+        res[label] = (hh["N_above"], np.diagonal(hh["xi"], axis1=0, axis2=1).T, np.array(hm))
+        out[f"{label}_xi_thr_pairs"] = hh["xi"]            # (T, T, n_r)
+        out[f"{label}_N_above"] = hh["N_above"]
+        out[f"{label}_hm"] = np.array(hm)                   # (T, n_r)
+
+    labels = list(res)
+    for t, lm in enumerate(lthr):
         print(f"\n=== M200m >= 10^{lm} Msun/h: " + ", ".join(
-            f"{k} {v[0]:,} halos" for k, v in res.items()) + " ===")
+            f"{k} {res[k][0][t]:,} halos" for k in labels) + " ===")
         print(f"{'r':>7}" + "".join(f" {k + ' hh/emu':>16}" for k in labels)
               + "".join(f" {k + ' hm/emu':>16}" for k in labels))
         for j in range(len(r)):
-            print(f"{r[j]:7.3f}" + "".join(f" {res[k][1][j] / xi_e[j]:16.3f}" for k in labels)
-                  + "".join(f" {res[k][2][j] / xim_e[j]:16.3f}" for k in labels))
+            print(f"{r[j]:7.3f}"
+                  + "".join(f" {res[k][1][t, j] / emu_hh[lm][j]:16.3f}" for k in labels)
+                  + "".join(f" {res[k][2][t, j] / emu_hm[lm][j]:16.3f}" for k in labels))
     np.savez(args.output, **out)
     print(f"\nSaved -> {args.output}")
 
