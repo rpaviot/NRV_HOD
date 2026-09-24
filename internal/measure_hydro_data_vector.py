@@ -292,6 +292,14 @@ def parse_args():
                         "satellite from its linked host (perpendicular to "
                         "--rsd_axis). Separates a wrong profile family from "
                         "wrong offset physics (host-centred matter only).")
+    p.add_argument("--rotate_satellites", action="store_true",
+                   help="Satellite-only DeltaSigma, measured twice on the same "
+                        "particles: real positions, and each satellite rotated "
+                        "to a random azimuth about the line of sight through "
+                        "its SOAP host (projected host distance and LOS offset "
+                        "kept). real/rotated = matter tied to the satellite's "
+                        "actual position, which no HOD can carry.")
+    p.add_argument("--rotate_seeds", type=int, nargs="+", default=[1, 2])
     p.add_argument("--profile", action="store_true",
                    help="Measure the SATELLITE RADIAL PROFILE of the NISP "
                         "sample around its true hosts, and fit the "
@@ -2156,6 +2164,112 @@ def fit_hod_forms(args):
     print(f"Saved plot -> {plot_path}")
 
 
+def _load_particles(args):
+    """Subsampled (optionally mass-weighted) hydro particles.
+
+    Streamed so that only the subsample is ever materialised: reading all
+    233M rows to keep 2% costs ~15 GB of peak RSS for nothing.
+    """
+    rng = np.random.default_rng(args.particle_seed)
+    cols = ["x", "y", "z", "mass"]
+    chunks = []
+    pf = pq.ParquetFile(args.part_path)
+    for batch in pf.iter_batches(batch_size=5_000_000, columns=cols):
+        arr = np.column_stack([batch.column(c).to_numpy(zero_copy_only=False)
+                               for c in cols]).astype(np.float64)
+        if args.particle_fraction < 1.0:
+            arr = arr[rng.random(len(arr)) < args.particle_fraction]
+        chunks.append(arr)
+    p = np.concatenate(chunks); del chunks
+    pos_p = np.ascontiguousarray(p[:, :3])
+    w_p = None if args.no_mass_weight else np.ascontiguousarray(p[:, 3])
+    del p
+    print(f"particles: {len(pos_p):,} "
+          f"(fraction {args.particle_fraction}, "
+          f"{'unweighted' if w_p is None else 'mass-weighted'})")
+    return pos_p, w_p
+
+
+def measure_rotated_satellites(args):
+    """Satellite DeltaSigma at the real vs randomly rotated positions.
+
+    An HOD satellite is a point at some radius in its host at a random angle:
+    the matter it sees is, on average, the host profile seen from that offset
+    (what TabulatedDeltaSigma computes). A real satellite sits on its subhalo,
+    often inside an infalling group. Rotating every satellite about the line
+    of sight through its own SOAP host keeps the host, the projected distance
+    and the LOS offset, and destroys only the correlation between the
+    satellite's position and the matter around it. So, on the same particles:
+
+    real / rotated         matter tied to the satellite's actual position --
+                           beyond any HOD, sets the scale cut
+    rotated / tabulation   what the tabulation's bin-averaged host Sigma
+                           loses (compare with --truth_ds --truth_offsets)
+    """
+    cosmo = Cosmology(COSMO_PARAMS, mass_function="Tinker08",
+                      mass_definition=MASS_DEFINITION, use_dark_emulator=False,
+                      verbose=False, units_per_h=True)
+    RHO_M = cosmo.get_rho_m()
+    rp_bins = (np.geomspace(args.rp_min, args.rp_max, args.n_rp)
+               if args.rp_min is not None else np.asarray(np.load(args.ref_path)["rp_bins"]))
+
+    gal = _read_galaxies(args)
+    if "r_host" not in gal:
+        raise SystemExit("--rotate_satellites needs the rebuilt NISP catalogue "
+                         "(r_host, mass_200m) for the SOAP host link.")
+    halo_df = pd.read_parquet(args.hydro_host_path, columns=["x", "y", "z", "mass"])
+    hp = np.ascontiguousarray(halo_df[["x", "y", "z"]].values, dtype=np.float64) % LBOX
+    gp = np.ascontiguousarray(gal[["x", "y", "z"]].values, dtype=np.float64) % LBOX
+    idx, _ = _link_galaxies_to_hosts(
+        args, hp, gp, np.log10(halo_df["mass"].values.astype(np.float64)), gal)
+
+    sat = np.nonzero(gal["type"].values == 1)[0]
+    pos_s = gp[sat]
+    host = hp[idx[sat]]
+    d = pos_s - host
+    d -= LBOX * np.round(d / LBOX)
+    ax = "xyz".index(args.rsd_axis)
+    a, b = [k for k in range(3) if k != ax]
+    rho = np.hypot(d[:, a], d[:, b])
+    print(f"satellites: {len(sat):,}; projected host offset median "
+          f"{np.median(rho):.3f} Mpc/h")
+
+    pos_p, w_p = _load_particles(args)
+    bins_comp = np.geomspace(5e-3, 120, 201)   # as the data vector
+
+    def _ds(pos):
+        _, ds = compute_galaxy_lensing(
+            pos, pos_p, LBOX, args.rsd_axis, RHO_M, rp_bins,
+            weights_part=w_p, chi_max=args.chi_max, bins_comp=bins_comp)
+        return np.asarray(ds)
+
+    print("DeltaSigma, real satellite positions ...")
+    ds_real = _ds(pos_s)
+    ds_rot = []
+    for seed in args.rotate_seeds:
+        phi = np.random.default_rng(seed).uniform(0.0, 2.0 * np.pi, len(sat))
+        rot = pos_s.copy()
+        rot[:, a] = host[:, a] + rho * np.cos(phi)
+        rot[:, b] = host[:, b] + rho * np.sin(phi)
+        rot %= LBOX
+        print(f"DeltaSigma, rotated (seed {seed}) ...")
+        ds_rot.append(_ds(rot))
+    ds_rot = np.array(ds_rot)
+
+    rp = np.sqrt(rp_bins[1:] * rp_bins[:-1])
+    print(f"\n{'rp':>8} {'real':>10} " + " ".join(f"{'rot s' + str(s):>10}" for s in args.rotate_seeds)
+          + f" {'real/rot':>9} {'seed spread%':>12}")
+    for j in range(len(rp)):
+        m = ds_rot[:, j].mean()
+        print(f"{rp[j]:8.3f} {ds_real[j]:10.4f} " + " ".join(f"{v:10.4f}" for v in ds_rot[:, j])
+              + f" {ds_real[j] / m:9.3f} {100 * np.ptp(ds_rot[:, j]) / abs(m):12.2f}")
+    np.savez(args.output, rp_centers=rp, rp_bins=rp_bins, ds_real=ds_real,
+             ds_rotated=ds_rot, seeds=np.asarray(args.rotate_seeds),
+             particle_fraction=args.particle_fraction, chi_max=args.chi_max,
+             n_sat=len(sat))
+    print(f"\nSaved -> {args.output}")
+
+
 def main():
     args = parse_args()
 
@@ -2181,6 +2295,13 @@ def main():
             args.output = os.path.join(os.path.dirname(REF_PATH),
                                        "hydro_measured_satellite_profile.npz")
         measure_satellite_profile(args)
+        return
+
+    if args.rotate_satellites:
+        if args.output == default_out:
+            args.output = os.path.join(os.path.dirname(REF_PATH),
+                                       "hydro_satellites_rotated.npz")
+        measure_rotated_satellites(args)
         return
 
     if args.truth_ds:
@@ -2234,26 +2355,7 @@ def main():
     ngal = len(pos_g)
     print(f"galaxies: {ngal:,}  (ngal = {ngal/LBOX**3:.3e} (Mpc/h)^-3)")
 
-    # ---- particles (subsampled, mass-weighted) -----------------------------
-    # Streamed so that only the subsample is ever materialised: reading all
-    # 233M rows to keep 2% costs ~15 GB of peak RSS for nothing.
-    rng = np.random.default_rng(args.particle_seed)
-    cols = ["x", "y", "z", "mass"]
-    chunks = []
-    pf = pq.ParquetFile(args.part_path)
-    for batch in pf.iter_batches(batch_size=5_000_000, columns=cols):
-        arr = np.column_stack([batch.column(c).to_numpy(zero_copy_only=False)
-                               for c in cols]).astype(np.float64)
-        if args.particle_fraction < 1.0:
-            arr = arr[rng.random(len(arr)) < args.particle_fraction]
-        chunks.append(arr)
-    p = np.concatenate(chunks); del chunks
-    pos_p = np.ascontiguousarray(p[:, :3])
-    w_p = None if args.no_mass_weight else np.ascontiguousarray(p[:, 3])
-    del p
-    print(f"particles: {len(pos_p):,} "
-          f"(fraction {args.particle_fraction}, "
-          f"{'unweighted' if w_p is None else 'mass-weighted'})")
+    pos_p, w_p = _load_particles(args)
 
     # ---- DeltaSigma (real space, mass-weighted galaxy x particle) ----------
     print("Measuring DeltaSigma ...")
