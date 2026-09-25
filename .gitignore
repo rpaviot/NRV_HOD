@@ -220,6 +220,7 @@ example_scripts/*
 !example_scripts/numerical_dsigma_example.py
 !example_scripts/cross_check_tabulated.py
 !example_scripts/compute_assembly_bias.py
+!example_scripts/benchmark_dsigma_convergence.py
 
 # internal/ is the tracked production pipeline; its cluster drivers are not
 internal/slurm_*.sh

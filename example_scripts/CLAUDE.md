@@ -1,6 +1,6 @@
 # example_scripts — Validation Tests
 
-Only the validation tests, plus the assembly-bias environment builder, are tracked here. The production pipeline (catalogue
+Only the validation tests, the downsampling benchmark and the assembly-bias environment builder are tracked here. The production pipeline (catalogue
 building, tabulation, covariance, chains, hydro measurements) lives in
 [`../internal/`](../internal/); everything else in this directory is local
 scratch and gitignored.
@@ -11,6 +11,7 @@ scratch and gitignored.
 | `numerical_dsigma_example.py` | Builds `baseline_dsigma_cache.npz` for the test below |
 | `cross_check_analytical_numerical.py` | Analytical vs numerical ΔΣ for one HOD parameter set |
 | `cross_check_tabulated.py` | Tabulated (TabCorr-style) ΔΣ / w_gg vs the full Monte-Carlo calculation |
+| `benchmark_dsigma_convergence.py` | Particle / galaxy downsampling and number of realizations needed for converged direct ΔΣ |
 | `compute_assembly_bias.py` | Not a test: builds the environment columns (δ, tidal shear, mass-binned ranks) that assembly bias uses |
 
 ## `null_test_analytical.py` — analytical vs pyccl

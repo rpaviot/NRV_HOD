@@ -19,8 +19,8 @@ c = NaN) get the analytical model's c(M) (Duffy08, M200m, z = zeff).
         --particle_path .../DMO_flamingo_0058_downsampled_0.5percent.parquet \
         --cache baseline_dsigma_cache_DMO_distinct.npz
 
-Other scripts (benchmark_dsigma_convergence.py, cross_check_analytical_numerical.py)
-consume this cache rather than recomputing the baseline.
+cross_check_analytical_numerical.py consumes this cache rather than recomputing
+the baseline.
 
 Data: Flamingo L1000N1800
   - Halos:     /Users/ler13nrv/Documents/flamingo_data/parquet_halo_catalogue_L1000N1800.parquet
