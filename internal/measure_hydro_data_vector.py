@@ -62,6 +62,7 @@ Usage (cluster):
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -209,6 +210,15 @@ def parse_args():
                         "handful of mislinked satellites there (nearest-centre "
                         "link, model ~0) would otherwise dominate the "
                         "deviance.")
+    p.add_argument("--conformity", action="store_true",
+                   help="With --hod_env: measure galactic conformity, "
+                        "<N_sat | an ELG central present> / <N_sat | none> at "
+                        "fixed mass, both mass-only and within the (mass, "
+                        "environment quantile) cells -- the latter is what a "
+                        "model that already carries assembly bias has left to "
+                        "explain. Converted to kappa_EE = R^(-1/alpha) of "
+                        "ELG_satellite_conformity_cutoff with alpha from the "
+                        "--fit_ab spec.")
     p.add_argument("--link_cache", default=LINK_CACHE,
                    help="npz cache of the galaxy->host KD-tree link.")
     p.add_argument("--fit_hod", default=None, metavar="MEASURED_HOD_NPZ",
@@ -1114,6 +1124,9 @@ def measure_hod_environment(args):
         _fit_ab_to_env_split(args, logM_h, env, flat, logM, n_host, n_cen,
                              n_sat, mean_env)
 
+    if args.conformity:
+        _measure_conformity(args, idx, is_sat, len(halo), mbin, ebin, logM)
+
     fig, axes = plt.subplots(1, 3, figsize=(15, 4.5))
     M = 10.0**logM
     cmap = plt.get_cmap("viridis")
@@ -1146,6 +1159,100 @@ def measure_hod_environment(args):
     plot_path = os.path.splitext(args.output)[0] + ".png"
     fig.savefig(plot_path, dpi=150)
     print(f"Saved plot -> {plot_path}")
+
+
+# ----------------------------------------------------------------------------
+# Galactic conformity: does a halo with an ELG central host more satellites?
+# ----------------------------------------------------------------------------
+#
+# ELG_satellite_conformity_cutoff multiplies <N_sat> in halos WITH a central by
+# kappa_EE^(-alpha) relative to halos without one (M1 -> kappa_EE*M1), at every
+# mass. That ratio R is measured here per halo: lam1 = N_sat / N_host over the
+# halos that carry a NISP central, lam0 over those that do not. Pooled over
+# cells with a common R and a free lam0 per cell, the Poisson likelihood
+# profiles to a 1D score, solved exactly. Within (mass, env quantile) cells
+# the environment-driven part of the correlation -- which the variant AB
+# already generates -- is taken out.
+
+def _conformity_ratio(Hc, Hn, Sc, Sn):
+    """ML common ratio R = lam1/lam0 over cells, with its 1-sigma error.
+
+    Cell k: Sc ~ Pois(R lam0_k Hc), Sn ~ Pois(lam0_k Hn). Profiling lam0_k
+    gives the score sum_k [Sc/R - Hc (Sc + Sn) / (R Hc + Hn)] = 0.
+    """
+    from scipy.optimize import brentq
+    use = (Hc > 0) & (Hn > 0) & (Sc + Sn > 0)
+    Hc, Hn, Sc, Sn = (np.asarray(a, dtype=np.float64)[use]
+                      for a in (Hc, Hn, Sc, Sn))
+    if not use.any():
+        return np.nan, np.nan
+
+    def score(R):
+        return np.sum(Sc / R - Hc * (Sc + Sn) / (R * Hc + Hn))
+
+    R = brentq(score, 1e-4, 1e4)
+    # observed information of the profile likelihood
+    info = np.sum(Sc / R**2 - (Hc**2) * (Sc + Sn) / (R * Hc + Hn)**2)
+    return R, (1.0 / np.sqrt(info) if info > 0 else np.nan)
+
+
+def _measure_conformity(args, idx, is_sat, n_halo, mbin, ebin, logM):
+    nM, nE = len(logM), args.n_env_bins
+    ncen_h = np.bincount(idx[~is_sat], minlength=n_halo)
+    nsat_h = np.bincount(idx[is_sat], minlength=n_halo)
+    has = ncen_h > 0
+    print(f"\n=== conformity: <N_sat | central> / <N_sat | no central> ===")
+    print(f"  halos with >1 NISP central: {(ncen_h > 1).sum():,} "
+          f"(treated as 'has a central')")
+
+    ok_m = (mbin >= 0) & (mbin < nM)
+
+    def cells(key, n):
+        k = np.where(ok_m, key, -1)
+        sel = k >= 0
+        f = lambda w: np.bincount(k[sel], weights=w[sel], minlength=n)
+        one = np.ones(n_halo)
+        return (f(one * has), f(one * ~has),
+                f(nsat_h * has), f(nsat_h * ~has))
+
+    Hc, Hn, Sc, Sn = cells(mbin, nM)
+    print(f"{'logM':>6} {'H_cen':>9} {'H_nocen':>9} {'lam1':>9} {'lam0':>9} "
+          f"{'R':>7} {'err':>6}")
+    for m in range(nM):
+        if Sc[m] + Sn[m] < 20 or Hc[m] == 0 or Hn[m] == 0:
+            continue
+        l1, l0 = Sc[m] / Hc[m], Sn[m] / Hn[m]
+        R = l1 / l0 if l0 > 0 else np.nan
+        e = R * np.sqrt(1 / max(Sc[m], 1) + 1 / max(Sn[m], 1))
+        print(f"{logM[m]:6.2f} {Hc[m]:9.0f} {Hn[m]:9.0f} {l1:9.5f} {l0:9.5f} "
+              f"{R:7.3f} {e:6.3f}")
+
+    R_m, eR_m = _conformity_ratio(Hc, Hn, Sc, Sn)
+    ok_e = ok_m & (ebin >= 0)
+    Hc2, Hn2, Sc2, Sn2 = cells(np.where(ok_e, mbin * nE + ebin, -1), nM * nE)
+    R_me, eR_me = _conformity_ratio(Hc2, Hn2, Sc2, Sn2)
+    print(f"  pooled R, mass cells only       = {R_m:.4f} "
+          f"+- {eR_m:.4f}")
+    print(f"  pooled R, (mass, env q{nE}) cells = {R_me:.4f} +- {eR_me:.4f}"
+          f"   <- what is left once the AB is in the model")
+
+    alpha = None
+    if args.fit_ab:
+        specs = (json.load(open(args.fit_ab)) if os.path.exists(args.fit_ab)
+                 else json.loads(args.fit_ab))
+        spec = next((s for s in specs if s.get("label") == args.fit_ab_label),
+                    specs[0])
+        alpha = float(spec["alpha"])
+    if alpha:
+        for tag, R in (("mass", R_m), ("mass+env", R_me)):
+            print(f"  kappa_EE ({tag}) = R^(-1/alpha) = "
+                  f"{R ** (-1.0 / alpha):.4f}   (alpha = {alpha:.3f})")
+
+    out = os.path.splitext(args.output)[0] + "_conformity.npz"
+    np.savez(out, logM=logM, Hc=Hc, Hn=Hn, Sc=Sc, Sn=Sn,
+             R_mass=R_m, R_mass_err=eR_m, R_mass_env=R_me,
+             R_mass_env_err=eR_me, alpha=np.nan if alpha is None else alpha)
+    print(f"Saved conformity -> {out}")
 
 
 # ----------------------------------------------------------------------------
