@@ -73,7 +73,7 @@ docs = [
 
 [project.urls]
 Homepage = "https://github.com/rpaviot/NRV_HOD"
-Documentation = "https://nrvpy.readthedocs.io"
+Documentation = "https://nrv-hod.readthedocs.io"
 Repository = "https://github.com/yourusername/NRV_HOD.git"
 Issues = "https://github.com/yourusername/NRV_HOD/issues"
 

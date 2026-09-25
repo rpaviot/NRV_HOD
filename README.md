@@ -4,7 +4,7 @@
 distribution (HOD) code that fits projected galaxy clustering w_gg(r_p) and
 galaxy–galaxy lensing ΔΣ(r_p).
 
-Documentation: https://nrvpy.readthedocs.io
+Documentation: https://nrv-hod.readthedocs.io
 
 ## Two models
 
@@ -67,7 +67,7 @@ rp, ds = halo.compute_galaxy_lensing(rp_bins)
 
 `example_scripts/` holds the tests against independent references (pyccl,
 the direct Monte-Carlo pipeline, analytical vs numerical); see the
-[validation page](https://nrvpy.readthedocs.io/en/latest/validation.html).
+[validation page](https://nrv-hod.readthedocs.io/en/latest/validation.html).
 
 ## Authors
 
