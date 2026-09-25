@@ -99,7 +99,11 @@ PRIOR_RANGES = {
     "lambda_NFW": (0.1,   2.0),
     "f_exp":      (0.0,   0.9),
     "tau":        (1.0,   10.0),
-    "kappa_EE":   (0.5,   1.0),
+    # M1 -> kappa_EE*M1 in halos with a central: <Nsat|cen>/<Nsat|none> =
+    # kappa_EE^-alpha. Measured on the hydro NISP sample (2026-09-25, pooled
+    # over mass): 0.61-0.68 (all satellites), 0.50-0.54 (within R200m) -- the
+    # old (0.5, 1.0) put it on the edge. kappa > 1 allows anti-conformity.
+    "kappa_EE":   (0.2,   1.5),
     # B_cent/B_sat shift logMmin and logM1 by B*fE under ab_method="mass", so
     # these are DEX, not the occupation amplitudes they were under "direct".
     # The direct-vs-tabulated null test (job 58367900) calibrates the lever:
