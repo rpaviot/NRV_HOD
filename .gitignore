@@ -232,3 +232,4 @@ internal/dbg_*
 HOD_NRV/utilsf/emulator_nn_flax.py
 HOD_NRV/utilsf/emulator_utils.py
 EMULATOR_README.md
+!docs/requirements.txt

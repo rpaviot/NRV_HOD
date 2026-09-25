@@ -26,9 +26,9 @@ class HaloOccupation:
     Parameters
     ----------
     cosmology : dict
-        Cosmological parameters dictionary containing:
-        - 'Om0': Matter density parameter at z=0
-        - 'Ob0': Baryon density parameter at z=0
+        Cosmological parameters for the pyccl cosmology, as in the analytical
+        HaloModel: 'h', 'Omc', 'Omb', 'n_s', 'A_s' (or 's8'), optionally
+        'Omnu' (or 'mnu').
     zeff : float
         Effective redshift for calculations
     Lbox : float
@@ -83,7 +83,8 @@ class HaloOccupation:
     --------
     >>> # Basic usage
     >>> halo = HaloOccupation(
-    ...     cosmology={'Om0': 0.3, 'Ob0': 0.049},
+    ...     cosmology={'h': 0.68, 'Omc': 0.26, 'Omb': 0.049,
+    ...                'A_s': 2.1e-9, 'n_s': 0.967},
     ...     zeff=1.0, Lbox=1000, column_mapping=cm,
     ...     mass_definition="Mvir", DataFrame=df
     ... )
