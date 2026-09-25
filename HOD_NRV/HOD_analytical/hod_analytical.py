@@ -112,7 +112,9 @@ def validate_hod_params(hod_type: str, params: Dict) -> bool:
 @jit
 def lrg_N_central(logM: jnp.ndarray, Ac: float, log10Mmin: float, sig_M: float) -> jnp.ndarray:
     """
-    LRG central occupation (Zheng+07 style).
+    LRG central occupation (Zheng+07 style), with the sqrt(2) of the
+    Gaussian CDF in the denominator, as in the numerical LRG_Zheng07:
+        N_cen = Ac/2 * (1 + erf((logM - log10Mmin) / (sqrt(2) * sig_M)))
 
     Parameters
     ----------
@@ -130,7 +132,7 @@ def lrg_N_central(logM: jnp.ndarray, Ac: float, log10Mmin: float, sig_M: float) 
     N_cen : array
         Mean central occupation
     """
-    return Ac / 2.0 * (1.0 + erf_jax((logM - log10Mmin) / sig_M))
+    return Ac / 2.0 * (1.0 + erf_jax((logM - log10Mmin) / (jnp.sqrt(2.0) * sig_M)))
 
 
 @jit

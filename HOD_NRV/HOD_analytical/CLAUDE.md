@@ -50,7 +50,7 @@ Base cosmology class. Initializes pyccl cosmology, mass definition (default 200c
 ### `hod_analytical.py` - HOD Occupation Functions and Classes
 
 **Occupation functions** (all `@jit`):
-- `lrg_N_central()` - LRG Zheng+07 (error function)
+- `lrg_N_central()` - LRG Zheng+07 (error function, erf((logM-Mmin)/(sqrt2*sig_M)), same as numerical LRG_Zheng07)
 - `elg_ghod_N_central()` - ELG Gaussian HOD
 - `elg_sfr_N_central()` - ELG SFR-based (Gaussian + power-law tail)
 - `unified_N_satellite()` - power-law with kappa*Mmin cutoff

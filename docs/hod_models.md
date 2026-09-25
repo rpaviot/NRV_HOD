@@ -19,13 +19,12 @@ numerical one. Below, $\mu = \log_{10} M$.
 **LRG** (Zheng et al. 2007) — a smoothed step, rising to $A_c$ above
 $M_{\min}$:
 
-$$\langle N_{\rm cen}\rangle = \frac{A_c}{2}\left[1 + {\rm erf}\left(\frac{\mu - \mu_{\min}}{\sigma_M}\right)\right]$$
+$$\langle N_{\rm cen}\rangle = \frac{A_c}{2}\left[1 + {\rm erf}\left(\frac{\mu - \mu_{\min}}{\sqrt{2}\,\sigma_M}\right)\right]$$
 
-:::{note}
-The numerical model divides by $\sqrt{2}\,\sigma_M$ instead of $\sigma_M$, so
-the same `sig_M` gives a step $\sqrt{2}$ wider there. The ELG forms below are
-identical in the two models.
-:::
+With the $\sqrt{2}$, $\sigma_M$ is the standard deviation in $\log_{10} M$
+of the Gaussian whose cumulative is the step. Zheng et al. (2007) and pyccl's
+`HaloProfileHOD` omit it (pyccl also uses $\ln M$), so their $\sigma$ equals
+$\sqrt{2}\,\sigma_M$ here ($\sqrt{2}\ln 10\,\sigma_M$ for pyccl).
 
 **ELG_GHOD** (Gaussian HOD; Avila et al. 2020) — star-forming centrals live
 in a narrow mass range:
