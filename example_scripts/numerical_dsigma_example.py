@@ -6,9 +6,18 @@ Canonical producer of baseline numerical DeltaSigma results.
 
 This script:
 1. Loads Flamingo L1000N1800 halo + particle catalogs
-2. Populates ELG_GHOD galaxies with rescaled Ac/As to target n_gal
+2. Populates ELG_mHMQ galaxies with rescaled Ac/As to target n_gal
 3. Computes galaxy-galaxy lensing (DeltaSigma) for N_BASELINE realizations
-4. Saves results to baseline_dsigma_cache.npz
+4. Saves results AND the HOD (type + all parameters) to baseline_dsigma_cache.npz,
+   so the analytical side evaluates exactly the same occupation
+
+Halos without a concentration (promoted halos of a distinct-halo catalogue,
+c = NaN) get the analytical model's c(M) (Duffy08, M200m, z = zeff).
+
+    python numerical_dsigma_example.py \
+        --halo_path  .../host_catalogue_distinct_excl.parquet \
+        --particle_path .../DMO_flamingo_0058_downsampled_0.5percent.parquet \
+        --cache baseline_dsigma_cache_DMO_distinct.npz
 
 Other scripts (benchmark_dsigma_convergence.py, cross_check_analytical_numerical.py)
 consume this cache rather than recomputing the baseline.
@@ -18,6 +27,7 @@ Data: Flamingo L1000N1800
   - Particles: /Users/ler13nrv/Documents/flamingo_data/particle_catalogue_L1000N1800_downsampled.parquet
 """
 
+import argparse
 import time
 import numpy as np
 import pandas as pd
@@ -29,13 +39,24 @@ from HOD_NRV.HOD_numerical.HOD_models import rescale_Ac_to_target_ngal
 # Configuration
 # ============================================================================
 
-HALO_PATH = "/Users/ler13nrv/Documents/flamingo_data/parquet_halo_catalogue_L1000N1800.parquet"
-PARTICLE_PATH = "/Users/ler13nrv/Documents/flamingo_data/particle_catalogue_L1000N1800_downsampled.parquet"
+parser = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+parser.add_argument("--halo_path", default="/Users/ler13nrv/Documents/flamingo_data/"
+                    "parquet_halo_catalogue_L1000N1800.parquet")
+parser.add_argument("--particle_path", default="/Users/ler13nrv/Documents/flamingo_data/"
+                    "particle_catalogue_L1000N1800_downsampled.parquet")
+parser.add_argument("--cache", default="baseline_dsigma_cache.npz")
+parser.add_argument("--n_real", type=int, default=10)
+args = parser.parse_args()
+
+HALO_PATH = args.halo_path
+PARTICLE_PATH = args.particle_path
 
 # Baseline configuration
-N_BASELINE = 10
+N_BASELINE = args.n_real
 BASE_SEED = 1000
-CACHE_FILE = "baseline_dsigma_cache.npz"
+CACHE_FILE = args.cache
+HOD_TYPE = "ELG_mHMQ"    # analytical name: ELG_MHMQ
 
 Lbox = 681.0        # Mpc/h
 zeff = 1.0
@@ -58,7 +79,7 @@ dict_cosmo = {
     }
 
 
-# Base HOD parameters for ELG_GHOD (Ac and As will be rescaled)
+# Base HOD parameters for ELG_mHMQ (Ac and As will be rescaled)
 base_hod_params = {
     "As": 0.3,
     "Mmin": 12.7,
@@ -85,6 +106,18 @@ print("=" * 60)
 print("\nLoading halo catalog...")
 df_halo = pd.read_parquet(HALO_PATH)
 print(f"  {len(df_halo)} halos loaded")
+no_c = ~np.isfinite(df_halo["c"].to_numpy())
+if no_c.any():
+    import pyccl as ccl
+    cosmo_ccl = ccl.Cosmology(Omega_c=dict_cosmo["Omc"], Omega_b=dict_cosmo["Omb"],
+                              h=dict_cosmo["h"], A_s=dict_cosmo["A_s"],
+                              n_s=dict_cosmo["n_s"])
+    cM = ccl.halos.ConcentrationDuffy08(mass_def=ccl.halos.MassDef200m)
+    M_nat = df_halo["mass"].to_numpy()[no_c] / dict_cosmo["h"]   # Msun
+    df_halo.loc[no_c, "c"] = cM(cosmo_ccl, M_nat, 1.0 / (1.0 + zeff))
+    print(f"  {no_c.sum():,} halos without c -> Duffy08 c(M200m)")
+if "promoted" in df_halo:
+    print(f"  promoted (distinct-halo) halos: {int(df_halo['promoted'].sum()):,}")
 
 print("Loading particle catalog...")
 df_part = pd.read_parquet(PARTICLE_PATH)
@@ -113,8 +146,8 @@ halo = HaloOccupation(
 # Set HOD model and rescale Ac/As
 # ============================================================================
 
-print("\nSetting HOD model: ELG_mHMQ")
-halo.set_halo_model("ELG_mHMQ")
+print(f"\nSetting HOD model: {HOD_TYPE}")
+halo.set_halo_model(HOD_TYPE)
 
 print(f"Rescaling Ac/As to target n_gal = {target_ngal:.2e} (Mpc/h)^-3 ...")
 Ac_rescaled, As_rescaled = rescale_Ac_to_target_ngal(
@@ -170,6 +203,12 @@ np.savez(
     ngal=ngals,
     Ac=Ac_rescaled[0],
     As=As_rescaled[0],
+    hod_type=HOD_TYPE,
+    hod_param_names=np.array(list(base_hod_params)),
+    hod_param_values=np.array([float(np.ravel(hod_params[k])[0])
+                               for k in base_hod_params]),
+    halo_path=HALO_PATH,
+    particle_path=PARTICLE_PATH,
 )
 print(f"\nSaved cache to {CACHE_FILE}")
 

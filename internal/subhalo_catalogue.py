@@ -418,7 +418,8 @@ def _m200m_from_apertures(M_ap, r_ap, rho_thr):
 
 
 def build_distinct_halo_catalogue(filepath, h=0.681, Lbox=681.0,
-                                  mass_threshold=1e11, gal_rows=None):
+                                  mass_threshold=1e11, gal_rows=None,
+                                  aperture="inclusive"):
     """Host catalogue under a DISTINCT-halo (Rockstar-like) convention.
 
     SOAP here sits on HBT+: a host is a FOF group and every other subhalo in
@@ -435,7 +436,14 @@ def build_distinct_halo_catalogue(filepath, h=0.681, Lbox=681.0,
        is dominated by the host's particles and would let them absorb
        neighbours.
     2. Satellite candidates get M200m from the InclusiveSphere apertures
-       (_m200m_from_apertures); centrals keep SO/200_mean.
+       (_m200m_from_apertures); centrals keep SO/200_mean. Their R200m is
+       the radius of that M200m at 200 rho_m.
+       aperture="exclusive" uses the ExclusiveSphere (bound-only) apertures
+       instead -- the inclusive ones sweep up the neighbouring host's
+       particles (median 1.75x the bound mass on hydro) -- and removes their
+       mass-dependent low bias (-0.07 to -0.20 dex vs SO/200_mean) with the
+       median log(M_SO / M_excl) of the FOF centrals, calibrated in bins of
+       log M_excl (Rockstar BOUND_PROPS-like).
     3. A candidate with M200m >= mass_threshold is distinct unless its centre
        lies inside R200m of a MORE MASSIVE candidate (order-independent, as
        Rockstar's upid). Candidates below the threshold cannot absorb anything
@@ -479,16 +487,42 @@ def build_distinct_halo_catalogue(filepath, h=0.681, Lbox=681.0,
           f"({100 * len(out_sat) / len(sat):.1f}%)")
     del d, r_sat, hsat
 
-    # 2. their M200m from the inclusive apertures
-    aps = [int(k[:-3]) for k in f["InclusiveSphere"].keys() if k.endswith("kpc")]
+    # 2. their M200m from the apertures
+    grp = {"inclusive": "InclusiveSphere", "exclusive": "ExclusiveSphere"}[aperture]
+    aps = [int(k[:-3]) for k in f[grp].keys() if k.endswith("kpc")]
     aps = sorted(aps)
     r_ap = np.array(aps) / 1e3 / a                           # phys kpc -> cMpc
-    M_ap = np.stack([f[f"InclusiveSphere/{r}kpc/TotalMass"][:][out_sat]
-                     for r in aps], axis=1).astype(np.float64)
-    M_prom = _m200m_from_apertures(M_ap, r_ap, rho_thr)
-    del M_ap
-    print(f"  M200m interpolated for {100 * np.isfinite(M_prom).mean():.1f}% "
-          f"of them")
+
+    def ap_m200m(rows):
+        M_ap = np.stack([f[f"{grp}/{r}kpc/TotalMass"][:][rows]
+                         for r in aps], axis=1).astype(np.float64)
+        return _m200m_from_apertures(M_ap, r_ap, rho_thr)
+
+    M_prom = ap_m200m(out_sat)
+    print(f"  {grp} M200m interpolated for "
+          f"{100 * np.isfinite(M_prom).mean():.1f}% of them")
+    if aperture == "exclusive":
+        # calibrate the bound-only bias on the FOF centrals, in the observed
+        # log M_excl so the correction can be applied to the promoted halos
+        thr0 = 0.5 * mass_threshold / h / 1e10
+        cc = np.nonzero(cen & (M >= thr0))[0]
+        Mc_ex = ap_m200m(cc)
+        good = np.isfinite(Mc_ex) & (Mc_ex > 0)
+        lx, dl = np.log10(Mc_ex[good]), np.log10(M[cc][good] / Mc_ex[good])
+        edges = np.arange(np.floor(lx.min() * 10) / 10, lx.max() + 0.1, 0.1)
+        ib = np.digitize(lx, edges) - 1
+        cnt = np.bincount(ib, minlength=len(edges) - 1)[:len(edges) - 1]
+        use = np.nonzero(cnt >= 50)[0]
+        mid = 0.5 * (edges[use] + edges[use + 1])
+        med = np.array([np.median(dl[ib == i]) for i in use])
+        print(f"  bound-only bias on {good.sum():,} centrals, "
+              f"median log(M_SO/M_excl):")
+        for i in range(0, len(use), max(1, len(use) // 12)):
+            print(f"    log M_excl [Msun/h] {mid[i] + 10 + np.log10(h):6.2f}  "
+                  f"{med[i]:+.3f}  (N {cnt[use[i]]:,})")
+        corr = np.interp(np.log10(np.where(M_prom > 0, M_prom, 1.0)), mid, med)
+        M_prom = M_prom * 10.0 ** corr                        # flat beyond the ends
+        del Mc_ex, lx, dl, ib
 
     # 3. distinct-halo selection among candidates above the threshold
     thr = mass_threshold / h / 1e10                          # -> 1e10 Msun

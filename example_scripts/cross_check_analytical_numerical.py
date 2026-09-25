@@ -22,7 +22,10 @@ from HOD_NRV.HOD_analytical.halo_model import HaloModel
 # Shared configuration
 # ============================================================================
 
-BASELINE_CACHE = "baseline_dsigma_cache.npz"
+import argparse
+_ap = argparse.ArgumentParser()
+_ap.add_argument("--cache", default="baseline_dsigma_cache.npz")
+BASELINE_CACHE = _ap.parse_args().cache
 
 Lbox = 681.0   # Mpc/h
 zeff = 1.0
@@ -39,24 +42,16 @@ dict_cosmo = {
     }
 
 
-# Base HOD parameters (numerical naming: Mmin, M1 in log10)
-base_hod_params_numerical = {
-    "As": 0.3,
-    "Mmin": 13.0,
-    "sig_M": 0.3,
-    "M1": 13.0,
-    "alpha": 0.80,
-    "kappa": 0.80,
-}
-
 target_ngal = 2e-4  # (Mpc/h)^-3
 
 # Output options
 SAVE_TABLE = True
 SAVE_PLOT  = True
 OUTPUT_DIR = "."
-TABLE_FILE = "cross_check_results.txt"
-PLOT_FILE  = "cross_check_dsigma.png"
+_stem = os.path.splitext(os.path.basename(BASELINE_CACHE))[0].replace(
+    "baseline_dsigma_cache", "")
+TABLE_FILE = f"cross_check_results{_stem}.txt"
+PLOT_FILE  = f"cross_check_dsigma{_stem}.png"
 
 # Non-linear bias options (passed to HaloModel as beta_nl_kwargs)
 beta_nl_opts = {
@@ -94,6 +89,14 @@ ngal_arr = cache["ngal"]
 sat_frac_arr = cache["sat_frac"]
 Ac_rescaled = np.array([cache["Ac"]])
 As_rescaled = np.array([cache["As"]])
+if "hod_type" not in cache:
+    raise RuntimeError(f"{BASELINE_CACHE} predates the HOD being stored in the "
+                       "cache; re-run numerical_dsigma_example.py")
+# The HOD the numerical side populated -- the analytical side must use it
+hod_type = str(cache["hod_type"]).upper()
+base_hod_params_numerical = dict(zip(cache["hod_param_names"].tolist(),
+                                     cache["hod_param_values"].tolist()))
+print(f"  HOD {hod_type}: {base_hod_params_numerical}")
 
 ds_numerical = ds_all.mean(axis=0)
 ngal_numerical = ngal_arr.mean()
@@ -117,15 +120,11 @@ print("\n--- ANALYTICAL PIPELINE ---")
 # Convert numerical HOD parameter names to analytical names:
 #   numerical Mmin  -> analytical log10Mmin
 #   numerical M1    -> analytical log10M1
-hod_params_analytical = {
-    "Ac": Ac_rescaled,
-    "log10Mmin": base_hod_params_numerical["Mmin"],       # already log10
-    "sig_M": base_hod_params_numerical["sig_M"],
-    "As": As_rescaled,
-    "log10M1": base_hod_params_numerical["M1"],            # already log10
-    "alpha": base_hod_params_numerical["alpha"],
-    "kappa": base_hod_params_numerical["kappa"],
-}
+_rename = {"Mmin": "log10Mmin", "M1": "log10M1"}          # already log10
+hod_params_analytical = {_rename.get(k, k): v
+                         for k, v in base_hod_params_numerical.items()}
+hod_params_analytical["Ac"] = Ac_rescaled
+hod_params_analytical["As"] = As_rescaled
 
 # The analytical module uses pyccl mass definitions via string.
 # For virial mass, use "MassDefVir".
@@ -133,7 +132,7 @@ print("Initializing HaloModel ...")
 model = HaloModel(
     cosmo_params=dict_cosmo,
     z=zeff,
-    hod_type="ELG_GHOD",
+    hod_type=hod_type,
     units_per_h=True,
     mass_definition="MassDef200m",
     verbose=True,
@@ -159,7 +158,7 @@ print("Initializing HaloModel with include_beta_nl=True ...")
 model_nl = HaloModel(
     cosmo_params=dict_cosmo,
     z=zeff,
-    hod_type="ELG_GHOD",
+    hod_type=hod_type,
     units_per_h=True,
     mass_definition="MassDef200m",
     include_beta_nl=True,
@@ -188,7 +187,7 @@ print(f"\n  ngal numerical  = {ngal_numerical:.6e}  (Mpc/h)^-3")
 print(f"  ngal analytical = {ngal_analytical:.6e}  (Mpc/h)^-3")
 
 header = (f"{'rp [Mpc/h]':>12s}  {'DS_num':>14s}  {'DS_ana_L':>14s}  "
-          f"{'DS_ana_NL':>14s}  {'num/L':>10s}  {'NL/L':>10s}")
+          f"{'DS_ana_NL':>14s}  {'num/L':>10s}  {'num/NL':>10s}")
 print(f"\n{header}")
 print("-" * 82)
 
@@ -199,9 +198,9 @@ for i in range(len(rp_num)):
     ds_l = ds_analytical[i] if i < len(ds_analytical) else np.nan
     ds_nl = ds_analytical_nl[i] if i < len(ds_analytical_nl) else np.nan
     ratio_num_l = ds_n / ds_l if ds_l != 0 else np.nan
-    ratio_nl_l = ds_n / ds_l if ds_l != 0 else np.nan
+    ratio_num_nl = ds_n / ds_nl if ds_nl != 0 else np.nan
     line = (f"  {r:10.4f}    {ds_n:12.6e}    {ds_l:12.6e}    "
-            f"{ds_nl:12.6e}    {ratio_num_l:8.4f}    {ratio_num_l:8.4f}")
+            f"{ds_nl:12.6e}    {ratio_num_l:8.4f}    {ratio_num_nl:8.4f}")
     print(line)
     table_lines.append(line)
 

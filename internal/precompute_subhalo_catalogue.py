@@ -80,6 +80,12 @@ def parse_args():
                              "halo (Rockstar-like) convention, satellites beyond "
                              "their FOF host's R200m promoted with an aperture "
                              "M200m (see build_distinct_halo_catalogue).")
+    parser.add_argument("--aperture", choices=["inclusive", "exclusive"],
+                        default="inclusive",
+                        help="With --distinct: aperture M200m for promoted "
+                             "halos. exclusive = bound-only, corrected by the "
+                             "centrals' median offset to SO/200_mean; written "
+                             "to host_catalogue_distinct_excl.parquet.")
     parser.add_argument("--distinct_nisp", type=str, default="",
                         help="With --distinct: a rebuilt NISP catalogue "
                              "(precompute --nisp) to re-host under the distinct "
@@ -360,12 +366,14 @@ def main():
         res = build_distinct_halo_catalogue(args.soap_path, h=args.h,
                                             Lbox=args.Lbox,
                                             mass_threshold=args.mass_threshold,
-                                            gal_rows=rows)
+                                            gal_rows=rows,
+                                            aperture=args.aperture)
         df, assign = res if gal is not None else (res, None)
         if len(df) == 0:
             raise SystemExit("empty distinct-halo catalogue")
         os.makedirs(args.output_dir, exist_ok=True)
-        out = os.path.join(args.output_dir, "host_catalogue_distinct.parquet")
+        tag = "_excl" if args.aperture == "exclusive" else ""
+        out = os.path.join(args.output_dir, f"host_catalogue_distinct{tag}.parquet")
         df.to_parquet(out, index=False)
         print(f"Saved {len(df):,} halos -> {out}  ({time.time() - t0:.0f}s)")
         if gal is not None:

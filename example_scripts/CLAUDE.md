@@ -26,14 +26,17 @@ Same HOD parameters and cosmology through both pipelines: the numerical one
 one (halo model + Hankel transform).
 
 Run `numerical_dsigma_example.py` first. It populates the box for 10
-realizations and writes `baseline_dsigma_cache.npz`, which the cross-check
-loads.
+realizations and writes `baseline_dsigma_cache.npz` (`--cache`), which the
+cross-check loads (`--cache`). The cache stores the HOD type and all its
+parameters, so the analytical side evaluates the occupation that was
+populated. Halos with `c = NaN` (promoted halos of a distinct-halo catalogue)
+get Duffy08 c(M200m), the analytical model's default.
 
-Expected agreement:
-- rp > 10 Mpc/h: within ~5%
-- 1–10 Mpc/h: deviations up to 25–30%. Most likely the β^NL
-  (beyond-linear halo bias) term of the analytical model; not yet confirmed
-- rp < 1 Mpc/h: within ~5%
+Before 2026-09-25 the two scripts used DIFFERENT HODs (numerical ELG_mHMQ
+Mmin 12.7, alpha 1.10; analytical ELG_GHOD Mmin 13.0, alpha 0.80 — only
+Ac/As were shared), so the old 25–30% gap at 1–10 Mpc/h, attributed to
+β^NL, was never a like-for-like comparison. Caches written before then are
+rejected.
 
 ## `cross_check_tabulated.py` — tabulated vs full calculation
 
