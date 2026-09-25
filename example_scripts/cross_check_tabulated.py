@@ -123,6 +123,14 @@ def parse_args():
                         "difference is a binning-resolution question -- run "
                         "both against the MC here before trusting either.")
     p.add_argument("--n_fI_bins_wgg", type=int, default=8)
+    p.add_argument("--conformity", action="store_true",
+                   help="--wgg: populate with AbacusHOD conformity and compare "
+                        "kappa_EE = 1 and 0.5 (the tabulated 1-halo cs/ss "
+                        "terms use lam1/lam0; this checks them against the MC).")
+    p.add_argument("--wgg_As", type=float, default=None,
+                   help="--wgg: override the satellite amplitude (the default "
+                        "sample has fsat ~0.05, too few satellites to test "
+                        "the central-satellite term).")
     return p.parse_args()
 
 
@@ -380,6 +388,8 @@ def run_wgg_check(args, halo, cases):
     all_pass = True
     for name, extra in cases.items():
         params = {**WGG_BASE_PARAMS, **extra}
+        if args.wgg_As is not None:
+            params["As"] = args.wgg_As
         if args.assembly_bias:
             params.setdefault("A_cent", 0.0)
             params.setdefault("A_sat", 0.0)
@@ -660,14 +670,22 @@ def main():
         particle_fraction=args.particle_fraction,
         population_backend="numba", mass_function="Despali16",
     )
-    halo.set_halo_model("ELG_mHMQ", ab_method=args.ab_method,
-                        ab_rank=args.ab_rank)
+    halo.set_halo_model("ELG_mHMQ", conformity=args.conformity,
+                        ab_method=args.ab_method, ab_rank=args.ab_rank)
 
     if args.wgg:
-        cases = dict(CASES)
-        if args.assembly_bias:
-            cases["NFW_AB"] = dict(AB_CASE)
-            cases["EXT_AB"] = {**CASES["EXT_compact"], **AB_CASE}
+        if args.conformity:
+            # kappa_EE = 1 must reproduce the no-conformity occupation
+            cases = {"CONF_k1.0": {"kappa_EE": 1.0},
+                     "CONF_k0.5": {"kappa_EE": 0.5},
+                     "CONF_k0.5_EXT": {**CASES["EXT_compact"], "kappa_EE": 0.5}}
+            if args.assembly_bias:
+                cases["CONF_k0.5_AB"] = {**AB_CASE, "kappa_EE": 0.5}
+        else:
+            cases = dict(CASES)
+            if args.assembly_bias:
+                cases["NFW_AB"] = dict(AB_CASE)
+                cases["EXT_AB"] = {**CASES["EXT_compact"], **AB_CASE}
         run_wgg_check(args, halo, cases)
         return
 
