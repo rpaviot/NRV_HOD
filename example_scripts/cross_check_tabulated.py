@@ -110,7 +110,9 @@ def parse_args():
                    help="WggTabulation .npz on the cache's (logM, fI) bins. "
                         "With --jax, also validates TabulatedWgg.make_predict_jax "
                         "and the joint batched likelihood against the NumPy "
-                        "path, with the satellite profile pinned.")
+                        "path, with the satellite profile pinned. With --direct, "
+                        "also compares tabulated wgg with the direct wp of the "
+                        "same populated boxes (RSD applied as in the tabulation).")
     p.add_argument("--n_logM_bins_wgg", type=int, default=24,
                    help="24 validated; 16 leaves ~6%% cc binning errors")
     p.add_argument("--sat_kernel_weighting", default="occupation",
@@ -126,7 +128,9 @@ def parse_args():
     p.add_argument("--conformity", action="store_true",
                    help="--wgg: populate with AbacusHOD conformity and compare "
                         "kappa_EE = 1 and 0.5 (the tabulated 1-halo cs/ss "
-                        "terms use lam1/lam0; this checks them against the MC).")
+                        "terms use lam1/lam0; this checks them against the MC). "
+                        "--direct: populate with conformity (give kappa_EE in "
+                        "--params_json).")
     p.add_argument("--wgg_As", type=float, default=None,
                    help="--wgg: override the satellite amplitude (the default "
                         "sample has fsat ~0.05, too few satellites to test "
@@ -478,7 +482,7 @@ def run_direct_check(args):
     from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import (
         HaloCenterLensingCache, TabulatedDeltaSigma)
     from HOD_NRV.HOD_numerical.twopoint_calculator.standard_two_point_calculator import (
-        compute_galaxy_lensing)
+        compute_galaxy_lensing, compute_corr)
 
     if not args.cache_path:
         raise SystemExit("--direct needs --cache_path pointing at the cache "
@@ -514,8 +518,9 @@ def run_direct_check(args):
         population_backend="numba",
     )
     halo.set_halo_model("ELG_mHMQ", satellite_occupation="exp_cutoff",
+                        conformity=args.conformity,
                         ab_method=args.ab_method, ab_rank=args.ab_rank)
-    print(f"  assembly_bias={halo.assembly_bias}"
+    print(f"  conformity={halo.HOD.conformity}, assembly_bias={halo.assembly_bias}"
           + (f", ab_method={halo.HOD.ab_method!r}, ab_rank={halo.HOD.ab_rank}"
              f", column={args.ab_column!r}"
              if halo.assembly_bias else ""))
@@ -548,6 +553,26 @@ def run_direct_check(args):
     tab = TabulatedDeltaSigma(cache, halo)
     saved, summary = {}, []
 
+    # ---- optional wgg: tabulated vs direct wp of the same populated boxes ----
+    tabw = None
+    if args.wgg_tab:
+        from HOD_NRV.HOD_numerical.twopoint_calculator.tabulated_wgg import (
+            WggTabulation, TabulatedWgg)
+        wtab = WggTabulation.load(args.wgg_tab)
+        # refine_rp_edges(rp_bins, n_sub=3): 3 padding edges below, the
+        # analysis edges every 3rd, 2 padding edges above
+        rp_bins_wgg = np.asarray(wtab.rp_edges)[3:-2:3]
+        ratio = rp_bins_wgg[1:] / rp_bins_wgg[:-1]
+        if not np.allclose(ratio, ratio[0], rtol=1e-6):
+            raise SystemExit("could not recover the analysis rp bins from the "
+                             "wgg tabulation (expected refine_rp_edges n_sub=3)")
+        tabw = TabulatedWgg(wtab, halo,
+                            sat_kernel_weighting=args.sat_kernel_weighting)
+        print(f"wgg: {len(rp_bins_wgg) - 1} rp bins "
+              f"[{rp_bins_wgg[0]:.3f}, {rp_bins_wgg[-1]:.2f}], pi_max "
+              f"{wtab.pi_bins[-1]:.0f}, kernel {args.sat_kernel_weighting}")
+    wsummary = []
+
     for spec in specs:
         spec = dict(spec)
         label = spec.pop("label", "model")
@@ -556,6 +581,9 @@ def run_direct_check(args):
         # ---- tabulated prediction ------------------------------------------
         rp, ds_tab, info = tab.predict(spec)
         print(f"tabulated: ngal {info['ngal']:.4e}, fsat {info['fsat']:.4f}")
+        if tabw is not None:
+            rpw, wgg_tab, _ = tabw.predict(spec, rp_bins_wgg)
+            wgg_mc = []
 
         # ---- direct measurement, N realisations ----------------------------
         ds_mc, ngal_mc, fsat_mc = [], [], []
@@ -569,6 +597,17 @@ def run_direct_check(args):
                 weights_part=w_p, chi_max=args.chi_max,
                 bins_comp=np.geomspace(5e-3, 120, 201))
             ds_mc.append(np.asarray(ds_i))
+            if tabw is not None:
+                # same Kaiser shift the tabulation applied to the halos
+                pos_s = pos_g.copy()
+                ax = halo.rsd_axis_index
+                pos_s[:, ax] += (np.asarray(halo.velocities_gal)[:, ax]
+                                 * halo.rsd_factor)
+                pos_s %= LBOX
+                _, w_i = compute_corr('rppi', pos_s, rp_bins_wgg,
+                                      bins2=wtab.pi_bins, boxsize=LBOX,
+                                      los=halo.rsd_axis, output='wp')
+                wgg_mc.append(np.asarray(w_i))
             ngal_mc.append(len(pos_g) / LBOX ** 3)
             fsat_mc.append(float(halo.satellite_fraction))
             print(f"  realisation {i+1}/{args.n_real}: {len(pos_g):,} galaxies, "
@@ -589,6 +628,27 @@ def run_direct_check(args):
         big = rp > 3.0
         print(f"\nmax|dev| = {100*np.abs(dev).max():.2f}%   "
               f"mean dev over rp>3 = {100*np.mean(dev[big]):+.2f}%")
+        if tabw is not None:
+            wgg_mc = np.array(wgg_mc)
+            wmc = wgg_mc.mean(axis=0)
+            wse = (wgg_mc.std(axis=0, ddof=1) / np.sqrt(args.n_real)
+                   if args.n_real > 1 else np.full_like(wmc, np.nan))
+            wdev = wgg_tab / wmc - 1.0
+            print(f"\n{'rp':>9} {'wgg dir':>11} {'wgg tab':>11} {'tab/dir-1':>10} "
+                  f"{'SE%':>7}")
+            for j in range(len(rpw)):
+                print(f"{rpw[j]:9.3f} {wmc[j]:11.4f} {wgg_tab[j]:11.4f} "
+                      f"{100*wdev[j]:9.2f}% {100*wse[j]/abs(wmc[j]):7.2f}")
+            wbig = rpw > 3.0
+            print(f"\nwgg max|dev| = {100*np.abs(wdev).max():.2f}%   "
+                  f"mean dev over rp>3 = {100*np.mean(wdev[wbig]):+.2f}%   "
+                  f"max|dev|/SE = {np.nanmax(np.abs(wdev * wmc / wse)):.1f}")
+            wsummary.append((label, float(100 * np.mean(wdev[wbig])),
+                             float(100 * np.abs(wdev).max())))
+            for k, v in (("rp_wgg", rpw), ("wgg_tab", wgg_tab),
+                         ("wgg_direct", wmc), ("wgg_se", wse),
+                         ("wgg_real", wgg_mc)):
+                saved[f"{label}_{k}"] = v
         summary.append((label, float(100 * np.mean(dev[big])),
                         float(100 * np.abs(dev).max()),
                         float(np.mean(fsat_mc)), info['fsat']))
@@ -609,6 +669,8 @@ def run_direct_check(args):
           f"{'fsat dir':>9} {'fsat tab':>9}")
     for label, d3, dmax, fs_d, fs_t in summary:
         print(f"  {label:>22} {d3:+9.2f}% {dmax:9.2f}% {fs_d:9.4f} {fs_t:9.4f}")
+    for label, d3, dmax in wsummary:
+        print(f"  {'wgg ' + label:>22} {d3:+9.2f}% {dmax:9.2f}%")
     print("\n  A deviation that appears only when B_sat is switched on is the "
           "satellite\n  binning; one that appears with B_cent too would be "
           "something else entirely.")
