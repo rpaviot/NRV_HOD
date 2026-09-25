@@ -39,7 +39,7 @@ Main entry point. Loads halo/particle catalogs, sets up cosmology, populates gal
 - `do_test` - run validation on init (calls `test_satellites.run_all_tests()`)
 
 **Key methods:**
-- `set_halo_model(hod_type, conformity=False)` - configure HOD model (`"LRG"`, `"ELG_GHOD"`, `"ELG_SFR"`)
+- `set_halo_model(hod_type, conformity=False, satellite_occupation="power_law"|"exp_cutoff")` - configure HOD model (`"LRG"`, `"ELG_GHOD"`, `"ELG_SFR"`, `"ELG_mHMQ"`, case-insensitive; `elg_satellite=True` is the deprecated spelling of `"exp_cutoff"`)
 - `populate_haloes(dict_params, random_seed=None)` - full population pipeline
 - `compute_galaxy_clustering(mode, bins1, ...)` - wrapper for `compute_galaxy_clustering()`
 - `compute_galaxy_lensing(bins1, ...)` - wrapper for `compute_galaxy_lensing()`

@@ -261,30 +261,42 @@ class HaloOccupation:
             test_satellites.run_all_tests()
 
     def set_halo_model(self, hod_type: str, conformity: bool = False,
-                       elg_satellite: bool = False, ab_method: str = "mass",
-                       ab_rank: bool = False, ab_rank_dlogM: float = 0.1):
+                       satellite_occupation: str = "power_law",
+                       ab_method: str = "mass", ab_rank: bool = False,
+                       ab_rank_dlogM: float = 0.1,
+                       elg_satellite: Optional[bool] = None):
         """
         Configure the Halo Occupation Distribution model.
 
         Parameters
         ----------
         hod_type : str
-            HOD model type. Options:
+            HOD model type (case-insensitive). Options:
+
             - "LRG": Error function (erf) model for Luminous Red Galaxies
             - "ELG_GHOD": Gaussian HOD model for Emission Line Galaxies
             - "ELG_SFR": Star Formation Rate based ELG model
             - "ELG_mHMQ": Modified HMQ model for ELGs
+
         conformity : bool, default=False
             Whether to use AbacusHOD-style conformity for satellites.
             When True, satellite occupation depends on actual central
             galaxy realization rather than just central probability.
-        elg_satellite : bool, default=False
-            Whether to use ELG satellite HOD with high-mass exponential cutoff.
-            When True, uses: <N_sat> = As * (M/M1)^alpha * exp(-Mcut/M) * exp(-M/Mmax).
-            Required dict_params keys: {"Ac", "Mmin", "sig_M", "As", "M1", "alpha", "Mcut", "Mmax"}.
-            Ignored when conformity=True (conformity takes precedence).
+        satellite_occupation : {"power_law", "exp_cutoff"}, default="power_law"
+            Mean satellite occupation:
+
+            - "power_law" : As * ((M - kappa*Mmin)/M1)^alpha for M > kappa*Mmin
+              (keys As, M1, alpha, kappa).
+            - "exp_cutoff": As * (M/M1)^alpha * exp(-Mcut/M) * exp(-M/Mmax)
+              (keys As, M1, alpha, Mcut, Mmax).
+
+            Either combines with conformity (M1 -> kappa_EE*M1 where a central
+            was drawn).
+        elg_satellite : bool, optional
+            Deprecated: True is satellite_occupation="exp_cutoff".
         ab_method : str, default="mass"
             How the assembly-bias property enters the occupation:
+
             - "mass"   : shift the mass thresholds, logMmin += A_cent*fI +
               B_cent*fE and logM1 += A_sat*fI + B_sat*fE. Uses the CONTINUOUS
               ranking, so A/B are in dex.
@@ -297,6 +309,7 @@ class HaloOccupation:
               and N_sat*(1 + B*fE). The paper defines fE as the RANK within
               0.1 dex mass bins -- pass ab_rank=True for that; on the
               value-normalised fs_norm columns it is a different model.
+
             "mass" matches the default of the underlying Occupation; this
             argument used to default to "direct" and silently override it.
         ab_rank : bool, default=False
@@ -308,7 +321,7 @@ class HaloOccupation:
         --------
         >>> halo.set_halo_model("LRG")  # Standard LRG model
         >>> halo.set_halo_model("ELG_GHOD", conformity=True)  # ELG with conformity
-        >>> halo.set_halo_model("ELG_mHMQ", elg_satellite=True)  # ELG with cutoff satellites
+        >>> halo.set_halo_model("ELG_mHMQ", satellite_occupation="exp_cutoff")
 
         Notes
         -----
@@ -323,6 +336,7 @@ class HaloOccupation:
         self.HOD = Occupation(
             hod_type, self.logM_bins, self.mass_function,
             assembly_bias=self.assembly_bias, conformity=conformity,
+            satellite_occupation=satellite_occupation,
             elg_satellite=elg_satellite,
             fI=self.fI, fE=self.fE,
             ab_method=ab_method,
@@ -624,11 +638,13 @@ class HaloOccupation:
 
         **Performance:**
 
-        | Scenario    | Standard | Optimized | Speedup |
-        |-------------|----------|-----------|---------|
-        | f_sat = 0.3 | 0.64s    | ~0.20s    | ~3×     |
-        | f_sat = 0.2 | 0.64s    | ~0.13s    | ~5×     |
-        | f_sat = 0.1 | 0.64s    | ~0.07s    | ~9×     |
+        ===========  ========  =========  =======
+        Scenario     Standard  Optimized  Speedup
+        ===========  ========  =========  =======
+        f_sat = 0.3  0.64 s    ~0.20 s    ~3x
+        f_sat = 0.2  0.64 s    ~0.13 s    ~5x
+        f_sat = 0.1  0.64 s    ~0.07 s    ~9x
+        ===========  ========  =========  =======
 
         See Also
         --------

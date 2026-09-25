@@ -201,8 +201,9 @@ class TabulatedFitter:
         the wrong Ac/As ratio rather than just the wrong absolute scale.
     target_ngal : float
         Galaxy number density the (Ac, As) pair is rescaled to.
-    data_path / (ds_obs, cov_inv, rp_obs), rp_min / rp_max, param_config,
-    max_fsat: data vector, scale cuts, priors, f_sat truncation prior.
+    data_path, ds_obs, cov_inv, rp_obs, rp_min, rp_max, param_config, max_fsat
+        Data vector (a file, or the arrays), scale cuts, priors and the
+        f_sat truncation prior.
     """
 
     def __init__(

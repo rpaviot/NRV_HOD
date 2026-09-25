@@ -222,12 +222,12 @@ def run_jax_check(args, halo, cache):
         case = case.replace("+wgg", "")
         conformity = case == "CONF"
         halo.set_halo_model("ELG_mHMQ", conformity=conformity,
-                            elg_satellite=True, ab_method=args.ab_method,
+                            satellite_occupation="exp_cutoff", ab_method=args.ab_method,
                             ab_rank=args.ab_rank)
         tab = TabulatedDeltaSigma(cache, halo)
         occ_rescale = Occupation(
             "ELG_mHMQ", halo.logM_bins, halo.mass_function,
-            conformity=conformity, elg_satellite=True)
+            conformity=conformity, satellite_occupation="exp_cutoff")
 
         cfg = _jax_param_config(case, args.assembly_bias, args.ab_slope)
         wgg_kw = {}
@@ -503,7 +503,7 @@ def run_direct_check(args):
         assembly_bias=bool(args.ab_column), apply_rsd=False, do_test=False,
         population_backend="numba",
     )
-    halo.set_halo_model("ELG_mHMQ", elg_satellite=True,
+    halo.set_halo_model("ELG_mHMQ", satellite_occupation="exp_cutoff",
                         ab_method=args.ab_method, ab_rank=args.ab_rank)
     print(f"  assembly_bias={halo.assembly_bias}"
           + (f", ab_method={halo.HOD.ab_method!r}, ab_rank={halo.HOD.ab_rank}"

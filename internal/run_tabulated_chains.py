@@ -256,7 +256,7 @@ def build_halo_occupation(fit_case, halo_path, ab_column=None,
     halo.set_halo_model(
         "ELG_mHMQ",
         conformity=conformity or fit_case == FitCase.CONFORMITY,
-        elg_satellite=True,
+        satellite_occupation="exp_cutoff",
         ab_method=ab_method, ab_rank=ab_rank,
     )
     return halo
@@ -267,7 +267,7 @@ def _make_rescale_occupation(halo, fit_case):
     return Occupation(
         "ELG_mHMQ", halo.logM_bins, halo.mass_function,
         conformity=halo.HOD.conformity,
-        elg_satellite=True,
+        satellite_occupation="exp_cutoff",
     )
 
 

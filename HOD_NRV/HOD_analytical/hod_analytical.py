@@ -79,25 +79,35 @@ HOD_PARAM_DEFINITIONS = {
 CSMF_HOD_PARAMS = ['M0', 'M1', 'gamma1', 'gamma2', 'sigma_c', 'alpha_s', 'b0', 'b1']
 
 
-def get_required_params(hod_type: str) -> List[str]:
+# Satellite forms: 'power_law' uses HOD_PARAM_DEFINITIONS[...]['satellite_params'];
+# 'exp_cutoff' replaces them with these (no kappa*Mmin threshold).
+SATELLITE_OCCUPATIONS = ('power_law', 'exp_cutoff')
+EXP_CUTOFF_SATELLITE_PARAMS = ['As', 'log10M1', 'alpha', 'log10Mcut', 'log10Mmax']
+
+
+def get_required_params(hod_type: str,
+                        satellite_occupation: str = 'power_law') -> List[str]:
     """Get unique required parameters for a given HOD type."""
     hod_type = hod_type.upper()
     if hod_type not in HOD_PARAM_DEFINITIONS:
         raise ValueError(f"Unknown HOD type: {hod_type}. Supported: {list(HOD_PARAM_DEFINITIONS.keys())}")
 
     defn = HOD_PARAM_DEFINITIONS[hod_type]
+    sat = (EXP_CUTOFF_SATELLITE_PARAMS if satellite_occupation == 'exp_cutoff'
+           else defn['satellite_params'])
     # Combine and deduplicate (log10Mmin appears in both)
-    all_params = set(defn['central_params']) | set(defn['satellite_params'])
+    all_params = set(defn['central_params']) | set(sat)
     return list(all_params)
 
 
-def validate_hod_params(hod_type: str, params: Dict) -> bool:
+def validate_hod_params(hod_type: str, params: Dict,
+                        satellite_occupation: str = 'power_law') -> bool:
     """Validate that all required parameters are present."""
     hod_type = hod_type.upper()
     if hod_type == 'CSMF':
         required = CSMF_HOD_PARAMS
     else:
-        required = get_required_params(hod_type)
+        required = get_required_params(hod_type, satellite_occupation)
 
     missing = [p for p in required if p not in params]
     if missing:
@@ -264,6 +274,20 @@ def unified_N_satellite(logM: jnp.ndarray, As: float, log10Mmin: float,
     return jnp.where(M > kappa * Mmin, Nsat, 0.0)
 
 
+@jit
+def exp_cutoff_N_satellite(logM: jnp.ndarray, As: float, log10M1: float,
+                           alpha: float, log10Mcut: float,
+                           log10Mmax: float) -> jnp.ndarray:
+    """
+    Satellite occupation with exponential cut-offs at both ends:
+        N_sat = As * (M/M1)^alpha * exp(-Mcut/M) * exp(-M/Mmax)
+    Matches HOD_models.ELG_satellite_cutoff (satellite_occupation='exp_cutoff').
+    """
+    M = 10.0 ** logM
+    return (As * jnp.power(M / 10.0 ** log10M1, alpha)
+            * jnp.exp(-(10.0 ** log10Mcut) / M) * jnp.exp(-M / 10.0 ** log10Mmax))
+
+
 # ============================================================================
 # Legacy functions (for backward compatibility with old StandardHOD)
 # ============================================================================
@@ -372,13 +396,17 @@ class AnalyticalHOD:
         'ELG_MHMQ': elg_mhmq_N_central,
     }
 
-    def __init__(self, hod_type: str = 'LRG'):
+    def __init__(self, hod_type: str = 'LRG', satellite_occupation: str = 'power_law'):
         self.hod_type = hod_type.upper()
         if self.hod_type not in self.SUPPORTED_TYPES:
             raise ValueError(
                 f"Unknown HOD type: {hod_type}. "
                 f"Supported: {self.SUPPORTED_TYPES}"
             )
+        if satellite_occupation not in SATELLITE_OCCUPATIONS:
+            raise ValueError(f"satellite_occupation must be one of "
+                             f"{SATELLITE_OCCUPATIONS}, got {satellite_occupation!r}")
+        self.satellite_occupation = satellite_occupation
         self.params = None
         self._central_func = self._central_funcs[self.hod_type]
         self._param_def = HOD_PARAM_DEFINITIONS[self.hod_type]
@@ -395,7 +423,7 @@ class AnalyticalHOD:
             - ELG_GHOD: Ac, log10Mmin, sig_M, As, log10M1, alpha, kappa
             - ELG_SFR: Ac, log10Mmin, sig_M, gamma, As, log10M1, alpha, kappa
         """
-        validate_hod_params(self.hod_type, params)
+        validate_hod_params(self.hod_type, params, self.satellite_occupation)
         self.params = params.copy()
 
         # Store central params
@@ -409,7 +437,11 @@ class AnalyticalHOD:
         self.As = jnp.array(params['As'])
         self.log10M1 = jnp.array(params['log10M1'])
         self.alpha = jnp.array(params['alpha'])
-        self.kappa = jnp.array(params['kappa'])
+        if self.satellite_occupation == 'exp_cutoff':
+            self.log10Mcut = jnp.array(params['log10Mcut'])
+            self.log10Mmax = jnp.array(params['log10Mmax'])
+        else:
+            self.kappa = jnp.array(params['kappa'])
 
     def N_central(self, logM: jnp.ndarray) -> jnp.ndarray:
         """
@@ -454,6 +486,10 @@ class AnalyticalHOD:
         if self.params is None:
             raise ValueError("HOD parameters not set. Call set_params() first.")
 
+        if self.satellite_occupation == 'exp_cutoff':
+            return exp_cutoff_N_satellite(
+                logM, self.As, self.log10M1, self.alpha, self.log10Mcut, self.log10Mmax
+            )
         return unified_N_satellite(
             logM, self.As, self.log10Mmin, self.log10M1, self.alpha, self.kappa
         )
@@ -558,7 +594,8 @@ def create_hod(hod_type: str, **kwargs) -> Union[AnalyticalHOD, CSMF_HOD]:
 
     # Handle new HOD types
     if hod_type_upper in AnalyticalHOD.SUPPORTED_TYPES:
-        return AnalyticalHOD(hod_type_upper)
+        return AnalyticalHOD(hod_type_upper,
+                             kwargs.get('satellite_occupation', 'power_law'))
 
     # Handle CSMF
     if hod_type_upper == 'CSMF':
@@ -589,7 +626,8 @@ __all__ = [
     # Central occupation functions
     'lrg_N_central', 'elg_ghod_N_central', 'elg_sfr_N_central',
     # Satellite occupation functions
-    'unified_N_satellite',
+    'unified_N_satellite', 'exp_cutoff_N_satellite',
+    'SATELLITE_OCCUPATIONS', 'EXP_CUTOFF_SATELLITE_PARAMS',
     # Legacy functions
     'standard_N_central', 'standard_N_satellite',
     'csmf_Mstar_central', 'csmf_N_central', 'csmf_N_satellite',

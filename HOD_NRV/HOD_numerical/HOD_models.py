@@ -294,6 +294,33 @@ def build_occupation_fn_jax(occ, split_conformity=False):
     return fn
 
 
+SATELLITE_OCCUPATIONS = ("power_law", "exp_cutoff")
+
+
+def canonical_hod_type(hod_type, known):
+    """Return the spelling of ``hod_type`` used in ``known``, ignoring case."""
+    names = {k.upper(): k for k in known}
+    if hod_type.upper() not in names:
+        raise AttributeError(f"Unknown HOD type: {hod_type}. "
+                             f"Supported: {list(known)}")
+    return names[hod_type.upper()]
+
+
+def resolve_satellite_occupation(satellite_occupation, elg_satellite=None):
+    """Map the deprecated ``elg_satellite`` flag onto ``satellite_occupation``."""
+    if elg_satellite is not None:
+        import warnings
+        warnings.warn("elg_satellite is deprecated; use "
+                      "satellite_occupation='exp_cutoff' (or 'power_law').",
+                      DeprecationWarning, stacklevel=3)
+        if elg_satellite:
+            satellite_occupation = "exp_cutoff"
+    if satellite_occupation not in SATELLITE_OCCUPATIONS:
+        raise ValueError(f"satellite_occupation must be one of "
+                         f"{SATELLITE_OCCUPATIONS}, got {satellite_occupation!r}")
+    return satellite_occupation
+
+
 class Occupation:
     central_funcs = {
         "LRG": (LRG_Zheng07, ["Ac", "Mmin", "sig_M"]),
@@ -309,16 +336,22 @@ class Occupation:
     assembly_bias_params=['A_cent','B_cent','A_sat','B_sat','B_cent_slope','B_sat_slope']
 
     def __init__(self, hod_type, logM_bins, mass_function, assembly_bias=False,
-                 conformity=False, elg_satellite=False, fI=None, fE=None,
-                 ab_method="mass", logM_halos=None, ab_rank=False,
-                 ab_rank_dlogM=0.1, ab_rank_min_count=1000):
+                 conformity=False, satellite_occupation="power_law", fI=None,
+                 fE=None, ab_method="mass", logM_halos=None, ab_rank=False,
+                 ab_rank_dlogM=0.1, ab_rank_min_count=1000, elg_satellite=None):
         """``ab_rank=True`` replaces fI/fE by their rank within ``ab_rank_dlogM``
         mass bins (uniform in [-1, 1], see :func:`rank_within_mass_bins`),
         which is what 'variant' (Hadzhiyska+2023 Eq. 12-13) is defined on.
-        The raw arrays stay on the HaloOccupation for the tabulation bins."""
+        The raw arrays stay on the HaloOccupation for the tabulation bins.
 
-        if hod_type not in self.central_funcs:
-            raise AttributeError(f"Unknown HOD type: {hod_type}")
+        ``hod_type`` is matched case-insensitively. ``satellite_occupation`` is
+        ``"power_law"`` (As ((M - kappa Mmin)/M1)^alpha) or ``"exp_cutoff"``
+        (As (M/M1)^alpha exp(-Mcut/M) exp(-M/Mmax)); ``elg_satellite=True`` is
+        the deprecated spelling of ``"exp_cutoff"``."""
+
+        satellite_occupation = resolve_satellite_occupation(
+            satellite_occupation, elg_satellite)
+        hod_type = canonical_hod_type(hod_type, self.central_funcs)
         if ab_method not in ("direct", "variant", "mass"):
             raise ValueError(f"Unknown ab_method '{ab_method}'. Choose 'direct', 'variant', or 'mass'.")
 
@@ -328,7 +361,8 @@ class Occupation:
         self.HOD_central, self.central_params = self.central_funcs[hod_type]
         self.assembly_bias = assembly_bias
         self.conformity = conformity
-        self.elg_satellite = elg_satellite
+        self.satellite_occupation = satellite_occupation
+        self.elg_satellite = satellite_occupation == "exp_cutoff"
         self.ab_method = ab_method
         self.fI = fI
         self.fE = fE

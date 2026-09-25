@@ -76,6 +76,7 @@ class HaloModel(Cosmology):
         include_beta_nl: bool = False,
         beta_nl_kwargs: Optional[Dict] = None,
         verbose: bool = True,
+        satellite_occupation: str = "power_law",
         **cosmo_kwargs
     ):
         # Initialize Cosmology base class
@@ -94,7 +95,8 @@ class HaloModel(Cosmology):
         # HOD setup
         self.hod_type = hod_type.lower()
         self.masses_are_log10 = masses_are_log10
-        self.hod = create_hod(self.hod_type, masses_are_log10=masses_are_log10)
+        self.hod = create_hod(self.hod_type, masses_are_log10=masses_are_log10,
+                              satellite_occupation=satellite_occupation)
 
         if self.hod_type.upper() == 'CSMF' and (Mstar_min is None or Mstar_max is None):
             raise ValueError("CSMF HOD requires Mstar_min and Mstar_max")
