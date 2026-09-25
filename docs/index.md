@@ -18,6 +18,7 @@ NRVpy models the galaxy–halo connection two ways, one page each:
    tabulated estimators turn it into a likelihood fast enough for nested
    sampling.
 
+[HOD models](hod_models.md) gives the occupation functions both use.
 [Validation](validation.md) lists the tests that check each part against an
 independent reference.
 
@@ -44,6 +45,7 @@ $w_{gg}$ in Mpc/$h$. The analytical model follows these conventions when
 :hidden:
 :maxdepth: 1
 
+hod_models
 analytical
 numerical
 validation
