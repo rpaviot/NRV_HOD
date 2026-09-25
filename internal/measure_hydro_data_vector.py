@@ -1216,16 +1216,18 @@ def _measure_conformity(args, idx, is_sat, n_halo, mbin, ebin, logM):
                 f(nsat_h * has), f(nsat_h * ~has))
 
     Hc, Hn, Sc, Sn = cells(mbin, nM)
+    # K1 = lam1/<N_sat>, K2 = lam0/<N_sat> (KP4 GGL NISP HOD slides); R = K1/K2
     print(f"{'logM':>6} {'H_cen':>9} {'H_nocen':>9} {'lam1':>9} {'lam0':>9} "
-          f"{'R':>7} {'err':>6}")
+          f"{'R':>7} {'err':>6} {'K1':>6} {'K2':>6}")
     for m in range(nM):
         if Sc[m] + Sn[m] < 20 or Hc[m] == 0 or Hn[m] == 0:
             continue
         l1, l0 = Sc[m] / Hc[m], Sn[m] / Hn[m]
+        ns = (Sc[m] + Sn[m]) / (Hc[m] + Hn[m])
         R = l1 / l0 if l0 > 0 else np.nan
         e = R * np.sqrt(1 / max(Sc[m], 1) + 1 / max(Sn[m], 1))
         print(f"{logM[m]:6.2f} {Hc[m]:9.0f} {Hn[m]:9.0f} {l1:9.5f} {l0:9.5f} "
-              f"{R:7.3f} {e:6.3f}")
+              f"{R:7.3f} {e:6.3f} {l1 / ns:6.3f} {l0 / ns:6.3f}")
 
     R_m, eR_m = _conformity_ratio(Hc, Hn, Sc, Sn)
     ok_e = ok_m & (ebin >= 0)
