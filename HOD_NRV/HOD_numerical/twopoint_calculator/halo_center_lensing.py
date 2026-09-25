@@ -1425,7 +1425,8 @@ class TabulatedDeltaSigma:
         j_prop_cell = jnp.asarray(cells['prop_cell'].reshape(n_mc, n_fc))
         j_sign_cell = jnp.asarray(cells['sign_cell'].reshape(n_mc, n_fc))
         j_N_cell = jnp.asarray(cells['N_cell'].reshape(n_mc, n_fc))
-        occ_fn = build_occupation_fn_jax(occ)
+        occ_fn = build_occupation_fn_jax(occ, split_conformity=True)
+        conformity = occ.conformity
         Lbox3 = self.halo.Lbox ** 3
         has_ab, ab_method = occ.assembly_bias, occ.ab_method
 
@@ -1434,11 +1435,13 @@ class TabulatedDeltaSigma:
             if has_ab and ab_method == "mass":
                 cshift = params.get(cen_coef, 0.0) * j_prop_cell
                 sshift = params.get(sat_coef, 0.0) * j_prop_cell
-            probC, probS = occ_fn(j_logM_cell, params, cshift, sshift)
+            probC, probS, lam1, lam0 = occ_fn(j_logM_cell, params, cshift, sshift)
             if has_ab and ab_method == "direct":
                 ab_c = params.get(cen_coef, 0.0) * j_sign_cell
                 ab_s = params.get(sat_coef, 0.0) * j_sign_cell
                 probC = probC + ab_c * jnp.minimum(probC, 1.0 - probC)
+                if conformity:   # mixture on the AB-modified probC
+                    probS = probC * lam1 + (1.0 - probC) * lam0
                 probS = probS * (1.0 + ab_s)
             elif has_ab and ab_method == "variant":
                 ab_c = variant_coefficient(
@@ -1449,6 +1452,8 @@ class TabulatedDeltaSigma:
                     params.get(sat_coef + "_slope", 0.0), j_logM_cell) * j_prop_cell
                 probC = jnp.minimum(probC, 1.0)
                 probC = probC * (1.0 + ab_c * (1.0 - probC))
+                if conformity:   # mixture on the AB-modified probC
+                    probS = probC * lam1 + (1.0 - probC) * lam0
                 probS = probS * (1.0 + ab_s)
             probC = jnp.minimum(probC, 1.0)
             return jnp.sum((probC + probS) * j_N_cell) / Lbox3
@@ -1529,7 +1534,8 @@ class TabulatedDeltaSigma:
         j_sin_th = jnp.asarray(np.sqrt(1.0 - self._mu_nodes ** 2))
         j_cos_phi, j_phi_w = jnp.asarray(self._cos_phi), jnp.asarray(self._phi_w)
         j_M_sig, j_M_avg = jnp.asarray(M_sig), jnp.asarray(M_avg)
-        occ_fn = build_occupation_fn_jax(occ)
+        occ_fn = build_occupation_fn_jax(occ, split_conformity=True)
+        conformity = occ.conformity
         n_m, n_f = self.n_m, self.n_f
         Lbox3 = self.halo.Lbox ** 3
         rho_fac = self.RHO_M / 1e12
@@ -1541,11 +1547,13 @@ class TabulatedDeltaSigma:
             if has_ab and ab_method == "mass":
                 cshift = params.get(cen_coef, 0.0) * j_prop_cell
                 sshift = params.get(sat_coef, 0.0) * j_prop_cell
-            probC, probS = occ_fn(j_logM_cell, params, cshift, sshift)
+            probC, probS, lam1, lam0 = occ_fn(j_logM_cell, params, cshift, sshift)
             if has_ab and ab_method == "direct":
                 ab_c = params.get(cen_coef, 0.0) * j_sign_cell
                 ab_s = params.get(sat_coef, 0.0) * j_sign_cell
                 probC = probC + ab_c * jnp.minimum(probC, 1.0 - probC)
+                if conformity:   # mixture on the AB-modified probC
+                    probS = probC * lam1 + (1.0 - probC) * lam0
                 probS = probS * (1.0 + ab_s)
             elif has_ab and ab_method == "variant":
                 ab_c = variant_coefficient(
@@ -1556,6 +1564,8 @@ class TabulatedDeltaSigma:
                     params.get(sat_coef + "_slope", 0.0), j_logM_cell) * j_prop_cell
                 probC = jnp.minimum(probC, 1.0)
                 probC = probC * (1.0 + ab_c * (1.0 - probC))
+                if conformity:   # mixture on the AB-modified probC
+                    probS = probC * lam1 + (1.0 - probC) * lam0
                 probS = probS * (1.0 + ab_s)
             probC = jnp.minimum(probC, 1.0)
 

@@ -432,18 +432,6 @@ class Occupation:
                     self._B_sat  = B_sat
 
 
-    def _apply_direct_ab(self, probC, probS):
-        """Apply direct assembly bias to occupation numbers (ab_method='direct' only)."""
-        probC = assembly_bias_direct_cen(probC, self._ab_cent_val)
-        probS = assembly_bias_direct_sat(probS, self._ab_sat_val)
-        return probC, probS
-
-    def _apply_variant_ab(self, probC, probS):
-        """Apply variant assembly bias (paper Eq. 12–13)."""
-        probC = assembly_bias_variant_cen(probC, self._A_cent, self.fI, self._B_cent, self.fE)
-        probS = assembly_bias_variant_sat(probS, self._A_sat,  self.fI, self._B_sat,  self.fE)
-        return probC, probS
-
     def _compute_probS(self, logM, probC, has_central=None):
         """Compute satellite occupation, handling conformity.
 
@@ -470,15 +458,34 @@ class Occupation:
         probS = self._compute_probS(self.logM_bins, probC)
         return probC, probS
 
-    def compute_HOD_occupation(self, logM, dict_params, has_central=None):
-        self.set_params(dict_params)
+    def _occupation_with_ab(self, logM, has_central=None):
+        """(probC, probS) after set_params, every AB effect applied.
+
+        The conformity mixture probC*lam1 + (1-probC)*lam0 is formed from the
+        central occupation AFTER the 'direct'/'variant' central modification,
+        so <N_sat> agrees with the pair expectation probC*lam1 the wgg 1-halo
+        term uses. Both satellite factors are multiplicative, so they commute
+        with the mixture. Without conformity probS does not depend on probC
+        and this is the old ordering exactly.
+        """
         probC = self.HOD_central(logM, *self.central_args)
+        if self.assembly_bias and self.ab_method == "direct":
+            probC = assembly_bias_direct_cen(probC, self._ab_cent_val)
+        elif self.assembly_bias and self.ab_method == "variant":
+            probC = assembly_bias_variant_cen(probC, self._A_cent, self.fI,
+                                              self._B_cent, self.fE)
         probS = self._compute_probS(logM, probC, has_central)
         if self.assembly_bias and self.ab_method == "direct":
-            probC, probS = self._apply_direct_ab(probC, probS)
+            probS = assembly_bias_direct_sat(probS, self._ab_sat_val)
         elif self.assembly_bias and self.ab_method == "variant":
-            probC, probS = self._apply_variant_ab(probC, probS)
+            probS = assembly_bias_variant_sat(probS, self._A_sat, self.fI,
+                                              self._B_sat, self.fE)
+        # 'mass' method: AB already baked into central_args/satellite_args by set_params
         return probC, probS
+
+    def compute_HOD_occupation(self, logM, dict_params, has_central=None):
+        self.set_params(dict_params)
+        return self._occupation_with_ab(logM, has_central)
 
     def compute_central_occupation(self, logM, dict_params):
         self.set_params(dict_params)
@@ -602,13 +609,6 @@ class Occupation:
     def _probC_probS_direct(self, logM_halo, dict_params):
         """Compute per-halo (probC, probS) with all AB effects applied."""
         self.set_params(dict_params)
-        probC = self.HOD_central(logM_halo, *self.central_args)
-        probS = self._compute_probS(logM_halo, probC)
-        if self.assembly_bias and self.ab_method == "direct":
-            probC, probS = self._apply_direct_ab(probC, probS)
-        elif self.assembly_bias and self.ab_method == "variant":
-            probC, probS = self._apply_variant_ab(probC, probS)
-        # 'mass' method: AB already baked into central_args/satellite_args by set_params
-        return probC, probS
+        return self._occupation_with_ab(logM_halo)
 
 

@@ -642,6 +642,7 @@ class TabulatedWgg:
         j_B_cs, j_B_ss = jnp.asarray(B_cs), jnp.asarray(B_ss)
         j_area = jnp.asarray(area)
         occ_fn = build_occupation_fn_jax(occ, split_conformity=True)
+        conformity = occ.conformity
         Lbox3 = self.halo.Lbox ** 3
         has_ab, ab_method = occ.assembly_bias, occ.ab_method
 
@@ -655,6 +656,8 @@ class TabulatedWgg:
                 ab_c = params.get(cen_coef, 0.0) * j_sign_cell
                 ab_s = params.get(sat_coef, 0.0) * j_sign_cell
                 probC = probC + ab_c * jnp.minimum(probC, 1.0 - probC)
+                if conformity:   # mixture on the AB-modified probC
+                    probS = probC * lam1 + (1.0 - probC) * lam0
                 probS = probS * (1.0 + ab_s)
                 lam1 = lam1 * (1.0 + ab_s)
                 lam0 = lam0 * (1.0 + ab_s)
@@ -667,6 +670,8 @@ class TabulatedWgg:
                     params.get(sat_coef + "_slope", 0.0), j_logM_cell) * j_prop_cell
                 probC = jnp.minimum(probC, 1.0)
                 probC = probC * (1.0 + ab_c * (1.0 - probC))
+                if conformity:   # mixture on the AB-modified probC
+                    probS = probC * lam1 + (1.0 - probC) * lam0
                 probS = probS * (1.0 + ab_s)
                 lam1 = lam1 * (1.0 + ab_s)
                 lam0 = lam0 * (1.0 + ab_s)

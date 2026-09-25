@@ -142,6 +142,8 @@ def _ab_tag(args):
         tag += "_rank"
     if getattr(args, "ab_slope", False):
         tag += "_slope"
+    if getattr(args, "conformity", False):
+        tag += "_conf"
     return tag
 
 
@@ -168,7 +170,7 @@ VARIANT_SLOPE_RANGE = (-1.0, 1.0)
 
 
 def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False, fixed=None,
-                       ab_method="mass", ab_slope=False):
+                       ab_method="mass", ab_slope=False, conformity=False):
     """Same prior structure as run_emulator_chains.py --full_bb (elg_satellite).
 
     ``fixed`` is a {name: value} override applied last: a scalar in
@@ -186,7 +188,7 @@ def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False, fixed=None
     else:
         cfg["f_exp"], cfg["tau"] = 0.0, 5.0
 
-    if fit_case == FitCase.CONFORMITY:
+    if conformity or fit_case == FitCase.CONFORMITY:
         active.append("kappa_EE")
     else:
         cfg["kappa_EE"] = 1.0
@@ -224,7 +226,7 @@ def build_param_config(fit_case, *, assembly_bias, gaussian_ab=False, fixed=None
 # ============================================================================
 
 def build_halo_occupation(fit_case, halo_path, ab_column=None,
-                          ab_method="mass", ab_rank=False):
+                          ab_method="mass", ab_rank=False, conformity=False):
     """HaloOccupation with the assembly-bias column mapped as fE.
 
     assembly_bias is always on so the fI tabulation bins resolve; non-AB
@@ -249,7 +251,7 @@ def build_halo_occupation(fit_case, halo_path, ab_column=None,
     )
     halo.set_halo_model(
         "ELG_mHMQ",
-        conformity=(fit_case == FitCase.CONFORMITY),
+        conformity=conformity or fit_case == FitCase.CONFORMITY,
         elg_satellite=True,
         ab_method=ab_method, ab_rank=ab_rank,
     )
@@ -260,7 +262,7 @@ def _make_rescale_occupation(halo, fit_case):
     """Non-AB Occupation for the (Ac, As) -> ngal rescale (grid convention)."""
     return Occupation(
         "ELG_mHMQ", halo.logM_bins, halo.mass_function,
-        conformity=(fit_case == FitCase.CONFORMITY),
+        conformity=halo.HOD.conformity,
         elg_satellite=True,
     )
 
@@ -514,7 +516,7 @@ def run_case(case_name, fit_case, halo, tab, args):
         param_config = build_param_config(
             fit_case, assembly_bias=assembly_bias, gaussian_ab=args.gaussian_ab,
             fixed=args.fix_map, ab_method=args.ab_method,
-            ab_slope=args.ab_slope)
+            ab_slope=args.ab_slope, conformity=args.conformity)
 
         fitter = TabulatedFitter(
             tabulated_ds=tab,
@@ -732,6 +734,14 @@ def parse_args():
                         "Hadzhiyska+2023 and AbacusHOD. The tabulation bins "
                         "are still cut on the column's values, so no "
                         "re-tabulation is needed.")
+    p.add_argument("--conformity", action="store_true",
+                   help="Add AbacusHOD-style conformity (free kappa_EE: "
+                        "M1 -> kappa_EE*M1 in halos with a central) to ANY "
+                        "case, independent of the satellite profile. The "
+                        "CONF case is EXT + conformity and keeps that "
+                        "meaning; 'EXT_AB --conformity --fix f_exp=0 ...' "
+                        "is no longer needed for NFW + conformity: use "
+                        "'NFW_AB --conformity'. Output names carry '_conf'.")
     p.add_argument("--ab_slope", action="store_true",
                    help="With --ab_method variant: also sample a logM slope "
                         "of B_cent and B_sat (B + slope*(logM - 12.5), "
@@ -810,7 +820,8 @@ def predict_at(case_name, fit_case, halo, tab, args):
     param_config = build_param_config(
         fit_case, assembly_bias=case_name.endswith("_AB"),
         gaussian_ab=args.gaussian_ab, fixed=args.fix_map,
-        ab_method=args.ab_method, ab_slope=args.ab_slope)
+        ab_method=args.ab_method, ab_slope=args.ab_slope,
+        conformity=args.conformity)
 
     tab_wgg = None
     if args.wgg_tab:
@@ -884,7 +895,7 @@ def main():
             print(f"\nLoading halo catalogue for case {case_name} ...")
             halo = build_halo_occupation(fit_case, args.halo_path,
                                          args.ab_column, args.ab_method,
-                                         args.ab_rank)
+                                         args.ab_rank, args.conformity)
             predict_at(case_name, fit_case, halo,
                        TabulatedDeltaSigma(cache, halo), args)
         return
@@ -898,7 +909,7 @@ def main():
         print(f"\nLoading halo catalogue for case {case_name} ...")
         halo = build_halo_occupation(fit_case, args.halo_path,
                                      args.ab_column, args.ab_method,
-                                     args.ab_rank)
+                                     args.ab_rank, args.conformity)
         tab = TabulatedDeltaSigma(cache, halo)
         print(f"  {tab}")
         if halo.assembly_bias:
