@@ -17,7 +17,7 @@ cosmo = {"h": 0.681, "Omc": 0.2566, "Omb": 0.0486, "Omnu": 1.39e-3,
 model = HaloModel(
     cosmo_params=cosmo,
     z=1.0,                        # one redshift or a list
-    hod_type="ELG_MHMQ",          # LRG, ELG_GHOD, ELG_SFR, ELG_MHMQ, CSMF
+    hod_type="ELG_mHMQ",          # LRG, ELG_GHOD, ELG_SFR, ELG_mHMQ, CSMF
     units_per_h=True,             # k in h/Mpc, masses in Msun/h
     mass_definition="MassDef200m",
     mass_function="Tinker08",     # any pyccl MassFunc*, default Tinker10
@@ -58,7 +58,7 @@ $r_p \sim 1$–$10$ Mpc/$h$. The emulator is defined for $M_{200m}$ halos, so
 use `mass_definition="MassDef200m"` with it.
 
 ```python
-model = HaloModel(cosmo, z=1.0, hod_type="ELG_MHMQ", units_per_h=True,
+model = HaloModel(cosmo, z=1.0, hod_type="ELG_mHMQ", units_per_h=True,
                   mass_definition="MassDef200m", include_beta_nl=True,
                   beta_nl_kwargs={"log_M_min": 11.5, "log_M_max": 15.0})
 ```

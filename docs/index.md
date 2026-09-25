@@ -20,7 +20,7 @@ NRVpy models the galaxy–halo connection two ways, one page each:
 
 [HOD models](hod_models.md) gives the occupation functions both use.
 [Validation](validation.md) lists the tests that check each part against an
-independent reference.
+independent reference. [API](api.md) documents the main classes and functions.
 
 ## Install
 
@@ -29,9 +29,9 @@ git clone https://github.com/rpaviot/NRV_HOD.git && cd NRV_HOD
 pip install -e .
 ```
 
-Optional: `pycorr` (pair counts, numerical model), `dark_emulator` +
-`interpax` ($\beta^{\rm NL}$), `nautilus-sampler` and `iminuit` (fitting).
-pyccl needs CAMB (installed with pyccl from conda-forge; with pip,
+This installs every dependency, including pycorr (pair counts),
+dark_emulator + interpax ($\beta^{\rm NL}$), nautilus-sampler and iminuit
+(fitting). pyccl needs CAMB (installed with pyccl from conda-forge; with pip,
 `pip install camb`).
 
 ## Units
@@ -49,4 +49,5 @@ hod_models
 analytical
 numerical
 validation
+api
 ```

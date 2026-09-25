@@ -27,8 +27,9 @@ git clone https://github.com/rpaviot/NRV_HOD.git && cd NRV_HOD
 pip install -e .
 ```
 
-Optional: `pycorr` (pair counts), `dark_emulator` + `interpax` (non-linear
-bias), `nautilus-sampler`, `iminuit`.
+This installs every dependency, including pycorr (pair counts),
+dark_emulator + interpax (non-linear bias), nautilus-sampler and iminuit.
+pyccl needs CAMB (conda-forge, or `pip install camb`).
 
 ## Quick start
 

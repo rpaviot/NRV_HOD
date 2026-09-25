@@ -4,14 +4,15 @@ An HOD gives the mean number of central and satellite galaxies in a halo of
 mass $M$. Centrals are Bernoulli draws, satellites Poisson draws. Masses are
 in $M_\odot/h$; mass parameters are $\log_{10}$ values, written
 `log10Mmin` / `log10M1` in the analytical model and `Mmin` / `M1` in the
-numerical one. Below, $\mu = \log_{10} M$.
+numerical one. Below, $\mu = \log_{10} M$. Model names are
+case-insensitive.
 
 | Model | Centrals | Satellites | Analytical | Numerical |
 |-------|----------|------------|:---:|:---:|
-| `LRG` | error function | power law | ✓ | ✓ |
-| `ELG_GHOD` | Gaussian | power law | ✓ | ✓ |
-| `ELG_SFR` | Gaussian + power-law tail | power law | ✓ | ✓ |
-| `ELG_MHMQ` / `ELG_mHMQ` | skewed Gaussian | power law | ✓ | ✓ |
+| `LRG` | error function | power law or cut-off | ✓ | ✓ |
+| `ELG_GHOD` | Gaussian | power law or cut-off | ✓ | ✓ |
+| `ELG_SFR` | Gaussian + power-law tail | power law or cut-off | ✓ | ✓ |
+| `ELG_mHMQ` | skewed Gaussian | power law or cut-off | ✓ | ✓ |
 | `CSMF` | conditional stellar mass function | idem | ✓ | |
 
 ## Centrals
@@ -44,18 +45,25 @@ $$\langle N_{\rm cen}\rangle = N_{\rm GHOD}(\mu)\left[1 + {\rm erf}\left(\frac{\
 
 ## Satellites
 
-All four share one power law, switched on above $\kappa M_{\min}$:
+Any central form combines with either satellite form, chosen by
+`satellite_occupation` — in `HaloModel(...)` and in
+`HaloOccupation.set_halo_model(...)`:
 
-$$\langle N_{\rm sat}\rangle = A_s\left(\frac{M - \kappa M_{\min}}{M_1}\right)^{\alpha}, \qquad M > \kappa M_{\min}$$
+- `"power_law"` (default), switched on above $\kappa M_{\min}$:
 
-The numerical model has two alternatives:
+  $$\langle N_{\rm sat}\rangle = A_s\left(\frac{M - \kappa M_{\min}}{M_1}\right)^{\alpha}, \qquad M > \kappa M_{\min}$$
 
-- **ELG cut-off** — `set_halo_model(..., elg_satellite=True)`, with
-  parameters `Mcut` and `Mmax`:
-  $\langle N_{\rm sat}\rangle = A_s (M/M_1)^{\alpha}\, e^{-M_{\rm cut}/M}\, e^{-M/M_{\max}}$.
-- **Conformity** — `set_halo_model(..., conformity=True)`: in halos where a
-  central was drawn, $M_1$ becomes $\kappa_{EE} M_1$ (AbacusHOD; Yuan et al.
-  2022). $\kappa_{EE} < 1$ puts more satellites around existing centrals.
+- `"exp_cutoff"`, smooth cut-offs at both ends (parameters `Mcut`, `Mmax`;
+  `log10Mcut`, `log10Mmax` in the analytical model):
+
+  $$\langle N_{\rm sat}\rangle = A_s\left(\frac{M}{M_1}\right)^{\alpha} e^{-M_{\rm cut}/M}\, e^{-M/M_{\max}}$$
+
+The two models give identical occupations for the same parameters.
+
+**Conformity** (numerical model) — `set_halo_model(..., conformity=True)`:
+in halos where a central was drawn, $M_1$ becomes $\kappa_{EE} M_1$
+(AbacusHOD; Yuan et al. 2022), with either satellite form. $\kappa_{EE} < 1$
+puts more satellites around existing centrals.
 
 ## Normalisation
 

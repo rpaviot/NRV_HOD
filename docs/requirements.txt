@@ -1,3 +1,7 @@
 sphinx>=7
 furo
 myst-parser
+numpy
+scipy
+pandas
+jax
