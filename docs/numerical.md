@@ -101,7 +101,7 @@ prediction is the expectation value of the Monte-Carlo pipeline, without its
 noise, in well under a second: fast enough to call inside a nested sampler.
 
 ```python
-from HOD_NRV.HOD_numerical.twopoint_calculator.halo_center_lensing import (
+from HOD_NRV.HOD_numerical.twopoint_calculator import (
     precompute_halo_center_lensing, HaloCenterLensingCache, TabulatedDeltaSigma)
 
 cache = precompute_halo_center_lensing(          # once per box (hours)
@@ -123,7 +123,7 @@ rp, ds, info = tab.predict(hod)
   analytic, so $f_{\rm exp}$, $\tau$ and $\lambda_{\rm NFW}$ can vary freely
   with no retabulation.
 
-`TabulatedWgg` (`twopoint_calculator.tabulated_wgg`) does the same for
+`TabulatedWgg` (same module) does the same for
 $w_{gg}$ from halo–halo pair counts between bins
 (`precompute_wgg_tabulation`).
 

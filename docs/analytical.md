@@ -90,18 +90,18 @@ handle it:
 
 Two fitters wrap the model.
 
-**`AnalyticalHODFitter`** (`HOD_analytical.analytical_sampler`) fits
+**`AnalyticalHODFitter`** fits
 $\Delta\Sigma$ and optionally $w_{gg}$ with the LRG / ELG HODs at fixed
 $n_{\rm gal}$, with separate scale cuts for each probe, and runs iminuit
 (`minimize`) or nautilus (`run`).
 
-**`CSMFFitter`** (`HOD_analytical.sampler`) fits a conditional stellar mass
+**`CSMFFitter`** fits a conditional stellar mass
 function HOD (Yang et al. 2008; Dvornik et al. 2023) to
 $\Delta\Sigma$ in several stellar-mass bins at once. This is how the
 UNIONS × DESI analysis used the package:
 
 ```python
-from HOD_NRV.HOD_analytical.sampler import (
+from HOD_NRV.HOD_analytical import (
     CSMFFitter, DEFAULT_CSMF_PRIORS, DEFAULT_COSMO_PARAMS, ParameterPrior)
 
 fitter = CSMFFitter(
@@ -112,8 +112,8 @@ fitter = CSMFFitter(
     units_per_h=True,
     halo_model_kwargs={"mass_definition": "MassDef200m"},
 )
-fitter.load_lrg_data("data/", mass_bins=[0, 1, 2, 3])        # one file per bin
-fitter.load_bgs_data("data/", mass_bins=[0, 1, 2], selection="SFR")
+fitter.load_data("data/", "LRG", mass_bins=[0, 1, 2, 3])     # one file per bin
+fitter.load_data("data/", "BGS_SFR", mass_bins=[0, 1, 2])    # or "BGS_GMM"
 
 priors = dict(DEFAULT_CSMF_PRIORS)
 priors["gamma1"] = ParameterPrior(name="gamma1", prior_type="gaussian",
@@ -126,6 +126,7 @@ fitter.run(n_live=2000, n_eff=10000)          # nautilus posterior
 fitter.save_results("csmf_fit.npz")
 ```
 
-`load_lrg_data` also applies the lens-magnification correction. The
+For LRG bins, `load_data` also applies the lens-magnification correction.
+`file_pattern` (one `{}` for the mass-bin index) sets the file names. The
 priors cover the CSMF parameters and the concentration normalisations
 $f_h$, $f_s$ of the matter and satellite profiles.

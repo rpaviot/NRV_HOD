@@ -489,8 +489,8 @@ class CSMFFitter:
     ...     rp_max=30.0,
     ...     include_beta_nl=False
     ... )
-    >>> fitter.load_bgs_data('/path/to/data/', mass_bins=[0, 1, 2, 3])
-    >>> fitter.load_lrg_data('/path/to/data/', mass_bins=[0, 1, 2, 3])
+    >>> fitter.load_data('/path/to/data/', 'BGS_SFR', mass_bins=[0, 1, 2, 3])
+    >>> fitter.load_data('/path/to/data/', 'LRG', mass_bins=[0, 1, 2, 3])
     >>> fitter.set_priors(fixed_params={'f_h': 1.0, 'f_s': 1.0})
     >>> result = fitter.minimize_de(maxiter=1000, workers=-1)
     """
@@ -585,7 +585,8 @@ class CSMFFitter:
         file_pattern: Optional[str] = None
     ):
         """
-        Load BGS (Bright Galaxy Survey) data.
+        Load BGS (Bright Galaxy Survey) data. Same as
+        ``load_data(data_dir, 'BGS_SFR' or 'BGS_GMM', ...)``.
         
         Parameters
         ----------
@@ -639,6 +640,7 @@ class CSMFFitter:
     ):
         """
         Load LRG (Luminous Red Galaxy) data with magnification correction.
+        Same as ``load_data(data_dir, 'LRG', ...)``.
         
         Parameters
         ----------
@@ -702,14 +704,57 @@ class CSMFFitter:
     def load_data(
         self,
         data_dir: str,
+        sample: str = 'BGS_SFR',
         mass_bins: Optional[List[int]] = None,
-        file_pattern: str = 'dsigma_wgg_BGS_massbin{}.npz'
+        file_pattern: Optional[str] = None,
+        alpha_values: Optional[Dict[int, float]] = None,
     ):
         """
-        Legacy method for backward compatibility.
-        Loads data assuming BGS SFR selection.
+        Load the DeltaSigma measurements of one galaxy sample, one file per
+        stellar-mass bin. Call once per sample to fit several together.
+
+        Parameters
+        ----------
+        data_dir : str
+            Directory containing the data files.
+        sample : {'LRG', 'BGS_SFR', 'BGS_GMM'}
+            Galaxy sample ('SFR' and 'GMM' are accepted for the BGS ones).
+            LRG bins also get the lens-magnification correction.
+        mass_bins : list of int, optional
+            Mass-bin indices to load. Default: 0-3 for LRG, 0-7 for BGS.
+        file_pattern : str, optional
+            File name with one ``{}`` for the mass-bin index. Default depends
+            on the sample.
+        alpha_values : dict, optional
+            LRG only: magnification slope alpha per mass bin. Default
+            {0: 2.14, 1: 2.25, 2: 2.70, 3: 3.20}.
+
+        Examples
+        --------
+        >>> fitter.load_data('data/', 'LRG', mass_bins=[0, 1, 2, 3])
+        >>> fitter.load_data('data/', 'BGS_SFR', mass_bins=[0, 1, 2])
         """
-        self.load_bgs_data(data_dir, mass_bins, selection='SFR', file_pattern=file_pattern)
+        if isinstance(sample, (list, tuple)):
+            # old signature load_data(data_dir, mass_bins, file_pattern): BGS SFR
+            warnings.warn("load_data(data_dir, mass_bins) is deprecated; use "
+                          "load_data(data_dir, sample, mass_bins=...)",
+                          DeprecationWarning, stacklevel=2)
+            mass_bins, sample = list(sample), 'BGS_SFR'
+            if file_pattern is None:
+                file_pattern = 'dsigma_wgg_BGS_massbin{}.npz'
+        key = sample.upper()
+        if key == 'LRG':
+            self.load_lrg_data(data_dir, mass_bins, file_pattern=file_pattern,
+                               alpha_values=alpha_values)
+        elif key in ('BGS_SFR', 'SFR', 'BGS_GMM', 'GMM'):
+            if alpha_values is not None:
+                raise ValueError("alpha_values (magnification) is for LRG only")
+            self.load_bgs_data(data_dir, mass_bins,
+                               selection='GMM' if 'GMM' in key else 'SFR',
+                               file_pattern=file_pattern)
+        else:
+            raise ValueError(f"Unknown sample {sample!r}: use 'LRG', 'BGS_SFR' "
+                             f"or 'BGS_GMM'")
     
     def set_priors(
         self,
@@ -769,7 +814,7 @@ class CSMFFitter:
  #       from HOD_NRV.HOD_analytical.halo_model import HaloModel
         
         if not self.mass_bins:
-            raise ValueError("No data loaded. Call load_bgs_data() or load_lrg_data() first.")
+            raise ValueError("No data loaded. Call load_data() first.")
         
         self._z_eff_array = np.array([mb.z_eff for mb in self.mass_bins])
         
@@ -1355,7 +1400,7 @@ class CSMFFitter:
             raise ImportError("iminuit is required. Install with: pip install iminuit")
         
         if not self.mass_bins:
-            raise ValueError("No data loaded. Call load_bgs_data() or load_lrg_data() first.")
+            raise ValueError("No data loaded. Call load_data() first.")
         
         if not self.priors:
             print("No priors set. Using defaults.")
@@ -1530,7 +1575,7 @@ class CSMFFitter:
             Container with best-fit values, chi2, errors, etc.
         """
         if not self.mass_bins:
-            raise ValueError("No data loaded. Call load_bgs_data() or load_lrg_data() first.")
+            raise ValueError("No data loaded. Call load_data() first.")
         
         if not self.priors:
             print("No priors set. Using defaults.")
@@ -1761,7 +1806,7 @@ class CSMFFitter:
             raise ImportError("nautilus-sampler is required")
         
         if not self.mass_bins:
-            raise ValueError("No data loaded. Call load_bgs_data() or load_lrg_data() first.")
+            raise ValueError("No data loaded. Call load_data() first.")
         
         if not self.priors:
             print("No priors set. Using defaults.")
@@ -2074,11 +2119,11 @@ def create_fitter_from_config(
     
     # Load BGS data
     if bgs_mass_bins is not None:
-        fitter.load_bgs_data(data_dir, bgs_mass_bins, selection=bgs_selection)
+        fitter.load_data(data_dir, f'BGS_{bgs_selection}', mass_bins=bgs_mass_bins)
     
     # Load LRG data
     if lrg_mass_bins is not None:
-        fitter.load_lrg_data(data_dir, lrg_mass_bins)
+        fitter.load_data(data_dir, 'LRG', mass_bins=lrg_mass_bins)
     
     # Set priors
     priors = {}

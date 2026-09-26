@@ -178,11 +178,10 @@ model = HaloModel(cosmo, z=[0.5], hod_type='LRG',
 ### CSMF HOD fitting
 
 ```python
-from HOD_NRV.HOD_analytical import HaloModel
-from HOD_NRV.HOD_analytical.sampler import CSMFFitter
+from HOD_NRV.HOD_analytical import CSMFFitter
 
-fitter = CSMFFitter(cosmo, z_bins=[0.5], hod_type='CSMF')
-fitter.load_data('data/', mass_bins=[(10.0, 10.5), (10.5, 11.0)])
+fitter = CSMFFitter(cosmo_params=cosmo, observables=['DeltaSigma'])
+fitter.load_data('data/', 'LRG', mass_bins=[0, 1, 2, 3])       # or 'BGS_SFR' / 'BGS_GMM'
 fitter.set_priors(priors_dict)
 result = fitter.minimize(start_params)
 ```
