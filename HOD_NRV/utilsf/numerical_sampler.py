@@ -583,6 +583,12 @@ class TabulatedFitter:
         return wgg
 
     def log_likelihood(self, theta) -> float:
+        """Gaussian log-likelihood of one point, DeltaSigma plus wgg if fitted.
+
+        ``theta`` is a dict or a sequence ordered as ``param_names`` (free
+        parameters only). Returns -1e100 where the prediction fails, is not
+        finite, or the satellite fraction exceeds ``max_fsat``.
+        """
         if isinstance(theta, dict):
             free_dict = dict(theta)
         else:
