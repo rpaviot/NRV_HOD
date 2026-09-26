@@ -77,13 +77,14 @@ from scipy.optimize import differential_evolution, minimize as scipy_minimize
 # ============================================================================
 
 class SampleType(Enum):
-    """Galaxy sample types."""
+    """Sample names of the DESI BGS/LRG files (kept for old scripts)."""
     BGS_SFR = "BGS_SFR"
     BGS_GMM = "BGS_GMM"
     LRG = "LRG"
 
 
-# LRG magnification alpha coefficients (alpha - 1 factors)
+# Default LRG magnification alpha coefficients (alpha - 1 factors), used by
+# load_lrg_data only; load_data applies magnification only if given alpha_values
 # alpha values: 2.14, 2.25, 2.7, 3.2 for mass bins 0,1,2,3
 # Factor (alpha - 1) because the factor 2 is already in mag_contribution
 LRG_ALPHA_MINUS_ONE = {
@@ -196,13 +197,14 @@ class MassBinData:
     """
     Container for a single stellar mass bin's data.
     
-    Supports BGS (SFR/GMM) and LRG samples with optional magnification correction.
+    Any sample; the lens-magnification correction is applied when
+    ``alpha_minus_one`` is set and the file holds ``mag_contribution``.
     """
     massbin_id: int
     z_eff: float
     logmstar_min: float
     logmstar_max: float
-    sample_type: SampleType = SampleType.BGS_SFR
+    sample: str = ''    # sample label; (sample, massbin_id) identifies a bin
     logmstar_median: Optional[float] = None
     
     # Delta Sigma data
@@ -225,7 +227,7 @@ class MassBinData:
 
     # Magnification contribution (for LRG)
     mag_contribution: Optional[np.ndarray] = None
-    alpha_minus_one: Optional[float] = None  # (alpha - 1) factor for LRG
+    alpha_minus_one: Optional[float] = None  # (alpha - 1); None = no correction
     
     # Other
     mean_sigma_crit: Optional[np.ndarray] = None
@@ -235,19 +237,14 @@ class MassBinData:
             self.rp_wgg = self.rp.copy() if len(self.rp) > 0 else np.array([])
         if self.rp_bins_wgg is None:
             self.rp_bins_wgg = self.rp_bins.copy() if len(self.rp_bins) > 0 else np.array([])
-        
-        # Set alpha_minus_one for LRG if not provided
-        if self.sample_type == SampleType.LRG and self.alpha_minus_one is None:
-            self.alpha_minus_one = LRG_ALPHA_MINUS_ONE.get(self.massbin_id, 1.0)
     
     def get_corrected_delta_sigma(self) -> np.ndarray:
         """
-        Get Delta Sigma with magnification correction applied (for LRG).
-        
-        For LRG samples: DS_corrected = DS_measured - (alpha - 1) * mag_contribution
-        For BGS samples: returns the original delta_sigma unchanged.
+        Get Delta Sigma with the magnification correction applied:
+        DS_corrected = DS_measured - (alpha - 1) * mag_contribution when
+        alpha_minus_one is set, else the measured delta_sigma unchanged.
         """
-        if self.sample_type == SampleType.LRG and self.mag_contribution is not None:
+        if self.alpha_minus_one is not None and self.mag_contribution is not None:
             correction = self.alpha_minus_one * self.mag_contribution
             return self.delta_sigma - correction
         else:
@@ -258,8 +255,9 @@ class MassBinData:
         cls,
         filepath: str,
         massbin_id: int,
-        sample_type: SampleType,
-        h: float = 0.6766
+        sample: str = '',
+        h: float = 0.6766,
+        alpha_minus_one: Optional[float] = None,
     ) -> 'MassBinData':
         """
         Load mass bin data from npz file.
@@ -270,10 +268,12 @@ class MassBinData:
             Path to the npz file
         massbin_id : int
             Mass bin identifier
-        sample_type : SampleType
-            Type of galaxy sample (BGS_SFR, BGS_GMM, or LRG)
+        sample : str
+            Sample label.
         h : float
             Hubble parameter (for unit conversions if needed)
+        alpha_minus_one : float, optional
+            (alpha - 1) of the magnification correction; None for none.
         """
         data = np.load(filepath)
         
@@ -302,13 +302,10 @@ class MassBinData:
         n_gal_err = data.get('n_gal_err', None)
         n_gal_err = float(n_gal_err) if n_gal_err is not None else None
 
-        # Load magnification contribution if available (for LRG)
         mag_contribution = data.get('mag_contribution', None)
-        
-        # Get alpha_minus_one for LRG
-        alpha_minus_one = None
-        if sample_type == SampleType.LRG:
-            alpha_minus_one = LRG_ALPHA_MINUS_ONE.get(massbin_id, 1.0)
+        if alpha_minus_one is not None and mag_contribution is None:
+            raise ValueError(f"{filepath}: alpha given but the file has no "
+                             f"'mag_contribution' for the magnification correction")
         
         return cls(
             massbin_id=massbin_id,
@@ -317,7 +314,7 @@ class MassBinData:
             logmstar_max=float(data['logmstar_max']),
             logmstar_median=float(data.get('logmstar_median', 
                                            0.5 * (data['logmstar_min'] + data['logmstar_max']))),
-            sample_type=sample_type,
+            sample=getattr(sample, 'value', sample),
             rp=rp,
             rp_bins=data['rp_bins'],
             delta_sigma=data['delta_sigma'],
@@ -453,8 +450,8 @@ class CSMFFitter:
     CSMF HOD Fitter v2 - Updated for new HaloModel API.
     
     Supports:
-    - BGS samples (SFR and GMM selection)
-    - LRG samples with magnification correction
+    - any number of galaxy samples, each in several stellar-mass bins
+    - optional lens-magnification correction per sample
     - Optional β^NL (non-linear bias) correction
     - Multiple fitting methods: differential evolution, iminuit, nautilus
     
@@ -489,8 +486,9 @@ class CSMFFitter:
     ...     rp_max=30.0,
     ...     include_beta_nl=False
     ... )
-    >>> fitter.load_data('/path/to/data/', 'BGS_SFR', mass_bins=[0, 1, 2, 3])
-    >>> fitter.load_data('/path/to/data/', 'LRG', mass_bins=[0, 1, 2, 3])
+    >>> fitter.load_data('/path/to/data/', 'BGS_massbin{}.npz', [0, 1, 2, 3])
+    >>> fitter.load_data('/path/to/data/', 'LRG_massbin{}.npz', [0, 1, 2, 3],
+    ...                  alpha_values={0: 2.14, 1: 2.25, 2: 2.70, 3: 3.20})
     >>> fitter.set_priors(fixed_params={'f_h': 1.0, 'f_s': 1.0})
     >>> result = fitter.minimize_de(maxiter=1000, workers=-1)
     """
@@ -530,9 +528,8 @@ class CSMFFitter:
             cosmo_params = DEFAULT_COSMO_PARAMS
         self.cosmo_params = cosmo_params
         
-        # Data storage - separate lists for different sample types
-        self.bgs_mass_bins: List[MassBinData] = []
-        self.lrg_mass_bins: List[MassBinData] = []
+        # Data storage: one list of mass bins per sample, in load order
+        self.samples: Dict[str, List[MassBinData]] = {}
         
         # Combined list for fitting
         self.mass_bins: List[MassBinData] = []
@@ -565,196 +562,113 @@ class CSMFFitter:
             print(f"  rp range (WGG): [{self.rp_min_wgg}, {self.rp_max_wgg}]")
             if self.halo_model_kwargs:
                 print(f"  halo model overrides: {self.halo_model_kwargs}")
-    #dsigma_wgg_pip_lowscales_LRG_
-    def _get_file_pattern(self, sample_type: SampleType) -> str:
-        """Get the file pattern for a given sample type."""
-        if sample_type == SampleType.BGS_SFR:
-            return 'dsigma_wgg_PIP_lowscales_BGS_massbin{}.npz'
-        elif sample_type == SampleType.BGS_GMM:
-            return 'dsigma_wgg_PIP_lowscales_BGS_GMM_massbin{}.npz'
-        elif sample_type == SampleType.LRG:
-            return 'dsigma_wgg_CP_lowscales_LRG_massbin{}.npz'
-        else:
-            raise ValueError(f"Unknown sample type: {sample_type}")
-    
-    def load_bgs_data(
-        self,
-        data_dir: str,
-        mass_bins: Optional[List[int]] = None,
-        selection: str = 'SFR',
-        file_pattern: Optional[str] = None
-    ):
-        """
-        Load BGS (Bright Galaxy Survey) data. Same as
-        ``load_data(data_dir, 'BGS_SFR' or 'BGS_GMM', ...)``.
-        
-        Parameters
-        ----------
-        data_dir : str
-            Directory containing the data files
-        mass_bins : list of int, optional
-            Mass bin indices to load. Default: [0, 1, 2, 3, 4, 5, 6, 7]
-        selection : str
-            Selection type: 'SFR' or 'GMM'. Default: 'SFR'
-        file_pattern : str, optional
-            Custom file pattern. If None, uses default for selection type.
-        """
-        if mass_bins is None:
-            mass_bins = list(range(8))
-        
-        sample_type = SampleType.BGS_SFR if selection.upper() == 'SFR' else SampleType.BGS_GMM
-        
-        if file_pattern is None:
-            file_pattern = self._get_file_pattern(sample_type)
-        
-        self.bgs_mass_bins = []
-        
-        for mb in mass_bins:
-            filepath = os.path.join(data_dir, file_pattern.format(mb))
-            
-            if not os.path.exists(filepath):
-                warnings.warn(f"File not found: {filepath}")
-                continue
-            
-            data = MassBinData.from_npz(
-                filepath, mb, sample_type, self.cosmo_params['h']
-            )
-            self.bgs_mass_bins.append(data)
-            
-            if self.verbose:
-                print(f"Loaded BGS {selection} mass bin {mb}: z_eff={data.z_eff:.3f}, "
-                      f"log(M*)=[{data.logmstar_min:.2f}, {data.logmstar_max:.2f}]")
-        
-        self.bgs_mass_bins.sort(key=lambda x: x.z_eff)
-        self._update_combined_mass_bins()
-        
-        if self.verbose:
-            print(f"Total BGS bins loaded: {len(self.bgs_mass_bins)}")
-    
-    def load_lrg_data(
-        self,
-        data_dir: str,
-        mass_bins: Optional[List[int]] = None,
-        file_pattern: Optional[str] = None,
-        alpha_values: Optional[Dict[int, float]] = None
-    ):
-        """
-        Load LRG (Luminous Red Galaxy) data with magnification correction.
-        Same as ``load_data(data_dir, 'LRG', ...)``.
-        
-        Parameters
-        ----------
-        data_dir : str
-            Directory containing the data files
-        mass_bins : list of int, optional
-            Mass bin indices to load. Default: [0, 1, 2, 3]
-        file_pattern : str, optional
-            Custom file pattern. If None, uses default.
-        alpha_values : dict, optional
-            Custom alpha values for each mass bin. If None, uses defaults:
-            {0: 2.14, 1: 2.25, 2: 2.70, 3: 3.20}
-        """
-        if mass_bins is None:
-            mass_bins = list(range(4))
-        
-        if file_pattern is None:
-            file_pattern = self._get_file_pattern(SampleType.LRG)
-        
-        # Update alpha values if provided
-        if alpha_values is not None:
-            for mb, alpha in alpha_values.items():
-                LRG_ALPHA_MINUS_ONE[mb] = alpha - 1
-        
-        self.lrg_mass_bins = []
-        
-        for mb in mass_bins:
-            filepath = os.path.join(data_dir, file_pattern.format(mb))
-            
-            if not os.path.exists(filepath):
-                warnings.warn(f"File not found: {filepath}")
-                continue
-            
-            data = MassBinData.from_npz(
-                filepath, mb, SampleType.LRG, self.cosmo_params['h']
-            )
-            self.lrg_mass_bins.append(data)
-            
-            if self.verbose:
-                has_mag = data.mag_contribution is not None
-                mag_status = f"(α-1={data.alpha_minus_one:.2f})" if has_mag else "(no mag)"
-                print(f"Loaded LRG mass bin {mb}: z_eff={data.z_eff:.3f}, "
-                      f"log(M*)=[{data.logmstar_min:.2f}, {data.logmstar_max:.2f}] {mag_status}")
-        
-        self.lrg_mass_bins.sort(key=lambda x: x.z_eff)
-        self._update_combined_mass_bins()
-        
-        if self.verbose:
-            print(f"Total LRG bins loaded: {len(self.lrg_mass_bins)}")
-    
-    def _update_combined_mass_bins(self):
-        """Update the combined mass bins list from BGS and LRG."""
-        self.mass_bins = self.bgs_mass_bins + self.lrg_mass_bins
-        self.mass_bins.sort(key=lambda x: (x.sample_type.value, x.z_eff))
-        
-        if self.verbose and self.mass_bins:
-            print(f"\nTotal mass bins for fitting: {len(self.mass_bins)}")
-            print(f"  BGS: {len(self.bgs_mass_bins)}")
-            print(f"  LRG: {len(self.lrg_mass_bins)}")
-    
     def load_data(
         self,
         data_dir: str,
-        sample: str = 'BGS_SFR',
-        mass_bins: Optional[List[int]] = None,
-        file_pattern: Optional[str] = None,
-        alpha_values: Optional[Dict[int, float]] = None,
+        file_pattern: str,
+        mass_bins: List[int],
+        name: Optional[str] = None,
+        alpha_values: Optional[Union[float, Dict[int, float]]] = None,
     ):
         """
-        Load the DeltaSigma measurements of one galaxy sample, one file per
+        Load the measurements of one galaxy sample, one npz file per
         stellar-mass bin. Call once per sample to fit several together.
 
         Parameters
         ----------
         data_dir : str
             Directory containing the data files.
-        sample : {'LRG', 'BGS_SFR', 'BGS_GMM'}
-            Galaxy sample ('SFR' and 'GMM' are accepted for the BGS ones).
-            LRG bins also get the lens-magnification correction.
-        mass_bins : list of int, optional
-            Mass-bin indices to load. Default: 0-3 for LRG, 0-7 for BGS.
-        file_pattern : str, optional
-            File name with one ``{}`` for the mass-bin index. Default depends
-            on the sample.
-        alpha_values : dict, optional
-            LRG only: magnification slope alpha per mass bin. Default
-            {0: 2.14, 1: 2.25, 2: 2.70, 3: 3.20}.
+        file_pattern : str
+            File name with one ``{}`` for the mass-bin index, e.g.
+            ``'dsigma_wgg_LRG_massbin{}.npz'``.
+        mass_bins : list of int
+            Mass-bin indices to load.
+        name : str, optional
+            Label of the sample (default: ``file_pattern``). Loading the same
+            name again replaces it.
+        alpha_values : float or dict, optional
+            Magnification slope alpha, one value or one per mass bin. If given,
+            DeltaSigma is corrected by (alpha - 1) * mag_contribution (from the
+            file). Default: no correction.
+
+        Notes
+        -----
+        Each file holds ``z_eff``, ``logmstar_min``, ``logmstar_max``,
+        ``rp`` (or ``rp_delta_sigma``), ``rp_bins``, ``delta_sigma``,
+        ``delta_sigma_err`` and ``cov_delta_sigma`` (or ``covariance_matrix``);
+        optionally ``wp``, ``wp_err``, ``cov_wgg``, ``rp_wgg``, ``n_gal``,
+        ``logmstar_median`` and ``mag_contribution``.
 
         Examples
         --------
-        >>> fitter.load_data('data/', 'LRG', mass_bins=[0, 1, 2, 3])
-        >>> fitter.load_data('data/', 'BGS_SFR', mass_bins=[0, 1, 2])
+        >>> fitter.load_data('data/', 'dsigma_wgg_BGS_massbin{}.npz', [0, 1, 2])
+        >>> fitter.load_data('data/', 'dsigma_wgg_LRG_massbin{}.npz', [0, 1, 2, 3],
+        ...                  alpha_values={0: 2.14, 1: 2.25, 2: 2.70, 3: 3.20})
         """
-        if isinstance(sample, (list, tuple)):
+        if not isinstance(file_pattern, str):
             # old signature load_data(data_dir, mass_bins, file_pattern): BGS SFR
             warnings.warn("load_data(data_dir, mass_bins) is deprecated; use "
-                          "load_data(data_dir, sample, mass_bins=...)",
+                          "load_data(data_dir, file_pattern, mass_bins)",
                           DeprecationWarning, stacklevel=2)
-            mass_bins, sample = list(sample), 'BGS_SFR'
-            if file_pattern is None:
-                file_pattern = 'dsigma_wgg_BGS_massbin{}.npz'
-        key = sample.upper()
-        if key == 'LRG':
-            self.load_lrg_data(data_dir, mass_bins, file_pattern=file_pattern,
-                               alpha_values=alpha_values)
-        elif key in ('BGS_SFR', 'SFR', 'BGS_GMM', 'GMM'):
-            if alpha_values is not None:
-                raise ValueError("alpha_values (magnification) is for LRG only")
-            self.load_bgs_data(data_dir, mass_bins,
-                               selection='GMM' if 'GMM' in key else 'SFR',
-                               file_pattern=file_pattern)
-        else:
-            raise ValueError(f"Unknown sample {sample!r}: use 'LRG', 'BGS_SFR' "
-                             f"or 'BGS_GMM'")
+            file_pattern, mass_bins = (mass_bins or 'dsigma_wgg_BGS_massbin{}.npz',
+                                       file_pattern)
+            name = name or 'BGS_SFR'
+        if '{}' not in file_pattern:
+            raise ValueError(f"file_pattern {file_pattern!r} needs a '{{}}' "
+                             f"for the mass-bin index")
+        name = name or file_pattern
+
+        bins = []
+        for mb in mass_bins:
+            filepath = os.path.join(data_dir, file_pattern.format(mb))
+            if not os.path.exists(filepath):
+                warnings.warn(f"File not found: {filepath}")
+                continue
+            if alpha_values is None:
+                amo = None
+            elif isinstance(alpha_values, dict):
+                amo = alpha_values[mb] - 1
+            else:
+                amo = float(alpha_values) - 1
+            data = MassBinData.from_npz(filepath, mb, name, self.cosmo_params['h'],
+                                        alpha_minus_one=amo)
+            bins.append(data)
+            if self.verbose:
+                mag = f" (alpha-1={amo:.2f})" if amo is not None else ""
+                print(f"Loaded {name} mass bin {mb}: z_eff={data.z_eff:.3f}, "
+                      f"log(M*)=[{data.logmstar_min:.2f}, {data.logmstar_max:.2f}]{mag}")
+
+        self.samples[name] = sorted(bins, key=lambda x: x.z_eff)
+        self.mass_bins = [mb for b in self.samples.values() for mb in b]
+        if self.verbose:
+            print(f"Total mass bins for fitting: {len(self.mass_bins)} "
+                  f"({', '.join(f'{k}: {len(v)}' for k, v in self.samples.items())})")
+
+    # DESI BGS/LRG loaders of the UNIONS x DESI analysis, kept for old scripts
+    _DESI_PATTERNS = {
+        SampleType.BGS_SFR: 'dsigma_wgg_PIP_lowscales_BGS_massbin{}.npz',
+        SampleType.BGS_GMM: 'dsigma_wgg_PIP_lowscales_BGS_GMM_massbin{}.npz',
+        SampleType.LRG: 'dsigma_wgg_CP_lowscales_LRG_massbin{}.npz',
+    }
+
+    def load_bgs_data(self, data_dir: str, mass_bins: Optional[List[int]] = None,
+                      selection: str = 'SFR', file_pattern: Optional[str] = None):
+        """``load_data`` with the DESI BGS file names; selection 'SFR' or 'GMM'."""
+        st = SampleType.BGS_SFR if selection.upper() == 'SFR' else SampleType.BGS_GMM
+        self.load_data(data_dir, file_pattern or self._DESI_PATTERNS[st],
+                       list(range(8)) if mass_bins is None else mass_bins, name=st.value)
+
+    def load_lrg_data(self, data_dir: str, mass_bins: Optional[List[int]] = None,
+                      file_pattern: Optional[str] = None,
+                      alpha_values: Optional[Dict[int, float]] = None):
+        """``load_data`` with the DESI LRG file names and default alphas."""
+        if mass_bins is None:
+            mass_bins = list(range(4))
+        alphas = {mb: amo + 1 for mb, amo in LRG_ALPHA_MINUS_ONE.items()}
+        alphas.update(alpha_values or {})
+        self.load_data(data_dir, file_pattern or self._DESI_PATTERNS[SampleType.LRG],
+                       mass_bins, name=SampleType.LRG.value,
+                       alpha_values={mb: alphas.get(mb, 2.0) for mb in mass_bins})
     
     def set_priors(
         self,
@@ -845,7 +759,7 @@ class CSMFFitter:
         # Create unique identifier for each mass bin
         self._massbin_uid_to_index = {}
         for i, mb in enumerate(self.mass_bins):
-            uid = (mb.sample_type.value, mb.massbin_id)
+            uid = (mb.sample, mb.massbin_id)
             self._massbin_uid_to_index[uid] = i
         
         # Build beta_nl_kwargs
@@ -914,7 +828,7 @@ class CSMFFitter:
         """
         Compute model observables for ALL mass bins simultaneously.
         
-        Returns dictionaries keyed by (sample_type, massbin_id) tuples.
+        Returns dictionaries keyed by (sample, massbin_id) tuples.
         """
         # Extract CSMF HOD parameters
         csmf_params = {
@@ -949,7 +863,7 @@ class CSMFFitter:
         # Build output dictionary
         ds_dict = {}
         for i, mass_bin in enumerate(self.mass_bins):
-            uid = (mass_bin.sample_type.value, mass_bin.massbin_id)
+            uid = (mass_bin.sample, mass_bin.massbin_id)
             if self._halo_model.is_single_z:
                 ds_dict[uid] = np.asarray(ds_all)
             else:
@@ -970,7 +884,7 @@ class CSMFFitter:
                 )
                 
                 for i, mass_bin in enumerate(self.mass_bins):
-                    uid = (mass_bin.sample_type.value, mass_bin.massbin_id)
+                    uid = (mass_bin.sample, mass_bin.massbin_id)
                     if mass_bin.wp is not None:
                         if self._halo_model.is_single_z:
                             wgg_dict[uid] = np.asarray(wgg_all)
@@ -980,11 +894,11 @@ class CSMFFitter:
                         wgg_dict[uid] = None
             else:
                 for mass_bin in self.mass_bins:
-                    uid = (mass_bin.sample_type.value, mass_bin.massbin_id)
+                    uid = (mass_bin.sample, mass_bin.massbin_id)
                     wgg_dict[uid] = None
         else:
             for mass_bin in self.mass_bins:
-                uid = (mass_bin.sample_type.value, mass_bin.massbin_id)
+                uid = (mass_bin.sample, mass_bin.massbin_id)
                 wgg_dict[uid] = None
         
         return ds_dict, wgg_dict
@@ -996,10 +910,9 @@ class CSMFFitter:
         """
         Apply r_p scale cuts to Delta Sigma data.
         
-        For LRG samples, returns magnification-corrected Delta Sigma.
+        Uses the magnification-corrected Delta Sigma where one is set.
         """
         rp = mass_bin.rp
-        # Use corrected delta sigma for LRG
         ds = mass_bin.get_corrected_delta_sigma()
         cov = mass_bin.cov_delta_sigma
         
@@ -1052,7 +965,7 @@ class CSMFFitter:
         total_log_L = 0.0
         
         for mass_bin in self.mass_bins:
-            uid = (mass_bin.sample_type.value, mass_bin.massbin_id)
+            uid = (mass_bin.sample, mass_bin.massbin_id)
             
             if 'DeltaSigma' in self.observables:
                 rp_cut, ds_data, cov, mask = self._apply_scale_cuts(mass_bin)
@@ -1952,7 +1865,7 @@ class CSMFFitter:
         Returns
         -------
         predictions : dict
-            Dictionary keyed by (sample_type, massbin_id) with model predictions
+            Dictionary keyed by (sample, massbin_id) with model predictions
         """
         if params is None:
             params = self.get_best_fit()
@@ -1961,14 +1874,14 @@ class CSMFFitter:
         
         predictions = {}
         for mass_bin in self.mass_bins:
-            uid = (mass_bin.sample_type.value, mass_bin.massbin_id)
+            uid = (mass_bin.sample, mass_bin.massbin_id)
             predictions[uid] = {
                 'rp': mass_bin.rp,
                 'delta_sigma_model': ds_dict[uid],
                 'delta_sigma_data': mass_bin.get_corrected_delta_sigma(),
                 'delta_sigma_err': mass_bin.delta_sigma_err,
                 'z_eff': mass_bin.z_eff,
-                'sample_type': mass_bin.sample_type.value,
+                'sample': mass_bin.sample,
             }
             
             if wgg_dict[uid] is not None:
@@ -1984,8 +1897,8 @@ class CSMFFitter:
         save_dict = {}
         
         # Save mass bin info
-        save_dict['n_bgs_bins'] = len(self.bgs_mass_bins)
-        save_dict['n_lrg_bins'] = len(self.lrg_mass_bins)
+        save_dict['sample_names'] = np.array(list(self.samples), dtype=str)
+        save_dict['n_bins_per_sample'] = np.array([len(v) for v in self.samples.values()])
         save_dict['include_beta_nl'] = self.include_beta_nl
         
         if self.results is not None:
@@ -2044,23 +1957,14 @@ class CSMFFitter:
         print("DATA SUMMARY")
         print("="*70)
         
-        if self.bgs_mass_bins:
-            print(f"\nBGS Mass Bins ({len(self.bgs_mass_bins)}):")
+        for name, bins in self.samples.items():
+            print(f"\n{name} ({len(bins)} mass bins):")
             print("-"*50)
-            for mb in self.bgs_mass_bins:
+            for mb in bins:
+                mag_str = (f", alpha-1={mb.alpha_minus_one:.2f}"
+                           if mb.alpha_minus_one is not None else "")
                 print(f"  Bin {mb.massbin_id}: z={mb.z_eff:.3f}, "
-                      f"log(M*)=[{mb.logmstar_min:.2f}, {mb.logmstar_max:.2f}], "
-                      f"type={mb.sample_type.value}")
-        
-        if self.lrg_mass_bins:
-            print(f"\nLRG Mass Bins ({len(self.lrg_mass_bins)}):")
-            print("-"*50)
-            for mb in self.lrg_mass_bins:
-                has_mag = mb.mag_contribution is not None
-                mag_str = f"α-1={mb.alpha_minus_one:.2f}" if has_mag else "no mag"
-                print(f"  Bin {mb.massbin_id}: z={mb.z_eff:.3f}, "
-                      f"log(M*)=[{mb.logmstar_min:.2f}, {mb.logmstar_max:.2f}], "
-                      f"{mag_str}")
+                      f"log(M*)=[{mb.logmstar_min:.2f}, {mb.logmstar_max:.2f}]{mag_str}")
         
         print(f"\nTotal mass bins for fitting: {len(self.mass_bins)}")
         print("="*70)
@@ -2119,11 +2023,11 @@ def create_fitter_from_config(
     
     # Load BGS data
     if bgs_mass_bins is not None:
-        fitter.load_data(data_dir, f'BGS_{bgs_selection}', mass_bins=bgs_mass_bins)
+        fitter.load_bgs_data(data_dir, bgs_mass_bins, selection=bgs_selection)
     
     # Load LRG data
     if lrg_mass_bins is not None:
-        fitter.load_data(data_dir, 'LRG', mass_bins=lrg_mass_bins)
+        fitter.load_lrg_data(data_dir, lrg_mass_bins)
     
     # Set priors
     priors = {}

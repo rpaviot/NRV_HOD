@@ -112,8 +112,10 @@ fitter = CSMFFitter(
     units_per_h=True,
     halo_model_kwargs={"mass_definition": "MassDef200m"},
 )
-fitter.load_data("data/", "LRG", mass_bins=[0, 1, 2, 3])     # one file per bin
-fitter.load_data("data/", "BGS_SFR", mass_bins=[0, 1, 2])    # or "BGS_GMM"
+# one npz file per stellar-mass bin; one call per sample
+fitter.load_data("data/", "dsigma_BGS_massbin{}.npz", [0, 1, 2], name="BGS")
+fitter.load_data("data/", "dsigma_LRG_massbin{}.npz", [0, 1, 2, 3], name="LRG",
+                 alpha_values={0: 2.14, 1: 2.25, 2: 2.70, 3: 3.20})
 
 priors = dict(DEFAULT_CSMF_PRIORS)
 priors["gamma1"] = ParameterPrior(name="gamma1", prior_type="gaussian",
@@ -126,7 +128,9 @@ fitter.run(n_live=2000, n_eff=10000)          # nautilus posterior
 fitter.save_results("csmf_fit.npz")
 ```
 
-For LRG bins, `load_data` also applies the lens-magnification correction.
-`file_pattern` (one `{}` for the mass-bin index) sets the file names. The
+`load_data` takes any sample: `{}` in the file pattern is the mass-bin index.
+Passing `alpha_values` (the magnification slope, one value or one per bin)
+subtracts the lens-magnification term $(\alpha-1)\,\Delta\Sigma_{\rm mag}$,
+read from the file's `mag_contribution`. The
 priors cover the CSMF parameters and the concentration normalisations
 $f_h$, $f_s$ of the matter and satellite profiles.

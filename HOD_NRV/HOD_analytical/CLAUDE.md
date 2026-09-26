@@ -102,7 +102,7 @@ CSMF HOD fitting with Nautilus nested sampling and iminuit minimization.
 **Data containers:** `MassBinData`, `ParameterPrior`, `MinuitResult`, `DifferentialEvolutionResult`
 
 **Key methods:**
-- `load_data(data_dir, mass_bins, file_pattern)` - load NPZ data files
+- `load_data(data_dir, file_pattern, mass_bins, name=None, alpha_values=None)` - load one sample (any), one NPZ per mass bin; `alpha_values` switches on the magnification correction. `load_bgs_data`/`load_lrg_data` = wrappers with the DESI file names (LRG default alphas)
 - `set_priors(priors, fixed_params)` - configure parameter space
 - `minimize(start_params)` - iminuit MIGRAD + HESSE/MINOS
 - `minimize_de(...)` - scipy differential_evolution
@@ -181,7 +181,8 @@ model = HaloModel(cosmo, z=[0.5], hod_type='LRG',
 from HOD_NRV.HOD_analytical import CSMFFitter
 
 fitter = CSMFFitter(cosmo_params=cosmo, observables=['DeltaSigma'])
-fitter.load_data('data/', 'LRG', mass_bins=[0, 1, 2, 3])       # or 'BGS_SFR' / 'BGS_GMM'
+fitter.load_data('data/', 'LRG_massbin{}.npz', [0, 1, 2, 3], name='LRG',
+                 alpha_values={0: 2.14, 1: 2.25, 2: 2.70, 3: 3.20})  # magnification
 fitter.set_priors(priors_dict)
 result = fitter.minimize(start_params)
 ```
