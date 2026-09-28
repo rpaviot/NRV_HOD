@@ -6,7 +6,10 @@ parameters, mirroring the convention used in HOD_numerical / EmulatorFitter:
 joint (Ac, As) rescaling preserves the Ac/As ratio and leaves DeltaSigma /
 w_gg invariant, so the constraint is enforced by a single scalar rescale.
 
-Free parameters (Ac is derived):
+With ngal_mode='constraint' there is no rescale: Ac is fixed or sampled and
+n_gal enters the chi2 as a Gaussian term instead.
+
+Free parameters (Ac is derived under the default ngal_mode='rescale'):
 - ELG_GHOD: As, log10Mmin, sig_M, log10M1, alpha, kappa
 - ELG_SFR : As, log10Mmin, sig_M, gamma, log10M1, alpha, kappa
 - LRG     : As, log10Mmin, sig_M, log10M1, alpha, kappa
@@ -100,6 +103,7 @@ _PROFILE_DEFAULT_PRIOR: Dict[str, Tuple[float, float]] = {
 def _parse_param_config(
     hod_type: str,
     param_config: Optional[Dict[str, Any]],
+    ngal_mode: str = "rescale",
 ) -> Tuple[List[Tuple[str, float, float, str]], Dict[str, float]]:
     """Split user dict into (priors, fixed_params).
 
@@ -115,11 +119,16 @@ def _parse_param_config(
         cfg[n] = _PROFILE_DEFAULT_FIXED[n]
     if param_config:
         for name, value in param_config.items():
-            if name == "Ac":
+            if name == "Ac" and ngal_mode == "rescale":
                 raise ValueError(
-                    "Ac is derived from target_ngal; do not pass it in param_config."
+                    "Ac is derived from target_ngal; do not pass it in param_config "
+                    "(use ngal_mode='constraint' to fix or sample it)."
                 )
             cfg[name] = value
+
+    if ngal_mode == "constraint" and "Ac" not in cfg:
+        raise ValueError("ngal_mode='constraint' needs Ac in param_config "
+                         "(scalar = fixed, (low, high) = free).")
 
     priors: List[Tuple[str, float, float, str]] = []
     fixed: Dict[str, float] = {}
@@ -183,6 +192,13 @@ class AnalyticalHODFitter:
         Per-parameter overrides — see ``_parse_param_config`` docstring.
     ds_method : str, default 'direct'
         DeltaSigma method passed through to ``HaloModel.DeltaSigma``.
+    ngal_mode : {'rescale', 'constraint'}, default 'rescale'
+        'rescale': (Ac, As) are rescaled jointly at every call to hit
+        ``target_ngal`` exactly (Ac derived). 'constraint': no rescale; Ac is
+        fixed or sampled like any parameter (it must be in ``param_config``)
+        and n_gal enters the chi2 as ((n_model - target_ngal) / ngal_err)^2.
+    ngal_err : float, optional
+        1-sigma n_gal uncertainty for 'constraint' (default 10% of target_ngal).
     """
 
     def __init__(
@@ -203,6 +219,8 @@ class AnalyticalHODFitter:
         param_config: Optional[Dict[str, Any]] = None,
         ds_method: str = "direct",
         pi_max: Optional[float] = None,
+        ngal_mode: str = "rescale",
+        ngal_err: Optional[float] = None,
         verbose: bool = True,
     ):
         if not halo_model.is_single_z:
@@ -220,6 +238,11 @@ class AnalyticalHODFitter:
         self.Ac_fiducial = float(Ac_fiducial)
         self.ds_method = ds_method
         self.pi_max = pi_max
+        if ngal_mode not in ("rescale", "constraint"):
+            raise ValueError(f"Unknown ngal_mode {ngal_mode!r}")
+        self.ngal_mode = ngal_mode
+        self.ngal_err = (0.1 * self.target_ngal if ngal_err is None
+                         else float(ngal_err))
         self.verbose = verbose
 
         # DeltaSigma data + scale cut
@@ -253,10 +276,12 @@ class AnalyticalHODFitter:
             self.rp_bins_wgg = self._infer_bin_edges(self.rp_wgg)
 
         # Priors
-        self.priors, self.fixed = _parse_param_config(self.hod_type, param_config)
+        self.priors, self.fixed = _parse_param_config(self.hod_type, param_config,
+                                                      ngal_mode)
         self.free_names = [p[0] for p in self.priors]
 
-        self.n_data = len(self.ds_obs) + (len(self.wgg_obs) if self.fit_wgg else 0)
+        self.n_data = (len(self.ds_obs) + (len(self.wgg_obs) if self.fit_wgg else 0)
+                       + (1 if ngal_mode == "constraint" else 0))
 
         if verbose:
             self._print_summary()
@@ -275,7 +300,9 @@ class AnalyticalHODFitter:
 
     def _print_summary(self):
         print(f"AnalyticalHODFitter ({self.hod_type})")
-        print(f"  target n_gal = {self.target_ngal:.3e}")
+        print(f"  target n_gal = {self.target_ngal:.3e}  (ngal_mode={self.ngal_mode}"
+              + (f", sigma {self.ngal_err:.3e})" if self.ngal_mode == "constraint"
+                 else ")"))
         print(f"  Ac_fiducial  = {self.Ac_fiducial}")
         print(f"  free params  : {self.free_names}")
         if self.fixed:
@@ -303,6 +330,8 @@ class AnalyticalHODFitter:
         for n in _HOD_FREE_PARAMS[self.hod_type]:
             if n not in merged:
                 raise KeyError(f"Missing HOD parameter {n!r}")
+        if self.ngal_mode == "constraint":
+            return merged, f_h, f_s
 
         Ac, As = rescale_Ac_to_target_ngal(
             self.halo_model, merged, self.target_ngal, self.Ac_fiducial
@@ -348,6 +377,9 @@ class AnalyticalHODFitter:
                 return -1e30
             r_w = wgg_m - self.wgg_obs
             chi2 += float(r_w @ self.cov_wgg_inv @ r_w)
+        if self.ngal_mode == "constraint":
+            n_model = float(np.asarray(self.halo_model.ngal()).item())
+            chi2 += ((n_model - self.target_ngal) / self.ngal_err) ** 2
 
         # Gaussian-prior contribution
         for name, a, b, kind in self.priors:
@@ -372,6 +404,7 @@ class AnalyticalHODFitter:
             "f_h": f_h,
             "f_s": f_s,
             "f_sat": float(np.asarray(self.halo_model.satellite_fraction()).item()),
+            "ngal": float(np.asarray(self.halo_model.ngal()).item()),
         }
 
     # ----- iminuit ----------------------------------------------------------

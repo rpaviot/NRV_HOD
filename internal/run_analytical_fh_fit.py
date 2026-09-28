@@ -52,6 +52,15 @@ def main():
     ap.add_argument("--n_live", type=int, default=1000)
     ap.add_argument("--n_eff", type=int, default=5000)
     ap.add_argument("--n_derived", type=int, default=400)
+    ap.add_argument("--ngal_mode", choices=("rescale", "constraint"), default="rescale",
+                    help="rescale: (Ac, As) rescaled to n_gal each call; "
+                         "constraint: Ac fixed/free, Gaussian n_gal term")
+    ap.add_argument("--Ac", type=float, default=0.192,
+                    help="fixed Ac for --ngal_mode constraint (truth HOD-form fit)")
+    ap.add_argument("--Ac_free", action="store_true",
+                    help="sample Ac in (0.01, 1) instead of fixing it")
+    ap.add_argument("--ngal_err_frac", type=float, default=0.1,
+                    help="n_gal 1-sigma as a fraction of the target (constraint mode)")
     ap.add_argument("--minuit", action="store_true",
                     help="MIGRAD/HESSE best fit instead of a Nautilus chain")
     ap.add_argument("--n_starts", type=int, default=3)
@@ -76,7 +85,10 @@ def main():
     # As is relative to Ac_fiducial = 1: the truth ratio As/Ac ~ 2.6 (fsat 0.26 at the
     # truth HOD on the Tinker10 mass function); the fitter's default (0.001, 0.1)
     # caps fsat below 0.01. (0.05, 10) spans fsat ~ 0.01-0.6.
+    # Under --ngal_mode constraint As is absolute (truth 0.49).
     cfg = {"As": (0.05, 10.0)}
+    if args.ngal_mode == "constraint":
+        cfg["Ac"] = (0.01, 1.0) if args.Ac_free else args.Ac
     if args.free_f:
         cfg.update({"f_h": (0.1, 2.0), "f_s": (0.1, 1.0)})
     wgg_kw = {} if args.no_wgg else dict(
@@ -84,15 +96,19 @@ def main():
         rp_min_wgg=args.rp_min_wgg)
     fitter = AnalyticalHODFitter(
         model, ngal, rp, d["delta_sigma"], c["cov_delta_sigma"],
-        rp_min=args.rp_min_ds, param_config=cfg, pi_max=pi_max, **wgg_kw)
+        rp_min=args.rp_min_ds, param_config=cfg, pi_max=pi_max,
+        ngal_mode=args.ngal_mode, ngal_err=args.ngal_err_frac * ngal, **wgg_kw)
 
     tag = (f"mHMQ{'_bnl' if not args.no_beta_nl else ''}"
            f"{'_fhfs' if args.free_f else ''}{'' if args.no_wgg else '_wggjoint'}"
-           f"_rmin{args.rp_min_ds:g}")
+           f"_rmin{args.rp_min_ds:g}"
+           + ("" if args.ngal_mode == "rescale" else
+              f"_ngalc{args.ngal_err_frac:g}_Ac{'free' if args.Ac_free else f'{args.Ac:g}'}"))
 
     if args.test:
         start = {n: TRUTH[n] for n in fitter.free_names if n in TRUTH}
-        start.update({"As": 2.55, "f_h": 1.0, "f_s": 1.0})
+        start.update({"As": 2.55 if args.ngal_mode == "rescale" else 0.49,
+                      "Ac": args.Ac, "f_h": 1.0, "f_s": 1.0})
         start = {n: start[n] for n in fitter.free_names}
         t = time.time()
         chi2 = fitter.chi2(start)
@@ -177,8 +193,9 @@ def run_minuit(args, fitter, model, d, rp, edges, pi_max, ngal, tag):
     names = fitter.free_names
     lims = {n: (a, b) for n, a, b, _ in fitter.priors}
     truth_start = {n: TRUTH.get(n, 0.5 * sum(lims[n])) for n in names}
-    truth_start.update({k: v for k, v in (("As", 2.55), ("f_h", 1.0), ("f_s", 0.9))
-                        if k in names})
+    as0 = 2.55 if fitter.ngal_mode == "rescale" else 0.49
+    truth_start.update({k: v for k, v in (("As", as0), ("Ac", 0.192), ("f_h", 1.0),
+                                          ("f_s", 0.9)) if k in names})
     rng = np.random.default_rng(2)
     starts = [truth_start] + [
         {n: rng.uniform(*lims[n]) if n in ("f_h", "f_s") else
@@ -210,6 +227,7 @@ def run_minuit(args, fitter, model, d, rp, edges, pi_max, ngal, tag):
     _, wgg_bf = model.wgg(rp, rp_bins=edges, pi_max=pi_max)
     bf_fsat = float(np.asarray(model.satellite_fraction()))
     bf_meff = float(np.log10(np.asarray(model.effective_halo_mass())))
+    bf_ngal = float(np.asarray(model.ngal()))
 
     x0 = np.array([bf[n] for n in names])
     draws = rng.multivariate_normal(x0, cov, size=args.n_derived)
@@ -232,6 +250,7 @@ def run_minuit(args, fitter, model, d, rp, edges, pi_max, ngal, tag):
         print(f"{n:>10s} {bf[n]:9.3f} {err[n]:8.3f} {TRUTH.get(n, np.nan):8.3f}")
     for n, v in (("fsat", bf_fsat), ("log10Meff", bf_meff)):
         print(f"{n:>10s} {v:9.3f} {np.std(der[n]):8.3f} {TRUTH[n]:8.3f}")
+    print(f"      ngal {bf_ngal:.4e}  (target {ngal:.4e}, {100 * (bf_ngal / ngal - 1):+.1f}%)")
     print("\n  rp       DS model/data-1 [%]   wgg model/data-1 [%]")
     for i in range(len(rp)):
         print(f"{rp[i]:7.3f}   {100 * (ds_bf[i] / d['delta_sigma'][i] - 1):8.2f}"
@@ -242,7 +261,7 @@ def run_minuit(args, fitter, model, d, rp, edges, pi_max, ngal, tag):
              covariance=cov, chi2=best.chi2, ndof=best.ndof, n_data=fitter.n_data,
              valid=m.valid, rp=rp, ds_data=d["delta_sigma"], wgg_data=d["wgg"],
              ds_bf=ds_bf, wgg_bf=wgg_bf, bf_fsat=bf_fsat, bf_log10Meff=bf_meff,
-             fsat_err=np.std(der["fsat"]), log10Meff_err=np.std(der["log10Meff"]),
+             bf_ngal=bf_ngal, ngal_mode=fitter.ngal_mode, fsat_err=np.std(der["fsat"]), log10Meff_err=np.std(der["log10Meff"]),
              rp_min_ds=args.rp_min_ds, rp_min_wgg=args.rp_min_wgg, pi_max=pi_max,
              target_ngal=ngal, beta_nl=not args.no_beta_nl)
     print("saved", out)
