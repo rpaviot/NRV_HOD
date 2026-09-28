@@ -8,6 +8,7 @@ Same data, covariance (no cross term), n_gal and scale cuts as the tabulated
 chains in chains_TABULATED_*_R1_inR200m; w_gg uses the measurement's pi_max.
 
     python internal/run_analytical_fh_fit.py --rp_min_ds 0.1 --free_f
+    python internal/run_analytical_fh_fit.py --rp_min_ds 0.5 --free_f --minuit
     python internal/run_analytical_fh_fit.py --test --no_beta_nl   # laptop smoke test
 """
 import argparse
@@ -51,6 +52,9 @@ def main():
     ap.add_argument("--n_live", type=int, default=1000)
     ap.add_argument("--n_eff", type=int, default=5000)
     ap.add_argument("--n_derived", type=int, default=400)
+    ap.add_argument("--minuit", action="store_true",
+                    help="MIGRAD/HESSE best fit instead of a Nautilus chain")
+    ap.add_argument("--n_starts", type=int, default=3)
     ap.add_argument("--test", action="store_true",
                     help="evaluate chi2 at the truth HOD and time it; no sampling")
     args = ap.parse_args()
@@ -97,6 +101,9 @@ def main():
         return
 
     os.makedirs(args.out_dir, exist_ok=True)
+    if args.minuit:
+        run_minuit(args, fitter, model, d, rp, edges, pi_max, ngal, tag)
+        return
     t = time.time()
     res = fitter.run(n_live=args.n_live, n_eff=args.n_eff, n_workers=1, verbose=True)
     print(f"sampling took {(time.time() - t) / 3600:.2f} h, log Z = {res.sampler.log_z:.2f}")
@@ -161,6 +168,84 @@ def main():
              rp_min_ds=args.rp_min_ds, rp_min_wgg=args.rp_min_wgg, pi_max=pi_max,
              target_ngal=ngal, beta_nl=not args.no_beta_nl)
     print("saved", os.path.join(args.out_dir, f"chain_{tag}.npz"))
+
+
+def run_minuit(args, fitter, model, d, rp, edges, pi_max, ngal, tag):
+    """MIGRAD + HESSE from the truth HOD and from ``--n_starts - 1`` random
+    starts inside the priors; keeps the lowest chi2. fsat / Meff errors come
+    from draws of the HESSE covariance (clipped to the priors)."""
+    names = fitter.free_names
+    lims = {n: (a, b) for n, a, b, _ in fitter.priors}
+    truth_start = {n: TRUTH.get(n, 0.5 * sum(lims[n])) for n in names}
+    truth_start.update({k: v for k, v in (("As", 2.55), ("f_h", 1.0), ("f_s", 0.9))
+                        if k in names})
+    rng = np.random.default_rng(2)
+    starts = [truth_start] + [
+        {n: rng.uniform(*lims[n]) if n in ("f_h", "f_s") else
+            np.clip(truth_start[n] + 0.15 * (lims[n][1] - lims[n][0]) * rng.normal(),
+                    *lims[n])
+         for n in names}
+        for _ in range(args.n_starts - 1)]
+
+    best = None
+    for k, s in enumerate(starts):
+        t = time.time()
+        res = fitter.minimize(start=s)
+        m = res.sampler
+        print(f"start {k}: chi2 {res.chi2:.2f}  valid {m.valid}  nfcn {m.nfcn}  "
+              f"({(time.time() - t) / 60:.1f} min)  "
+              + " ".join(f"{n}={res.best_fit[n]:.3f}" for n in names), flush=True)
+        if best is None or res.chi2 < best.chi2:
+            best = res
+    m = best.sampler
+    m.hesse()
+    bf = best.best_fit
+    err = {n: float(m.errors[n]) for n in names}
+    cov = np.array(m.covariance)
+
+    full, f_h, f_s = fitter._build_params(bf)
+    model.update_f(f_h=f_h, f_s=f_s)
+    model.set_hod_params(full)
+    _, ds_bf = model.DeltaSigma(rp, rp_bins=edges, method="direct", include_stellar=False)
+    _, wgg_bf = model.wgg(rp, rp_bins=edges, pi_max=pi_max)
+    bf_fsat = float(np.asarray(model.satellite_fraction()))
+    bf_meff = float(np.log10(np.asarray(model.effective_halo_mass())))
+
+    x0 = np.array([bf[n] for n in names])
+    draws = rng.multivariate_normal(x0, cov, size=args.n_derived)
+    lo_b = np.array([lims[n][0] for n in names])
+    hi_b = np.array([lims[n][1] for n in names])
+    der = {"fsat": [], "log10Meff": []}
+    for x in np.clip(draws, lo_b, hi_b):
+        built = fitter._build_params(dict(zip(names, x)))
+        if built is None:
+            continue
+        model.set_hod_params(built[0])
+        der["fsat"].append(float(np.asarray(model.satellite_fraction())))
+        der["log10Meff"].append(float(np.log10(np.asarray(model.effective_halo_mass()))))
+
+    print(f"\n==== {tag} (minuit) ====")
+    print(f"chi2 = {best.chi2:.2f} / {fitter.n_data} data, {len(names)} free "
+          f"(chi2_red {best.chi2 / best.ndof:.3f}); valid {m.valid}")
+    print(f"{'param':>10s} {'best':>9s} {'hesse':>8s} {'truth':>8s}")
+    for n in names:
+        print(f"{n:>10s} {bf[n]:9.3f} {err[n]:8.3f} {TRUTH.get(n, np.nan):8.3f}")
+    for n, v in (("fsat", bf_fsat), ("log10Meff", bf_meff)):
+        print(f"{n:>10s} {v:9.3f} {np.std(der[n]):8.3f} {TRUTH[n]:8.3f}")
+    print("\n  rp       DS model/data-1 [%]   wgg model/data-1 [%]")
+    for i in range(len(rp)):
+        print(f"{rp[i]:7.3f}   {100 * (ds_bf[i] / d['delta_sigma'][i] - 1):8.2f}"
+              f"            {100 * (wgg_bf[i] / d['wgg'][i] - 1):8.2f}")
+
+    out = os.path.join(args.out_dir, f"minuit_{tag}.npz")
+    np.savez(out, param_names=names, best_fit=x0, errors=[err[n] for n in names],
+             covariance=cov, chi2=best.chi2, ndof=best.ndof, n_data=fitter.n_data,
+             valid=m.valid, rp=rp, ds_data=d["delta_sigma"], wgg_data=d["wgg"],
+             ds_bf=ds_bf, wgg_bf=wgg_bf, bf_fsat=bf_fsat, bf_log10Meff=bf_meff,
+             fsat_err=np.std(der["fsat"]), log10Meff_err=np.std(der["log10Meff"]),
+             rp_min_ds=args.rp_min_ds, rp_min_wgg=args.rp_min_wgg, pi_max=pi_max,
+             target_ngal=ngal, beta_nl=not args.no_beta_nl)
+    print("saved", out)
 
 
 if __name__ == "__main__":
