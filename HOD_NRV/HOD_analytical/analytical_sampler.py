@@ -175,6 +175,8 @@ class AnalyticalHODFitter:
         If given, w_gg is added to the joint likelihood.
     rp_min, rp_max, rp_min_wgg, rp_max_wgg : float, optional
         Scale cuts (inclusive).
+    pi_max : float, optional
+        Line-of-sight cut of the w_gg measurement; None projects to infinity.
     Ac_fiducial : float, default 1.0
         Fiducial Ac at which n_gal is evaluated for the rescale step.
     param_config : dict, optional
@@ -200,6 +202,7 @@ class AnalyticalHODFitter:
         Ac_fiducial: float = 1.0,
         param_config: Optional[Dict[str, Any]] = None,
         ds_method: str = "direct",
+        pi_max: Optional[float] = None,
         verbose: bool = True,
     ):
         if not halo_model.is_single_z:
@@ -216,6 +219,7 @@ class AnalyticalHODFitter:
         self.target_ngal = float(target_ngal)
         self.Ac_fiducial = float(Ac_fiducial)
         self.ds_method = ds_method
+        self.pi_max = pi_max
         self.verbose = verbose
 
         # DeltaSigma data + scale cut
@@ -319,7 +323,8 @@ class AnalyticalHODFitter:
         )
         wgg = None
         if self.fit_wgg:
-            _, wgg = self.halo_model.wgg(self.rp_wgg, rp_bins=self.rp_bins_wgg)
+            _, wgg = self.halo_model.wgg(self.rp_wgg, rp_bins=self.rp_bins_wgg,
+                                         pi_max=self.pi_max)
         return np.asarray(ds), (None if wgg is None else np.asarray(wgg))
 
     # ----- public log-likelihood -------------------------------------------

@@ -181,6 +181,40 @@ def Pk_to_wgg_direct(k: np.ndarray, Pk_gg: np.ndarray,
         return r_out, spline_wgg(r_out)
 
 
+def Pk_to_wgg_pimax(k: np.ndarray, Pk_gg: np.ndarray, r_out, pi_max: float,
+                    rp_bins: Optional[np.ndarray] = None,
+                    n_pi: int = 400) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    w_gg(r_p) = 2 ∫_0^{pi_max} xi_gg(sqrt(r_p² + π²)) dπ — the finite line-of-sight
+    projection a pair-count measurement with a pi_max cut makes, unlike
+    ``Pk_to_wgg_direct`` which projects to infinity.
+
+    xi_gg comes from ``Pk_to_xi_gg`` and is interpolated linearly in log r; the
+    π integral uses Gauss-Legendre nodes in log(π + r_p) so the small-π peak
+    at small r_p is resolved. Same return convention as ``Pk_to_wgg_direct``.
+    """
+    r, xi = Pk_to_xi_gg(k, Pk_gg)
+    log_r = np.log(r)
+
+    x, wts = np.polynomial.legendre.leggauss(n_pi)
+
+    def wp(rp_in):
+        shape = np.shape(rp_in)
+        rp = np.asarray(rp_in, dtype=float).ravel()
+        # u = log(π + r_p) on [log r_p, log(pi_max + r_p)], dπ = e^u du
+        a, b = np.log(rp), np.log(pi_max + rp)
+        u = 0.5 * (b - a)[:, None] * x[None, :] + 0.5 * (b + a)[:, None]
+        pi = np.exp(u) - rp[:, None]
+        s = np.sqrt(rp[:, None] ** 2 + pi ** 2)
+        xi_s = np.interp(np.log(s), log_r, xi)
+        out = 2.0 * 0.5 * (b - a) * np.sum(wts * xi_s * np.exp(u), axis=1)
+        return out.reshape(shape)
+
+    if rp_bins is not None:
+        return r_out, binavg_2D(wp, rp_bins)
+    return r_out, wp(r_out)
+
+
 def Pk_to_DeltaSigma_direct(k: np.ndarray, Pk_gm: np.ndarray,
                              rho_m: float, r_out, 
                              rp_bins: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:

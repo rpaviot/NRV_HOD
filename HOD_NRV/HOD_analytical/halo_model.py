@@ -36,6 +36,7 @@ from .power_spectrum import (
 try:
     from HOD_NRV.utilsf.hankel_transforms import (
         Pk_to_wgg_direct,
+        Pk_to_wgg_pimax,
         Pk_to_DeltaSigma_direct,
         Pk_gm_to_DeltaSigma_traditional,
     )
@@ -563,8 +564,13 @@ class HaloModel(Cosmology):
             'I_11_mm': np.asarray(I_11_mm),
         }
 
-    def wgg(self, rp, rp_bins=None, hod_params=None):
-        """Compute projected correlation function."""
+    def wgg(self, rp, rp_bins=None, hod_params=None, pi_max=None):
+        """Compute projected correlation function.
+
+        ``pi_max=None`` projects to infinity; a finite ``pi_max`` (same length
+        units as ``rp``) integrates xi_gg to that line-of-sight cut, matching a
+        pair-count measurement.
+        """
         if not HAS_HANKEL:
             raise ImportError("Hankel transform utilities not available")
 
@@ -576,7 +582,11 @@ class HaloModel(Cosmology):
 
         result = []
         for iz in range(self.n_z):
-            rp_out, wgg_iz = Pk_to_wgg_direct(k, Pgg[iz], rp, rp_bins=rp_bins)
+            if pi_max is None:
+                rp_out, wgg_iz = Pk_to_wgg_direct(k, Pgg[iz], rp, rp_bins=rp_bins)
+            else:
+                rp_out, wgg_iz = Pk_to_wgg_pimax(k, Pgg[iz], rp, pi_max,
+                                                 rp_bins=rp_bins)
             result.append(wgg_iz)
 
         return rp_out, self._squeeze(np.array(result))
