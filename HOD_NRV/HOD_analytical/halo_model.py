@@ -445,9 +445,9 @@ class HaloModel(Cosmology):
                                  self.log10M_min, self.log10M_max) / n_c
             result.append(M_eff)
 
+        # _M_jax is already in the user's mass units (Msun/h when units_per_h;
+        # only the CCL calls convert to Msun), so the ratio needs no h factor.
         M_eff = jnp.array(result)
-        if self.units_per_h:
-            M_eff *= self.h
         return self._squeeze(np.asarray(M_eff))
 
     def satellite_fraction(self, hod_params=None):
