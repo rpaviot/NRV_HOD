@@ -93,8 +93,14 @@ class Cosmology:
         - Outputs are in natural units
     """
     
-    # Default k array in h/Mpc (for units_per_h=True) or 1/Mpc (for units_per_h=False)
-    DEFAULT_K_ARRAY = np.geomspace(1e-5, 100, 512)
+    # Default k array in h/Mpc (for units_per_h=True) or 1/Mpc (for units_per_h=False).
+    # k_max sets the ringing of the unpadded FAST-PT DeltaSigma transform, not the
+    # number of points. ELG HOD at z=1, bin-averaged on 25 bins over 0.1-50 Mpc/h,
+    # vs k_max=1e4: k_max=100 put the 0.11 Mpc/h bin 7.5% high (16.6% with S25
+    # baryons). k_max=1000 is within 0.07% everywhere without baryons; with S25,
+    # within 0.45% at rp>0.1 and 0.08% at rp>0.5 (k_max=2000 gets 0.07%).
+    # 512 points keeps the transforms at a power of two.
+    DEFAULT_K_ARRAY = np.geomspace(1e-5, 1000, 512)
     
     def __init__(
         self,
