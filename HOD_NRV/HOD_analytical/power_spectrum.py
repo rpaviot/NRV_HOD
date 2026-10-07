@@ -114,13 +114,16 @@ def _compute_Pgg(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k,
 
 @jit
 def _compute_Pgm(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
-                 log10M_min, log10M_max, f_h, f_s):
+                 log10M_min, log10M_max, f_h, f_s, resp_m=None):
     # Centrals are points (u_c = 1, eq. 9); satellites carry u_s(f_s); the matter
-    # profile u_m carries the halo concentration norm f_h (eq. 8, 15) -- this is
-    # the baryon-feedback knob and enters both the 1-halo and 2-halo terms.
+    # profile u_m carries the halo concentration norm f_h (eq. 8, 15) and, if
+    # given, the baryonic response resp_m(k, M) = u_DMB / u_DMO (n_k, n_M; e.g.
+    # Schneider+25, baryons_s25.py). Both enter the 1-halo and 2-halo terms.
     n_gal = gl_integrate((N_c + N_s) * n_M, log10M_min, log10M_max)
     u_s = nfw_fourier_u(k, R_s, c, f_s)
     u_m = nfw_fourier_u(k, R_s, c, f_h)
+    if resp_m is not None:
+        u_m = u_m * resp_m
 
     # 1-halo
     integrand_1h = (N_c + N_s * u_s) * u_m * (M / rho_m) * n_M
@@ -209,14 +212,20 @@ def _compute_Pgg_with_beta_nl(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k,
 @jit
 def _compute_Pgm_with_beta_nl(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
                                log10M_min, log10M_max, f_h, f_s,
-                               beta_nl_gl, beta_nl_Mmin_col, R_s_Mmin, c_Mmin):
+                               beta_nl_gl, beta_nl_Mmin_col, R_s_Mmin, c_Mmin,
+                               resp_m=None, resp_m_Mmin=None):
+    """resp_m (n_k, n_M) / resp_m_Mmin (n_k,): baryonic response of the matter
+    profile at the GL nodes and at M_min (see _compute_Pgm); both or neither."""
     P_gm = _compute_Pgm(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
-                        log10M_min, log10M_max, f_h, f_s)
+                        log10M_min, log10M_max, f_h, f_s, resp_m)
 
     n_gal = gl_integrate((N_c + N_s) * n_M, log10M_min, log10M_max)
     u_s = nfw_fourier_u(k, R_s, c, f_s)
     u_m = nfw_fourier_u(k, R_s, c, f_h)
     u_m_Mmin = nfw_fourier_u_single(k, R_s_Mmin, c_Mmin, f_h)
+    if resp_m is not None:
+        u_m = u_m * resp_m
+        u_m_Mmin = u_m_Mmin * resp_m_Mmin
 
     H_g = (N_c[None, :] + N_s[None, :] * u_s) / n_gal  # central point: u_c = 1
     W_m = M / rho_m

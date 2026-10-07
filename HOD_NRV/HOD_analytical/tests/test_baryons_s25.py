@@ -150,3 +150,29 @@ def test_m200m_to_m200c_inverts_colossus_ratio():
     M200c, r_ratio, c200c = m200m_to_m200c(1e12, 5.0, 0.774)
     np.testing.assert_allclose(M200c / 1e12, 0.919, atol=2e-3)
     np.testing.assert_allclose(c200c, 5.0 * r_ratio, rtol=1e-12)
+
+
+def test_halomodel_baryon_hook():
+    """HaloModel.set_baryons: S25 lowers DeltaSigma at 0.2-1 Mpc/h for an ELG HOD
+    (z=1, M200m), leaves large scales alone, and None restores P_gm bit for bit."""
+    import warnings
+    warnings.filterwarnings("ignore")
+    from HOD_NRV.HOD_analytical.halo_model import HaloModel
+    cosmo = {"h": 0.681, "Omc": 0.306 - 0.0486 - 1.39e-3, "Omb": 0.0486,
+             "A_s": 2.099e-9, "n_s": 0.967, "Omnu": 1.39e-3}
+    hod = {"Ac": 1.0, "As": 2.0, "log10Mmin": 11.626, "sig_M": 0.599, "gamma": 4.08,
+           "log10M1": 13.04, "alpha": 0.859, "kappa": 1.01}
+    m = HaloModel(cosmo, z=1.0, hod_type="ELG_MHMQ", units_per_h=True,
+                  mass_definition="MassDef200m", verbose=False)
+    m.set_hod_params(hod)
+    edges = np.geomspace(0.1, 50, 26)
+    rc = np.sqrt(edges[1:] * edges[:-1])
+    P0 = np.asarray(m.Pgm())
+    _, d0 = m.DeltaSigma(rc, rp_bins=edges, include_stellar=False)
+    m.set_baryons("s25")
+    _, d1 = m.DeltaSigma(rc, rp_bins=edges, include_stellar=False)
+    ratio = d1 / d0
+    assert np.all(ratio[(rc > 0.2) & (rc < 1.0)] < 0.98)
+    np.testing.assert_allclose(ratio[rc > 3.0], 1.0, atol=2e-3)
+    m.set_baryons(None)
+    assert np.array_equal(np.asarray(m.Pgm()), P0)

@@ -78,6 +78,8 @@ class HaloModel(Cosmology):
         beta_nl_kwargs: Optional[Dict] = None,
         verbose: bool = True,
         satellite_occupation: str = "power_law",
+        baryons: Optional[str] = None,
+        baryon_params: Optional[Dict] = None,
         **cosmo_kwargs
     ):
         # Initialize Cosmology base class
@@ -126,6 +128,13 @@ class HaloModel(Cosmology):
 
         # Precompute CCL quantities
         self._precompute_ccl()
+
+        # Baryonic response of the matter profile (None = dark-matter-only NFW)
+        self.baryons = None
+        self._resp_m_jax = None
+        self._resp_m_Mmin_jax = None
+        if baryons is not None:
+            self.set_baryons(baryons, baryon_params)
 
         # Compute beta^NL
         if include_beta_nl:
@@ -323,6 +332,82 @@ class HaloModel(Cosmology):
     def set_hod_params(self, hod_params: Dict):
         self.hod.set_params(hod_params)
 
+    def set_baryons(self, model: Optional[str] = 's25', params: Optional[Dict] = None,
+                    concentration: str = 'model', r_norm_max: float = np.inf):
+        """Switch on a baryonic response of the matter profile, or off with None.
+
+        The matter profile becomes u_m(k|M) = u_NFW(k|M) * u_DMB(k|M) / u_DMO(k|M),
+        in the 1-halo, 2-halo and beta^NL terms of P_gm. The ratio -> 1 at
+        k -> 0, so the halo mass (and every mass integral) keeps the model's mass
+        definition; only the shape changes. P_gg is unaffected.
+
+        model 's25': Schneider+25 as implemented in BaryonForge
+        (baryons_s25.py). params default to FLAMINGO m8 at z=1, the set of the
+        DMO_B2 baryonified box. S25 is defined on M200c: each mass node
+        (M200m with this model's c(M)) is converted to M200c, R200c, c200c for
+        the NFW, and nu = 1.686 / sigma(M200c). concentration='diemer15'
+        replaces c200c by the Diemer15 c(M200c) relation BaryonForge uses
+        when it is given no concentration (as for the box).
+
+        The response is precomputed for fixed parameters. The S25 central
+        galaxy is part of the profile, so the CSMF stellar point mass
+        (median_Mstar) must not be added on top.
+        """
+        if model is None:
+            self.baryons, self._resp_m_jax, self._resp_m_Mmin_jax = None, None, None
+            return
+        if model.lower() != 's25':
+            raise ValueError(f"unknown baryon model {model!r} (only 's25')")
+        if self.median_Mstar is not None:
+            raise ValueError("S25 baryons include the central galaxy; drop median_Mstar "
+                             "(the stellar point mass) to avoid counting it twice")
+        import pyccl as ccl
+        from .baryons_s25 import (S25Grid, complete_params, s25_flamingo_m8_z1,
+                                  s25_fourier, m200m_to_m200c)
+
+        p = complete_params(s25_flamingo_m8_z1(self.h) if params is None else params)
+        grid = S25Grid()
+        f_bar = self.ccl_cosmo['Omega_b'] / self.ccl_cosmo['Omega_m']
+        k_mpc = jnp.asarray(self._k_array_internal)             # 1/Mpc
+        mdef_c = ccl.halos.MassDef200c
+        to_msun = 1.0 / self.h if self.units_per_h else 1.0
+        M_nodes = np.append(self.M_array, 10.0 ** self.log10M_min)
+
+        resp, resp_min = [], []
+        for iz, (z, a) in enumerate(zip(self.z_array, self.a_array)):
+            c_nodes = np.append(self._c[iz], self._c_Mmin[iz])
+            name = self.mass_def.name if hasattr(self.mass_def, 'name') else str(self.mass_def)
+            if self.mass_def.Delta == 200 and self.mass_def.rho_type == 'matter':
+                Om_z = float(ccl.omega_x(self.ccl_cosmo, a, 'matter'))
+                M200c, _, c200c = m200m_to_m200c(M_nodes, c_nodes, Om_z)
+            elif self.mass_def.Delta == 200 and self.mass_def.rho_type == 'critical':
+                M200c, c200c = M_nodes, c_nodes
+            else:
+                raise NotImplementedError(f"S25 baryons need a 200m or 200c mass definition, got {name}")
+            M200c = M200c * to_msun                               # Msun
+            R200c = mdef_c.get_radius(self.ccl_cosmo, M200c, a) / a   # comoving Mpc
+            if concentration == 'diemer15':
+                c200c = ccl.halos.ConcentrationDiemer15(mass_def=mdef_c)(self.ccl_cosmo, M200c, a)
+            elif concentration != 'model':
+                raise ValueError("concentration must be 'model' or 'diemer15'")
+            nu = 1.686 / ccl.sigmaM(self.ccl_cosmo, M200c, a)
+            u_dmb, u_dmo = s25_fourier(grid, k_mpc, M200c, R200c, c200c, nu, float(z),
+                                       f_bar, p, r_norm_max)
+            r = u_dmb / u_dmo
+            resp.append(r[:, :-1])
+            resp_min.append(r[:, -1])
+
+        self.baryons = 's25'
+        self._resp_m_jax = jnp.stack(resp)          # (n_z, n_k, N_GL)
+        self._resp_m_Mmin_jax = jnp.stack(resp_min)  # (n_z, n_k)
+        if self.verbose:
+            print(f"  baryons: S25 response set (concentration={concentration})")
+
+    def _resp(self, iz):
+        if self._resp_m_jax is None:
+            return None, None
+        return self._resp_m_jax[iz], self._resp_m_Mmin_jax[iz]
+
     def update_f(self, f_h=None, f_s=None):
         if f_h is not None:
             self.f_h = f_h
@@ -395,6 +480,7 @@ class HaloModel(Cosmology):
         for iz in range(self.n_z):
             N_c, N_s = self._get_occupation(iz)
 
+            resp_m, resp_m_Mmin = self._resp(iz)
             if use_beta_nl:
                 P = _compute_Pgm_with_beta_nl(
                     N_c, N_s, self._n_M_jax[iz], self._b_h_jax[iz],
@@ -405,6 +491,7 @@ class HaloModel(Cosmology):
                     self._beta_nl_gl_cache[iz],
                     self._beta_nl_Mmin_col_cache[iz],
                     self._R_s_Mmin_jax[iz], self._c_Mmin_jax[iz],
+                    resp_m, resp_m_Mmin,
                 )
             else:
                 P = _compute_Pgm(
@@ -413,6 +500,7 @@ class HaloModel(Cosmology):
                     self._Pk_lin_jax[iz], self._k_jax,
                     self._M_jax, self.RHO_M,
                     self.log10M_min, self.log10M_max, self.f_h, self.f_s,
+                    resp_m,
                 )
             result.append(P)
 
@@ -687,6 +775,7 @@ class HaloModel(Cosmology):
                 ms_hi = self._Mstar_max_jax[iz]
                 N_c = csmf_N_central(M, ms_lo, ms_hi, M0, M1, g1, g2, sig)
                 N_s = csmf_N_satellite(M, ms_lo, ms_hi, M0, M1, g1, g2, al, b0, b1)
+                resp_m, resp_m_Mmin = self._resp(iz)
                 if use_beta_nl:
                     Pgm = _compute_Pgm_with_beta_nl(
                         N_c, N_s, self._n_M_jax[iz], self._b_h_jax[iz],
@@ -695,13 +784,14 @@ class HaloModel(Cosmology):
                         log10M_min, log10M_max, f_h, f_s,
                         self._beta_nl_gl_cache[iz], self._beta_nl_Mmin_col_cache[iz],
                         self._R_s_Mmin_jax[iz], self._c_Mmin_jax[iz],
+                        resp_m, resp_m_Mmin,
                     )
                 else:
                     Pgm = _compute_Pgm(
                         N_c, N_s, self._n_M_jax[iz], self._b_h_jax[iz],
                         self._R_s_jax[iz], self._c_jax[iz],
                         self._Pk_lin_jax[iz], self._k_jax, M, rho_m,
-                        log10M_min, log10M_max, f_h, f_s,
+                        log10M_min, log10M_max, f_h, f_s, resp_m,
                     )
                 rows.append(ds_builder.transform(Pgm, rho_m))   # (nbin,)
             ds_all = jnp.stack(rows)                            # (n_z, nbin)
