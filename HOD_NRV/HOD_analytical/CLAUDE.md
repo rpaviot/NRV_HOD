@@ -11,6 +11,7 @@ pycosmo.py           Cosmology base class - pyccl + Dark Emulator integration
 hod_analytical.py    HOD occupation functions and wrapper classes (JAX @jit)
 power_spectrum.py    Pure JIT-compiled P_gg / P_gm computation functions
 emu.py               BetaNLInterpolator - beta^NL(k, M1, M2, z) from Dark Emulator
+baryons_s25.py       Schneider+25 baryonified one-halo profiles (JAX port of BaryonForge), FFTLog u_DMB/u_DMO(k|M)
 sampler.py           CSMFFitter - Nautilus / iminuit fitting framework
 null_test.py         Validation: compares JAX implementation vs pyccl reference
 ```
@@ -85,6 +86,17 @@ No class state; all functions are `@jit`-compiled and called by `HaloModel`.
 - `_compute_Pgg(...)` / `_compute_Pgm(...)` - standard 1h+2h power spectra
 - `_compute_Pgg_with_beta_nl(...)` / `_compute_Pgm_with_beta_nl(...)` - beta^NL-enhanced versions
 - `_compute_I_NL_22`, `_compute_I_NL_12`, `_compute_I_NL_21` - individual I^NL integral terms
+
+### `baryons_s25.py` - Schneider+25 baryonic profiles
+
+JAX port of BaryonForge's `Schneider25` profiles (upstream fafc0f3), the model used to baryonify the DMO_B2 box. It follows BaryonForge's conventions: eps = eps0 - eps1*nu, Q_i = q_i + nu_qi*z, comoving Mpc and Msun without h, M200c. It does not include the two-halo term.
+
+- `s25_flamingo_m8_z1(h)` - the FLAMINGO m8 z=1 parameter set of the DMO_B2 box
+- `complete_params(p)` - fills BaryonForge defaults; **raises on unknown keys** (BaryonForge drops them silently)
+- `s25_mass_profiles(grid, M, R, c, nu, z, f_bar, p, r_norm_max)` - dM/dlnx per component on x = r/R200c, plus the central point mass the Q1 term contracts onto r=0
+- `s25_fourier(...)` - (u_DMB, u_DMO), each (n_k, n_M) and normalised to M_tot. FFTLog to ~1e-4. Takes 22 ms for 200 masses x 300 k and is differentiable in the parameters
+- `m200m_to_m200c(M200m, c200m, Omega_m_z)` - NFW mass-definition conversion
+- Tests: `tests/test_baryons_s25.py` against the BaryonForge reference `tests/data/s25_bfg_reference.npz`. Components agree to <0.5%. BaryonForge's DMB renormalisation is 0.1-0.8% high because it misses that central point mass.
 
 ### `emu.py` - `BetaNLInterpolator`
 
