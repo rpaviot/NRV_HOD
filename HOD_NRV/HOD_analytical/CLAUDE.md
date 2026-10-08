@@ -23,7 +23,7 @@ null_test.py         Validation: compares JAX implementation vs pyccl reference
 Main entry point. Inherits from `Cosmology` (pycosmo.py) and wraps HOD + power spectrum computation.
 
 **Key methods:**
-- `set_hod_params(hod_params)` - update HOD parameters
+- `set_hod_params(hod_params)` - update HOD parameters; an optional `A_b` key (default 1) multiplies the galaxy-side halo bias in the 2-halo and beta^NL terms (P_gm x A_b, P_gg x A_b^2; Liu+25 eq. 7) to absorb assembly bias in the large-scale amplitude. n_gal is unchanged
 - `update_f(f_h, f_s)` - update NFW profile scaling factors
 - `ngal(hod_params)` - galaxy number density
 - `Pgg(hod_params)` - galaxy-galaxy power spectrum

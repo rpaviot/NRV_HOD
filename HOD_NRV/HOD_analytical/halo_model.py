@@ -108,6 +108,8 @@ class HaloModel(Cosmology):
         self.RHO_M = self.get_rho_m()
         self.f_h = f_h
         self.f_s = f_s
+        # Galaxy-side halo-bias amplitude, read from the HOD dict (see set_hod_params)
+        self.A_b = 1.0
 
         # Mass array at GL nodes
         self.log10M_min = np.log10(M_min)
@@ -330,6 +332,12 @@ class HaloModel(Cosmology):
         return arr[0] if self.is_single_z else arr
 
     def set_hod_params(self, hod_params: Dict):
+        """Set the occupation. An optional ``A_b`` key (default 1) multiplies the
+        galaxy-side halo bias in the 2-halo and beta^NL terms -- P_gm by A_b,
+        P_gg by A_b^2 -- absorbing assembly bias in the large-scale amplitude
+        (Liu+25 eq. 7). It does not touch the occupation, so n_gal is unchanged."""
+        hod_params = dict(hod_params)
+        self.A_b = float(hod_params.pop('A_b', 1.0))
         self.hod.set_params(hod_params)
 
     def set_baryons(self, model: Optional[str] = 's25', params: Optional[Dict] = None,
@@ -451,14 +459,14 @@ class HaloModel(Cosmology):
                     self._R_s_jax[iz], self._c_jax[iz],
                     self._Pk_lin_jax[iz], self._k_jax,
                     self.log10M_min, self.log10M_max, self.f_h, self.f_s,
-                    self._beta_nl_gl_cache[iz],
+                    self._beta_nl_gl_cache[iz], self.A_b,
                 )
             else:
                 P = _compute_Pgg(
                     N_c, N_s, self._n_M_jax[iz], self._b_h_jax[iz],
                     self._R_s_jax[iz], self._c_jax[iz],
                     self._Pk_lin_jax[iz], self._k_jax,
-                    self.log10M_min, self.log10M_max, self.f_h, self.f_s,
+                    self.log10M_min, self.log10M_max, self.f_h, self.f_s, self.A_b,
                 )
             result.append(P)
 
@@ -491,7 +499,7 @@ class HaloModel(Cosmology):
                     self._beta_nl_gl_cache[iz],
                     self._beta_nl_Mmin_col_cache[iz],
                     self._R_s_Mmin_jax[iz], self._c_Mmin_jax[iz],
-                    resp_m, resp_m_Mmin,
+                    resp_m, resp_m_Mmin, self.A_b,
                 )
             else:
                 P = _compute_Pgm(
@@ -500,7 +508,7 @@ class HaloModel(Cosmology):
                     self._Pk_lin_jax[iz], self._k_jax,
                     self._M_jax, self.RHO_M,
                     self.log10M_min, self.log10M_max, self.f_h, self.f_s,
-                    resp_m,
+                    resp_m, self.A_b,
                 )
             result.append(P)
 

@@ -90,10 +90,12 @@ def _compute_ngal(N_c, N_s, n_M, log10M_min, log10M_max):
 
 @jit
 def _compute_Pgg(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k,
-                 log10M_min, log10M_max, f_h, f_s):
+                 log10M_min, log10M_max, f_h, f_s, A_b=1.0):
     # f_h (halo/matter concentration norm) does not enter P_gg -- there is no
     # matter profile here. Centrals are points (H_c = N_c/n_c, eq. 9), so only
     # the satellite profile u_s carries a concentration rescaling (f_s).
+    # A_b rescales the galaxy-side halo bias, A_b * b_h(M) (Liu+25 eq. 7): it
+    # absorbs assembly bias in the 2-halo amplitude, so P_2h goes as A_b^2.
     n_gal = gl_integrate((N_c + N_s) * n_M, log10M_min, log10M_max)
     u_s = nfw_fourier_u(k, R_s, c, f_s)
 
@@ -107,18 +109,20 @@ def _compute_Pgg(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k,
     # 2-halo (central point: u_c = 1)
     integrand_2h = (N_c + N_s * u_s) * b_h * n_M
     I_2h = vmap(lambda x: gl_integrate(x, log10M_min, log10M_max))(integrand_2h)
-    P_2h = Pk_lin * (I_2h / n_gal) ** 2
+    P_2h = Pk_lin * (A_b * I_2h / n_gal) ** 2
 
     return P_1h + P_2h
 
 
 @jit
 def _compute_Pgm(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
-                 log10M_min, log10M_max, f_h, f_s, resp_m=None):
+                 log10M_min, log10M_max, f_h, f_s, resp_m=None, A_b=1.0):
     # Centrals are points (u_c = 1, eq. 9); satellites carry u_s(f_s); the matter
     # profile u_m carries the halo concentration norm f_h (eq. 8, 15) and, if
     # given, the baryonic response resp_m(k, M) = u_DMB / u_DMO (n_k, n_M; e.g.
     # Schneider+25, baryons_s25.py). Both enter the 1-halo and 2-halo terms.
+    # A_b rescales the galaxy-side bias only (I_g); the matter side I_m1 + I_m2
+    # keeps its consistency relation.
     n_gal = gl_integrate((N_c + N_s) * n_M, log10M_min, log10M_max)
     u_s = nfw_fourier_u(k, R_s, c, f_s)
     u_m = nfw_fourier_u(k, R_s, c, f_h)
@@ -137,7 +141,7 @@ def _compute_Pgm(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
     integrand_m2 = u_m * (M / rho_m) * b_h * n_M
     I_m2 = vmap(lambda x: gl_integrate(x, log10M_min, log10M_max))(integrand_m2)
 
-    return P_1h + Pk_lin * I_g * (I_m1 + I_m2)
+    return P_1h + Pk_lin * A_b * I_g * (I_m1 + I_m2)
 
 
 # ============================================================================
@@ -197,27 +201,29 @@ def _compute_I_NL_gm(beta_nl_gl, beta_nl_Mmin_col, H_g, H_m, b_h, n_M,
 
 @jit
 def _compute_Pgg_with_beta_nl(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k,
-                               log10M_min, log10M_max, f_h, f_s, beta_nl_gl):
+                               log10M_min, log10M_max, f_h, f_s, beta_nl_gl,
+                               A_b=1.0):
     P_gg = _compute_Pgg(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k,
-                        log10M_min, log10M_max, f_h, f_s)
+                        log10M_min, log10M_max, f_h, f_s, A_b)
 
     n_gal = gl_integrate((N_c + N_s) * n_M, log10M_min, log10M_max)
     u_s = nfw_fourier_u(k, R_s, c, f_s)
     H_g = (N_c[None, :] + N_s[None, :] * u_s) / n_gal  # central point: u_c = 1
 
     I_NL = _compute_I_NL_gg(beta_nl_gl, H_g, b_h, n_M, log10M_min, log10M_max)
-    return P_gg + Pk_lin * I_NL
+    return P_gg + Pk_lin * A_b ** 2 * I_NL  # two galaxy-side biases
 
 
 @jit
 def _compute_Pgm_with_beta_nl(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
                                log10M_min, log10M_max, f_h, f_s,
                                beta_nl_gl, beta_nl_Mmin_col, R_s_Mmin, c_Mmin,
-                               resp_m=None, resp_m_Mmin=None):
+                               resp_m=None, resp_m_Mmin=None, A_b=1.0):
     """resp_m (n_k, n_M) / resp_m_Mmin (n_k,): baryonic response of the matter
-    profile at the GL nodes and at M_min (see _compute_Pgm); both or neither."""
+    profile at the GL nodes and at M_min (see _compute_Pgm); both or neither.
+    A_b: galaxy-side bias amplitude (see _compute_Pgg)."""
     P_gm = _compute_Pgm(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
-                        log10M_min, log10M_max, f_h, f_s, resp_m)
+                        log10M_min, log10M_max, f_h, f_s, resp_m, A_b)
 
     n_gal = gl_integrate((N_c + N_s) * n_M, log10M_min, log10M_max)
     u_s = nfw_fourier_u(k, R_s, c, f_s)
@@ -234,7 +240,7 @@ def _compute_Pgm_with_beta_nl(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
 
     I_NL = _compute_I_NL_gm(beta_nl_gl, beta_nl_Mmin_col, H_g, H_m, b_h, n_M,
                             u_m_Mmin, A_Mmin, log10M_min, log10M_max)
-    return P_gm + Pk_lin * I_NL
+    return P_gm + Pk_lin * A_b * I_NL  # one galaxy-side bias
 
 
 __all__ = [
