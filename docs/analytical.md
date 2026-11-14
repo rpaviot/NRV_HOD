@@ -63,6 +63,55 @@ model = HaloModel(cosmo, z=1.0, hod_type="ELG_mHMQ", units_per_h=True,
                   beta_nl_kwargs={"log_M_min": 11.5, "log_M_max": 15.0})
 ```
 
+## Tangential shear
+
+$\Delta\Sigma$ needs a redshift for every lens. $\gamma_t(\theta)$ needs only
+the redshift distribution of the lens sample, so it is the safer observable
+when individual lens photo-z are poor. The model is the same $\Delta\Sigma$,
+projected through the lens and source $n(z)$:
+
+$$
+\gamma_t(\theta) = \int dz_l\, n_l(z_l)\,
+\langle\Sigma_{\rm c}^{-1}\rangle(z_l)\,
+\Delta\Sigma\big(R=\theta f_K(z_l)\big),
+$$
+
+with comoving $\Delta\Sigma$, $R$ and $\Sigma_{\rm c}$, and
+$\langle\Sigma_{\rm c}^{-1}\rangle$ averaged over the source $n(z)$. This is
+the Limber, flat-sky expression of Zacharegkas et al. (2022,
+[arXiv:2106.08438](https://arxiv.org/abs/2106.08438), Eqs. 14-18).
+
+```python
+theta_bins = np.geomspace(1.0, 100.0, 11)          # arcmin
+proj = model.make_gamma_t_projector(theta_bins, z_lens, n_lens,
+                                    z_source, n_source)
+gt = model.GammaT(proj, hod_params=hod)            # averaged over each bin
+proj.theta, proj.z_eff                             # bin angles, lensing-weighted lens z
+
+alpha = 2.2                                        # magnification slope of the lenses
+gt_total = gt + 2 * (alpha - 1) * proj.lens_magnification()
+```
+
+A model with several redshifts takes one projector per redshift. One
+$\Delta\Sigma$ profile, the model at the redshift given to `HaloModel`, is
+used across the lens bin: the geometry is integrated over the lens $n(z)$,
+the evolution of $P_{\rm gm}$ inside the bin is neglected.
+
+`lens_magnification()` is the lens-magnification term for
+$2(\alpha-1)=1$ (Eqs. 22-24 of the same paper): the $J_2$ transform of the
+convergence cross-spectrum of the lens and source $n(z)$, with the non-linear
+matter power spectrum. It does not depend on the HOD. There is no
+multiplicative shear bias, source-redshift shift, intrinsic alignment or
+source magnification term.
+
+To fit $\gamma_t$ with `CSMFFitter`, use `observables=["GammaT"]` and
+`theta_min` / `theta_max` (arcmin) for the scale cuts. Each npz file holds
+`theta`, `theta_bins`, `gamma_t`, `cov_gamma_t`, `z_lens`, `nz_lens`,
+`z_source`, `nz_source`, next to `z_eff`, `logmstar_min` and `logmstar_max`.
+`alpha_values` in `load_data` removes the magnification term, computed from
+the two $n(z)$. The vectorised nautilus likelihood does not cover $\gamma_t$
+yet.
+
 ## Fixing the number density (optional)
 
 $w_{gg}$ and $\Delta\Sigma$ are normalised by the galaxy number density, so

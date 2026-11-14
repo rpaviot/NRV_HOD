@@ -624,6 +624,51 @@ class HaloModel(Cosmology):
         return rp_out, self._squeeze(np.array(result))
 
     # ------------------------------------------------------------------
+    # Tangential shear
+    # ------------------------------------------------------------------
+    def make_gamma_t_projector(self, theta_bins, z_lens, n_lens, z_source,
+                               n_source, **kwargs):
+        """:class:`GammaTProjector` for one lens/source pair in this model's
+        cosmology and units. ``kwargs``: theta_unit, n_r, n_gl."""
+        from .gamma_t import GammaTProjector
+        return GammaTProjector(self.ccl_cosmo, theta_bins, z_lens, n_lens,
+                               z_source, n_source, units_per_h=self.units_per_h,
+                               **kwargs)
+
+    def GammaT(self, projectors, hod_params=None, include_stellar=True):
+        """Bin-averaged tangential shear, one array per model redshift.
+
+        ``projectors`` holds one :class:`GammaTProjector` per redshift of the
+        model (a single projector for a single-redshift model). The model
+        DeltaSigma at that redshift is evaluated on ``projector.r_grid`` and
+        projected through the lens and source n(z). Lens magnification is not
+        included: add ``2 (alpha - 1) * projector.lens_magnification()``.
+        """
+        if not HAS_HANKEL:
+            raise ImportError("Hankel transform utilities not available")
+        if not isinstance(projectors, (list, tuple)):
+            projectors = [projectors]
+        if len(projectors) != self.n_z:
+            raise ValueError(f"need one projector per redshift ({self.n_z}), "
+                             f"got {len(projectors)}")
+        Pgm = self.Pgm(hod_params)
+        if self.is_single_z:
+            Pgm = Pgm[np.newaxis, :]
+        k = self.get_k()
+        result = []
+        for iz, proj in enumerate(projectors):
+            if proj.units_per_h != self.units_per_h:
+                raise ValueError("projector and model disagree on units_per_h")
+            r, ds = Pk_to_DeltaSigma_direct(k, Pgm[iz], self.RHO_M, proj.r_grid)
+            if include_stellar and self.median_Mstar is not None:
+                ds_stellar = self.median_Mstar[iz] / (np.pi * r**2) / 1e12
+                if self.units_per_h:
+                    ds_stellar *= self.h
+                ds = ds + ds_stellar
+            result.append(proj.gamma_t(ds))
+        return result[0] if self.is_single_z else result
+
+    # ------------------------------------------------------------------
     # Pure / vmap-able CSMF ΔΣ forward pass
     # ------------------------------------------------------------------
     def make_deltasigma_jax(self, ds_builder, rp_centers):

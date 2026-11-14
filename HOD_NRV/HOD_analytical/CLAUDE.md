@@ -12,6 +12,7 @@ hod_analytical.py    HOD occupation functions and wrapper classes (JAX @jit)
 power_spectrum.py    Pure JIT-compiled P_gg / P_gm computation functions
 emu.py               BetaNLInterpolator - beta^NL(k, M1, M2, z) from Dark Emulator
 sampler.py           CSMFFitter - Nautilus / iminuit fitting framework
+gamma_t.py           GammaTProjector - DeltaSigma(R) -> gamma_t(theta) through the lens/source n(z); lens magnification
 null_test.py         Validation: compares JAX implementation vs pyccl reference
 ```
 
@@ -31,6 +32,7 @@ Main entry point. Inherits from `Cosmology` (pycosmo.py) and wraps HOD + power s
 - `satellite_fraction(hod_params)` - satellite fraction
 - `wgg(rp, rp_bins, hod_params)` - projected clustering (requires pycorr)
 - `DeltaSigma(rp, rp_bins, method, hod_params, ...)` - excess surface density
+- `make_gamma_t_projector(theta_bins, z_lens, n_lens, z_source, n_source)` / `GammaT(projectors, hod_params)` - tangential shear (one projector per redshift)
 - `diagnose_beta_nl_terms(iz, hod_params)` - individual I^NL contributions
 
 Precomputes mass function, halo bias, linear P(k), NFW profiles, and optionally beta^NL grids at Gauss-Legendre nodes per redshift.
@@ -195,3 +197,17 @@ result = fitter.minimize(start_params)
 - beta^NL support requires both `dark_emulator` and `interpax` packages
 - `null_test.py` validates <1% agreement between JAX implementation and pyccl reference
 - **Last successful null test run: 2026-02-03** -- all tests pass (<0.4% P_gg, <0.17% P_gm for both natural and h-units). Fixed k_array input to respect `units_per_h=True` convention (k in h/Mpc).
+
+### `gamma_t.py` - tangential shear
+
+`GammaTProjector(ccl_cosmo, theta_bins, z_lens, n_lens, z_source, n_source)` builds one fixed matrix so that `gamma_t = matrix @ DeltaSigma(r_grid)`, bin-averaged over the theta bins (arcmin by default):
+
+    gamma_t(theta) = int dz_l n_l(z_l) <Sigma_c,com^-1>(z_l) DeltaSigma(theta f_K(z_l))
+
+This is the Limber, flat-sky J_2 transform of C_gm (Zacharegkas+22, arXiv:2106.08438, Eqs. 14-18) written in terms of the comoving DeltaSigma. One DeltaSigma profile (the model at the bin's `z_eff`) is used across the lens bin: the geometry is integrated over the lens n(z), the evolution of P_gm inside the bin is neglected.
+
+`lens_magnification()` returns the lens-magnification term for unit `2 (alpha - 1)` (Eqs. 22-24): the J_2 transform of the convergence cross-spectrum of the lens and source n(z), with the non-linear matter power, via pyccl. It does not depend on the HOD.
+
+In `CSMFFitter`, `observables=['GammaT']` fits gamma_t. Each npz file then holds `theta`, `theta_bins` [arcmin], `gamma_t`, `cov_gamma_t`, `z_lens`, `nz_lens`, `z_source`, `nz_source` (plus `z_eff`, `logmstar_min/max`). `alpha_values` in `load_data` removes `2 (alpha - 1) * lens_magnification()` from the data. `theta_min` / `theta_max` are the scale cuts. The vectorised (`build_batched_loglike`) path does not support gamma_t yet. No multiplicative shear bias, source-redshift shift, intrinsic alignment or source magnification term.
+
+Tests: `tests/test_gamma_t.py` (projection limits, units, magnification vs a direct Limber integral), `tests/test_gamma_t_fitter.py` (end to end).
