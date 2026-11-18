@@ -35,8 +35,8 @@ import numpy as np
 
 from .standard_two_point_calculator import compute_corr
 from .halo_center_lensing import (
-    build_occupation_cells, build_tabulation_bins, satellite_offset_nodes,
-    satellite_radial_nodes,
+    build_occupation_cells, build_tabulation_bins, make_lambda_weights_jax,
+    satellite_offset_nodes, satellite_radial_nodes,
 )
 
 
@@ -420,19 +420,13 @@ class TabulatedWgg:
 
         Returns (rp_centers, wgg, info) with info = ngal, fsat, wp_1h, wp_2h.
         """
-        halo, tab = self.halo, self.tab
-        f_exp = float(dict_params.get('f_exp', 0.0))
-        tau = float(dict_params.get('tau', 6.0))
-        lam = float(dict_params.get('lambda_NFW', 1.0))
+        halo = self.halo
         logM = np.asarray(halo.logM)
 
         probC, probS = halo.HOD.compute_HOD_occupation(logM, dict_params)
         # Bernoulli sampling in populate_centrals clips probC at 1 implicitly
         probC = np.minimum(np.asarray(probC, dtype=np.float64), 1.0)
         probS = np.asarray(probS, dtype=np.float64)
-        N = probC.sum() + probS.sum()
-        ngal = N / halo.Lbox ** 3
-        fsat = probS.sum() / N
 
         # Same-halo pair expectations (Poisson satellites; conformity exact)
         if halo.HOD.conformity:
@@ -446,6 +440,51 @@ class TabulatedWgg:
         else:
             e_cs = probC * probS
             e_ss = 0.5 * probS ** 2
+
+        return self.predict_occupation(
+            probC, probS, rp_bins, e_cs, e_ss,
+            f_exp=float(dict_params.get('f_exp', 0.0)),
+            tau=float(dict_params.get('tau', 6.0)),
+            lambda_NFW=float(dict_params.get('lambda_NFW', 1.0)))
+
+    def predict_occupation(
+        self,
+        probC: np.ndarray,
+        probS: np.ndarray,
+        rp_bins: np.ndarray,
+        e_cs: np.ndarray,
+        e_ss: np.ndarray,
+        f_exp: float = 0.0,
+        tau: float = 6.0,
+        lambda_NFW: float = 1.0,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict]:
+        """
+        Predict wp_gg from an EXPLICIT per-halo occupation, the wgg twin of
+        ``TabulatedDeltaSigma.predict_occupation``: pass the measured galaxy
+        counts of each halo to predict at the occupation the simulation
+        realised. :meth:`predict` is this method with everything evaluated
+        from the HOD.
+
+        Parameters
+        ----------
+        probC, probS : np.ndarray
+            Per-halo central and satellite occupation, aligned with the halo
+            rows. Not clipped: pass what you mean.
+        rp_bins : np.ndarray
+            Projected bin edges [Mpc/h], nested in the tabulation grid.
+        e_cs, e_ss : np.ndarray
+            Per-halo expected cen-sat and (unordered) sat-sat pair counts for
+            the 1-halo term: for measured counts N_c N_s and N_s (N_s - 1) / 2.
+        f_exp, tau, lambda_NFW : float
+            Satellite radial profile parameters.
+        """
+        halo, tab = self.halo, self.tab
+        f_exp, tau, lam = float(f_exp), float(tau), float(lambda_NFW)
+        probC = np.asarray(probC, dtype=np.float64)
+        probS = np.asarray(probS, dtype=np.float64)
+        N = probC.sum() + probS.sum()
+        ngal = N / halo.Lbox ** 3
+        fsat = probS.sum() / N
 
         n_bins = self.n_m * self.n_f
         C = np.bincount(self.bin_index, weights=probC, minlength=n_bins)
@@ -551,9 +590,9 @@ class TabulatedWgg:
         return cache[key]
 
     def make_predict_jax(self, rp_bins: np.ndarray, f_exp: float, tau: float,
-                         lambda_NFW: float,
+                         lambda_NFW: Optional[float],
                          n_sub_logM: int = 16, n_sub_fI: int = 32,
-                         fI_sub: str = "width"):
+                         fI_sub: str = "width", lambda_nodes=None):
         """Build a pure-JAX twin of :meth:`predict` for a PINNED satellite profile.
 
         Returns ``predict_fn(params) -> (wgg, ngal, fsat)`` with ``wgg``
@@ -583,9 +622,23 @@ class TabulatedWgg:
         :meth:`predict` for free profiles. Requires
         ``sat_kernel_weighting='static'``: the occupation-weighted kernels of
         the default path depend on the HOD and cannot be constants.
+
+        With ``lambda_nodes`` (and ``lambda_NFW=None``) only (f_exp, tau) are
+        pinned: the 2-halo kernels and 1-halo operators are built at each node
+        and ``params['lambda_NFW']`` picks them through a cubic spline in
+        log(lambda) (:func:`make_lambda_weights_jax`, TabCorr's scheme over
+        log(eta)). The kernels are interpolated, not the output, so the
+        sat-sat term stays quadratic in one kernel. The 1-halo group sums run
+        as a sparse (cell, group) segment-sum, since folding the histogram into
+        each node's operators would cost one dense (n_cells, n_rp) per node.
         """
+        import jax
         import jax.numpy as jnp
         from ..HOD_models import build_occupation_fn_jax, variant_coefficient
+
+        if (lambda_nodes is None) == (lambda_NFW is None):
+            raise ValueError("pass exactly one of lambda_NFW (pinned) and "
+                             "lambda_nodes (interpolated)")
 
         if self.sat_kernel_weighting != "static":
             raise ValueError(
@@ -595,7 +648,7 @@ class TabulatedWgg:
         occ = self.halo.HOD
         tab = self.tab
         rp_bins = np.asarray(rp_bins, dtype=np.float64)
-        f_exp, tau, lam = float(f_exp), float(tau), float(lambda_NFW)
+        f_exp, tau = float(f_exp), float(tau)
         cells = self._occupation_cells(n_sub_logM, n_sub_fI, fI_sub)
         cen_coef, sat_coef = cells['cen_coef'], cells['sat_coef']
         n_mc, n_fc = cells['n_mc'], cells['n_fc']
@@ -617,16 +670,33 @@ class TabulatedWgg:
             sl = slice(idx[k], idx[k + 1])
             M_agg[k, sl] = w_area[sl] / w_area[sl].sum()
 
-        K = self._sat_kernels(tab.rp_centers, f_exp, tau, lam)
         mult = np.triu(np.full((n_m, n_m), 2.0), 1) + np.eye(n_m)
-
-        # 1-halo: joint (cell, group) halo histogram folded into the operators
-        A_cs, A_ss = self._one_halo_operators(rp_bins, f_exp, tau, lam)
-        W = np.bincount(cells['cell'] * self.n_grp_1h + self.grp_1h,
-                        minlength=cells['n_cells'] * self.n_grp_1h
-                        ).reshape(cells['n_cells'], self.n_grp_1h).astype(np.float64)
-        B_cs = W @ A_cs                                   # (n_cells, n_rp)
-        B_ss = W @ A_ss
+        # joint (cell, group) halo histogram of the 1-halo term
+        hist = np.bincount(cells['cell'] * self.n_grp_1h + self.grp_1h,
+                           minlength=cells['n_cells'] * self.n_grp_1h)
+        if lambda_nodes is None:
+            lam = float(lambda_NFW)
+            K = self._sat_kernels(tab.rp_centers, f_exp, tau, lam)
+            # 1-halo: histogram folded into the operators
+            A_cs, A_ss = self._one_halo_operators(rp_bins, f_exp, tau, lam)
+            W = hist.reshape(cells['n_cells'], self.n_grp_1h).astype(np.float64)
+            j_B_cs, j_B_ss = jnp.asarray(W @ A_cs), jnp.asarray(W @ A_ss)
+            j_K = jnp.asarray(K)
+        else:
+            # copies: both builders cache only their last profile
+            K_nodes = np.stack([self._sat_kernels(tab.rp_centers, f_exp, tau, l)
+                                .copy() for l in lambda_nodes])
+            A_nodes = [self._one_halo_operators(rp_bins, f_exp, tau, l)
+                       for l in lambda_nodes]
+            j_K_nodes = jnp.asarray(K_nodes)              # (n_nodes, n_m, R, R)
+            j_Acs_nodes = jnp.asarray(np.stack([a[0] for a in A_nodes]))
+            j_Ass_nodes = jnp.asarray(np.stack([a[1] for a in A_nodes]))
+            nz = np.nonzero(hist)[0]
+            j_nz_cell = jnp.asarray(nz // self.n_grp_1h)
+            j_nz_grp = jnp.asarray(nz % self.n_grp_1h)
+            j_nz_cnt = jnp.asarray(hist[nz].astype(np.float64))
+            n_grp = self.n_grp_1h
+            lam_weights = make_lambda_weights_jax(lambda_nodes)
         area = np.pi * np.diff(rp_bins ** 2)
         V = self.halo.Lbox ** 3
 
@@ -636,10 +706,8 @@ class TabulatedWgg:
         j_N_cell = jnp.asarray(cells['N_cell'].reshape(n_mc, n_fc))
         j_wp = jnp.asarray(tab.wp_ij)                     # (n_bins, n_bins, n_rp_tab)
         j_wp_g = j_wp.reshape(n_m, n_f, n_bins, -1)
-        j_K = jnp.asarray(K)
         j_mult = jnp.asarray(mult)
         j_M_agg = jnp.asarray(M_agg)
-        j_B_cs, j_B_ss = jnp.asarray(B_cs), jnp.asarray(B_ss)
         j_area = jnp.asarray(area)
         occ_fn = build_occupation_fn_jax(occ, split_conformity=True)
         conformity = occ.conformity
@@ -683,6 +751,12 @@ class TabulatedWgg:
             ngal = N / Lbox3
             fsat = jnp.sum(wS) / N
 
+            if lambda_nodes is None:
+                K = j_K
+            else:
+                w_lam = lam_weights(params['lambda_NFW'])
+                K = jnp.einsum('n,nmij->mij', w_lam, j_K_nodes)
+
             # ── 2-halo on the tabulation grid (twin of predict) ──
             C = wC.reshape(n_m, n_sub_logM, n_f, n_sub_fI).sum(axis=(1, 3))
             S = wS.reshape(n_m, n_sub_logM, n_f, n_sub_fI).sum(axis=(1, 3))
@@ -692,18 +766,27 @@ class TabulatedWgg:
             cs_j = jnp.einsum('i,ijr->jr', C_flat, j_wp)
             ss_i = jnp.einsum('mf,mfjr->mjr', S, j_wp_g)
             P_cs = jnp.einsum('mfr,mf->mr', cs_j.reshape(n_m, n_f, -1), S)
-            total = cc + 2.0 * jnp.einsum('mij,mj->i', j_K, P_cs)
+            total = cc + 2.0 * jnp.einsum('mij,mj->i', K, P_cs)
             G = jnp.einsum('mjr,j->mjr', ss_i, S_flat)
             G = G.reshape(n_m, n_m, n_f, -1).sum(axis=2)
-            inner = (j_K @ G.transpose(0, 2, 1)).transpose(0, 2, 1)
+            inner = (K @ G.transpose(0, 2, 1)).transpose(0, 2, 1)
             T = jnp.einsum('mn,mni->ni', j_mult, inner)
-            total = total + jnp.einsum('nij,nj->i', j_K, T)
+            total = total + jnp.einsum('nij,nj->i', K, T)
             wp_2h = (j_M_agg @ total) / N ** 2
 
-            # ── 1-halo: per-cell pair expectations x folded operators ──
+            # ── 1-halo: per-cell pair expectations x group operators ──
             e_cs = (probC * lam1).ravel()
             e_ss = (0.5 * (probC * lam1 ** 2 + (1.0 - probC) * lam0 ** 2)).ravel()
-            wp_1h = 2.0 * V * (e_cs @ j_B_cs + e_ss @ j_B_ss) / (N ** 2 * j_area)
+            if lambda_nodes is None:
+                pairs = e_cs @ j_B_cs + e_ss @ j_B_ss
+            else:
+                P_cs_g = jax.ops.segment_sum(e_cs[j_nz_cell] * j_nz_cnt,
+                                             j_nz_grp, num_segments=n_grp)
+                P_ss_g = jax.ops.segment_sum(e_ss[j_nz_cell] * j_nz_cnt,
+                                             j_nz_grp, num_segments=n_grp)
+                pairs = (P_cs_g @ jnp.einsum('n,ngr->gr', w_lam, j_Acs_nodes)
+                         + P_ss_g @ jnp.einsum('n,ngr->gr', w_lam, j_Ass_nodes))
+            wp_1h = 2.0 * V * pairs / (N ** 2 * j_area)
 
             return wp_2h + wp_1h, ngal, fsat
 

@@ -79,6 +79,9 @@ _DEFAULT_PRIORS: Dict[str, Tuple[float, float]] = {
     "log10M1":    (12.0, 15.0),
     "alpha":      (0.3, 2.0),
     "kappa":      (0.1, 3.0),
+    # satellite_occupation='exp_cutoff' (Mcut range as the tabulated chains)
+    "log10Mcut":  (11.5, 13.5),
+    "log10Mmax":  (13.0, 18.0),
 }
 
 _HOD_FREE_PARAMS: Dict[str, List[str]] = {
@@ -88,15 +91,25 @@ _HOD_FREE_PARAMS: Dict[str, List[str]] = {
     "ELG_MHMQ": ["As", "log10Mmin", "sig_M", "gamma", "log10M1", "alpha", "kappa"],
 }
 
+
+def _hod_param_names(hod_type: str, satellite_occupation: str = "power_law") -> List[str]:
+    """HOD parameters of the fitter; 'exp_cutoff' satellites swap the kappa*Mmin
+    threshold for (log10Mcut, log10Mmax)."""
+    names = _HOD_FREE_PARAMS[hod_type]
+    if satellite_occupation == "exp_cutoff":
+        names = [n for n in names if n != "kappa"] + ["log10Mcut", "log10Mmax"]
+    return names
+
 # Concentration-mass normalisations for the halo/matter (f_h) and satellite
 # (f_s) NFW profiles (Dvornik+23 eq. 15). Fixed at 1.0 by default (no feedback);
 # declare them in ``param_config`` to make them free or fix elsewhere.
 _PROFILE_PARAMS: List[str] = ["f_h", "f_s"]
 _PROFILE_DEFAULT_FIXED: Dict[str, float] = {"f_h": 1.0, "f_s": 1.0}
 _PROFILE_DEFAULT_PRIOR: Dict[str, Tuple[float, float]] = {
-    "f_h": (0.1, 2.0),
-    # f_s <= 1: satellite galaxies are never more concentrated than the DM halo.
-    "f_s": (0.1, 1.0),
+    # <= 1 for both: feedback only lowers the matter concentration, and satellite
+    # galaxies are never more concentrated than the DM halo.
+    "f_h": (0.05, 1.0),
+    "f_s": (0.05, 1.0),
 }
 
 
@@ -104,6 +117,7 @@ def _parse_param_config(
     hod_type: str,
     param_config: Optional[Dict[str, Any]],
     ngal_mode: str = "rescale",
+    satellite_occupation: str = "power_law",
 ) -> Tuple[List[Tuple[str, float, float, str]], Dict[str, float]]:
     """Split user dict into (priors, fixed_params).
 
@@ -112,7 +126,7 @@ def _parse_param_config(
       (mean, std, 'gaussian')              -> Gaussian free
       scalar                               -> fixed
     """
-    free_names = _HOD_FREE_PARAMS[hod_type]
+    free_names = _hod_param_names(hod_type, satellite_occupation)
     cfg: Dict[str, Any] = {n: _DEFAULT_PRIORS[n] for n in free_names}
     # f_h / f_s default to fixed at 1.0 (no rescaling); user can override.
     for n in _PROFILE_PARAMS:
@@ -233,6 +247,8 @@ class AnalyticalHODFitter:
         if hod_type not in _HOD_FREE_PARAMS:
             raise ValueError(f"Unsupported HOD type for this fitter: {hod_type}")
         self.hod_type = hod_type
+        self.satellite_occupation = getattr(halo_model.hod, "satellite_occupation",
+                                            "power_law")
 
         self.target_ngal = float(target_ngal)
         self.Ac_fiducial = float(Ac_fiducial)
@@ -277,7 +293,7 @@ class AnalyticalHODFitter:
 
         # Priors
         self.priors, self.fixed = _parse_param_config(self.hod_type, param_config,
-                                                      ngal_mode)
+                                                      ngal_mode, self.satellite_occupation)
         self.free_names = [p[0] for p in self.priors]
 
         self.n_data = (len(self.ds_obs) + (len(self.wgg_obs) if self.fit_wgg else 0)
@@ -299,7 +315,7 @@ class AnalyticalHODFitter:
         return edges
 
     def _print_summary(self):
-        print(f"AnalyticalHODFitter ({self.hod_type})")
+        print(f"AnalyticalHODFitter ({self.hod_type}, {self.satellite_occupation} satellites)")
         print(f"  target n_gal = {self.target_ngal:.3e}  (ngal_mode={self.ngal_mode}"
               + (f", sigma {self.ngal_err:.3e})" if self.ngal_mode == "constraint"
                  else ")"))
@@ -327,7 +343,7 @@ class AnalyticalHODFitter:
         # Pgm (f_h also in the Pgm 2-halo; f_s in Pgg too); they leave the
         # occupation N_c/N_s — and therefore n_gal — invariant. The (Ac, As)
         # rescale below is independent of (f_h, f_s).
-        for n in _HOD_FREE_PARAMS[self.hod_type]:
+        for n in _hod_param_names(self.hod_type, self.satellite_occupation):
             if n not in merged:
                 raise KeyError(f"Missing HOD parameter {n!r}")
         if self.ngal_mode == "constraint":

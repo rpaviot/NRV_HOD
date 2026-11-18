@@ -204,6 +204,12 @@ class TabulatedFitter:
     data_path, ds_obs, cov_inv, rp_obs, rp_min, rp_max, param_config, max_fsat
         Data vector (a file, or the arrays), scale cuts, priors and the
         f_sat truncation prior.
+    n_lambda_nodes : int
+        When > 0 and lambda_NFW is the only free satellite-profile parameter
+        (uniform prior), the batched likelihood interpolates the satellite
+        operators over this many log-spaced lambda nodes spanning the prior
+        (TabCorr's spline over eta) instead of rebuilding the convolution per
+        call; the joint wgg term then stays inside the jit. 0 = exact path.
     """
 
     def __init__(
@@ -229,6 +235,8 @@ class TabulatedFitter:
         rp_min_wgg: Optional[float] = None,
         rp_max_wgg: Optional[float] = None,
         n_wgg_threads: int = 1,
+        n_lambda_nodes: int = 0,
+        fit_ds: bool = True,
     ):
         self.fit_case = FitCase(fit_case)
         self.M1_fixed = M1_fixed
@@ -238,6 +246,7 @@ class TabulatedFitter:
 
         self.max_fsat = max_fsat
         self.n_wgg_threads = n_wgg_threads
+        self.n_lambda_nodes = n_lambda_nodes
         self.Ac_fiducial = Ac_fiducial
         self.hod_occupation = hod_occupation
         if max_fsat is not None and hod_occupation is None:
@@ -308,6 +317,15 @@ class TabulatedFitter:
             self.cov_inv_wgg = np.linalg.inv(cov[np.ix_(mask, mask)])
             self.rp_obs_wgg = centers[mask]
             self._fit_wgg = True
+
+        # wgg-only fit: zero the DeltaSigma precision so both likelihood paths
+        # drop the DS term; the real one is kept to report the unfitted DS chi2.
+        self.fit_ds = fit_ds
+        self.cov_inv_ds = self.cov_inv
+        if not fit_ds:
+            if not self._fit_wgg:
+                raise ValueError("fit_ds=False needs tabulated_wgg.")
+            self.cov_inv = np.zeros_like(self.cov_inv)
 
         if param_config is not None:
             priors, fixed = _parse_param_config(param_config)
@@ -660,31 +678,53 @@ class TabulatedFitter:
             ELG_satellite_cutoff, HOD_satellite,
         )
 
-        predict_fn = self.tab.make_predict_jax()
-
-        # ── joint wgg, jit twin: only for a PINNED satellite profile, whose
-        # kernels enter as constants (TabulatedWgg.make_predict_jax). With
-        # the profile free the wgg term falls back to the per-point NumPy
-        # predict on a thread pool, further down. ──
         free_names = list(self.param_names)
         fixed = {k: float(v) for k, v in self.fixed_params_dict.items()}
         profile_names = ("f_exp", "tau", "lambda_NFW")
+        f_exp_pin, tau_pin = fixed.get("f_exp", 0.0), fixed.get("tau", 6.0)
+
+        # ── lambda nodes: only lambda_NFW free -> satellite operators splined
+        # over log(lambda) nodes spanning its prior (TabCorr's scheme) ──
+        lambda_nodes = None
+        lam_prior = [p for p in self.free_params if p[0] == "lambda_NFW"]
+        if (self.n_lambda_nodes > 0 and lam_prior
+                and lam_prior[0][3] != "gaussian"
+                and not any(n in free_names for n in ("f_exp", "tau"))):
+            lambda_nodes = np.geomspace(lam_prior[0][1], lam_prior[0][2],
+                                        self.n_lambda_nodes)
+            print(f"  [build_batched_loglike] lambda_NFW on {len(lambda_nodes)} "
+                  f"log-spaced nodes in [{lambda_nodes[0]:g}, "
+                  f"{lambda_nodes[-1]:g}] (f_exp={f_exp_pin:g}, tau={tau_pin:g})")
+            predict_fn = self.tab.make_predict_jax(
+                lambda_nodes=lambda_nodes, f_exp=f_exp_pin, tau=tau_pin)
+        else:
+            predict_fn = self.tab.make_predict_jax()
+
+        # ── joint wgg, jit twin: only for a PINNED satellite profile (or
+        # lambda_NFW on nodes), whose kernels enter as constants
+        # (TabulatedWgg.make_predict_jax). Otherwise the wgg term falls back
+        # to the per-point NumPy predict on a thread pool, further down. ──
         wgg_fn = None
         if self._fit_wgg:
             pinned = not any(n in free_names for n in profile_names)
             static = self.tab_wgg.sat_kernel_weighting == "static"
-            if pinned and static:
+            if static and lambda_nodes is not None:
                 wgg_fn = self.tab_wgg.make_predict_jax(
-                    self.rp_bins_wgg, fixed.get("f_exp", 0.0),
-                    fixed.get("tau", 6.0), fixed.get("lambda_NFW", 1.0))
-                j_wgg_obs = jnp.asarray(self.wgg_obs)
-                j_cov_inv_wgg = jnp.asarray(self.cov_inv_wgg)
+                    self.rp_bins_wgg, f_exp_pin, tau_pin, None,
+                    lambda_nodes=lambda_nodes)
+            elif pinned and static:
+                wgg_fn = self.tab_wgg.make_predict_jax(
+                    self.rp_bins_wgg, f_exp_pin, tau_pin,
+                    fixed.get("lambda_NFW", 1.0))
             else:
                 why = ("the satellite profile is free" if not pinned else
                        "sat_kernel_weighting != 'static'")
                 print(f"  [build_batched_loglike] wgg on the NumPy thread-pool "
                       f"path ({why}); the jit twin needs a pinned profile and "
                       f"static kernels.")
+            if wgg_fn is not None:
+                j_wgg_obs = jnp.asarray(self.wgg_obs)
+                j_cov_inv_wgg = jnp.asarray(self.cov_inv_wgg)
         self._wgg_jit = wgg_fn is not None
 
         # ── ngal rescale: catalogue sum or analytic mass function, per

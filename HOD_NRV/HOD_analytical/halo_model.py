@@ -27,7 +27,7 @@ from .hod_analytical import (
 
 from .power_spectrum import (
     nfw_fourier_u, nfw_fourier_u_single,
-    _compute_ngal, _compute_Pgg, _compute_Pgm,
+    _compute_ngal, _compute_Pgg, _compute_Pgm, _compute_P_strip,
     _compute_Pgg_with_beta_nl, _compute_Pgm_with_beta_nl,
     _compute_I_NL_22, _compute_I_NL_12, _compute_I_NL_21,
     _compute_I_NL_gg, _compute_I_NL_gm,
@@ -137,6 +137,11 @@ class HaloModel(Cosmology):
         self._resp_m_Mmin_jax = None
         if baryons is not None:
             self.set_baryons(baryons, baryon_params)
+
+        # Satellite-strip term (None = off; see set_stripping)
+        self.strip_frac = None
+        self._strip_ct_jax = None
+        self._strip_mfrac_jax = None
 
         # Compute beta^NL
         if include_beta_nl:
@@ -411,6 +416,52 @@ class HaloModel(Cosmology):
         if self.verbose:
             print(f"  baryons: S25 response set (concentration={concentration})")
 
+    def set_stripping(self, r_t_frac: Optional[float] = 0.4):
+        """Add the satellite-strip term to P_gm, or remove it with None.
+
+        Each satellite galaxy carries its own subhalo: an NFW of its pre-infall
+        mass, hard-truncated at r_t = r_t_frac * R200c (Mandelbaum+05;
+        Zacharegkas+22 eq. 19 use 0.4). Pre-infall masses are distributed as the
+        centrals of the same sample (see power_spectrum._compute_P_strip). With
+        R200c = c200c * R_s, the truncation is c_t = r_t_frac * c200c in units of
+        the model's R_s, and the retained mass is mu(c_t)/mu(c) of the model's M.
+        No free parameter; ΔΣ only (P_gg is unaffected). The subhalo keeps the
+        dark-matter NFW shape even when set_baryons is on.
+        """
+        if r_t_frac is None:
+            self.strip_frac, self._strip_ct_jax, self._strip_mfrac_jax = None, None, None
+            return
+        import pyccl as ccl
+        from .baryons_s25 import m200m_to_m200c
+        mu = lambda x: np.log1p(x) - x / (1.0 + x)
+        c_t, m_frac = [], []
+        for iz, a in enumerate(self.a_array):
+            c = self._c[iz]
+            if self.mass_def.Delta == 200 and self.mass_def.rho_type == 'matter':
+                Om_z = float(ccl.omega_x(self.ccl_cosmo, a, 'matter'))
+                _, _, c200c = m200m_to_m200c(self.M_array, c, Om_z)
+            elif self.mass_def.Delta == 200 and self.mass_def.rho_type == 'critical':
+                c200c = c
+            else:
+                raise NotImplementedError("stripping needs a 200m or 200c mass definition")
+            ct = r_t_frac * c200c
+            c_t.append(ct)
+            m_frac.append(mu(ct) / mu(c))
+        self.strip_frac = float(r_t_frac)
+        self._strip_ct_jax = jnp.asarray(np.stack(c_t))        # (n_z, N_GL)
+        self._strip_mfrac_jax = jnp.asarray(np.stack(m_frac))  # (n_z, N_GL)
+        if self.verbose:
+            print(f"  satellite strip: r_t = {r_t_frac:g} R200c, retained mass "
+                  f"{float(np.median(m_frac[0])):.2f} of M (median node)")
+
+    def _P_strip(self, iz, N_c, N_s):
+        if self._strip_ct_jax is None:
+            return 0.0
+        return _compute_P_strip(N_c, N_s, self._n_M_jax[iz], self._R_s_jax[iz],
+                                self._strip_ct_jax[iz], self._strip_mfrac_jax[iz],
+                                self._k_jax, self._M_jax, self.RHO_M,
+                                self.log10M_min, self.log10M_max)
+
     def _resp(self, iz):
         if self._resp_m_jax is None:
             return None, None
@@ -510,7 +561,7 @@ class HaloModel(Cosmology):
                     self.log10M_min, self.log10M_max, self.f_h, self.f_s,
                     resp_m, self.A_b,
                 )
-            result.append(P)
+            result.append(P + self._P_strip(iz, N_c, N_s))
 
         Pgm = jnp.stack(result)
         # if self.units_per_h:
@@ -801,6 +852,7 @@ class HaloModel(Cosmology):
                         self._Pk_lin_jax[iz], self._k_jax, M, rho_m,
                         log10M_min, log10M_max, f_h, f_s, resp_m,
                     )
+                Pgm = Pgm + self._P_strip(iz, N_c, N_s)
                 rows.append(ds_builder.transform(Pgm, rho_m))   # (nbin,)
             ds_all = jnp.stack(rows)                            # (n_z, nbin)
             if stellar is not None:

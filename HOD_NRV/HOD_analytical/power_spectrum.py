@@ -144,6 +144,31 @@ def _compute_Pgm(N_c, N_s, n_M, b_h, R_s, c, Pk_lin, k, M, rho_m,
     return P_1h + Pk_lin * A_b * I_g * (I_m1 + I_m2)
 
 
+@jit
+def _compute_P_strip(N_c, N_s, n_M, R_s, c_t, m_frac, k, M, rho_m,
+                     log10M_min, log10M_max):
+    """Satellite-strip 1-halo term: each satellite galaxy x its own tidally
+    stripped subhalo (Mandelbaum+05, Zacharegkas+22 eq. 19).
+
+    The subhalo is an NFW hard-truncated at c_t * R_s (u_t, normalised, from the
+    same closed form as an NFW cut at its virial radius), holding m_frac * M of
+    its pre-infall mass M. Pre-infall masses follow the centrals of the same
+    sample, p(M) = N_c n(M) / n_c, so the term is
+
+        P_strip(k) = (n_s / n_gal) * int dM p(M) m_frac M u_t(k|M) / rho_m.
+
+    The retained subhalo mass is not removed from the host profile; with
+    m_frac ~ 0.5 and a few satellites per host that double counts a few percent
+    of the host mass in the satellite 1-halo term.
+    """
+    n_c = gl_integrate(N_c * n_M, log10M_min, log10M_max)
+    n_s = gl_integrate(N_s * n_M, log10M_min, log10M_max)
+    u_t = nfw_fourier_u(k, R_s, c_t)
+    integrand = N_c * n_M * (m_frac * M / rho_m) * u_t
+    I_t = vmap(lambda x: gl_integrate(x, log10M_min, log10M_max))(integrand) / n_c
+    return n_s / (n_c + n_s) * I_t
+
+
 # ============================================================================
 # beta^NL Correction Functions
 # ============================================================================
@@ -247,7 +272,7 @@ __all__ = [
     # NFW Fourier transforms
     'nfw_fourier_u', 'nfw_fourier_u_single',
     # Standard power spectrum
-    '_compute_ngal', '_compute_Pgg', '_compute_Pgm',
+    '_compute_ngal', '_compute_Pgg', '_compute_Pgm', '_compute_P_strip',
     # beta^NL corrections
     '_compute_I_NL_22', '_compute_I_NL_12', '_compute_I_NL_21',
     '_compute_I_NL_gg', '_compute_I_NL_gm',

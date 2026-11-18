@@ -462,6 +462,66 @@ def satellite_offset_nodes(Rvir, conc, f_exp, tau, lambda_NFW,
     return rho, w_rho / w_rho.sum()
 
 
+def offset_convolution_operator(out_rp, grid_rp, rho, w_rho, cos_phi, phi_w):
+    """Matrix M with ``M @ f`` = the azimuthal + offset average of a radial
+    profile f tabulated on ``grid_rp``, evaluated at ``out_rp``.
+
+    The operator form of ``np.interp(dist, grid_rp, f, left=f[0], right=0.0)``
+    followed by the ``phi_w`` and ``w_rho`` contractions, with
+    dist^2 = R^2 + rho^2 + 2 R rho cos(phi): the interpolation is piecewise
+    linear in the tabulated values, so the whole convolution is linear in f.
+    """
+    out = np.asarray(out_rp, dtype=np.float64)
+    g = np.asarray(grid_rp, dtype=np.float64)
+    n_out, n = len(out), len(g)
+    shape = (n_out, len(rho), len(cos_phi))
+    d = np.sqrt(np.maximum(
+        out[:, None, None] ** 2 + rho[None, :, None] ** 2
+        + 2.0 * out[:, None, None] * rho[None, :, None] * cos_phi[None, None, :],
+        0.0)).ravel()
+    rows = np.repeat(np.arange(n_out), shape[1] * shape[2])
+    # Clipping the index and t reproduces left=f[0]; zeroing the weight above
+    # the grid reproduces right=0.0.
+    idx = np.clip(np.searchsorted(g, d) - 1, 0, n - 2)
+    t = np.clip((d - g[idx]) / (g[idx + 1] - g[idx]), 0.0, 1.0)
+    w = np.where(d > g[-1], 0.0, np.broadcast_to(
+        (w_rho[:, None] * phi_w[None, :])[None], shape).ravel())
+    w_hi = w * t
+    M = (np.bincount(rows * n + idx, w - w_hi, n_out * n)
+         + np.bincount(rows * n + idx + 1, w_hi, n_out * n))
+    return M.reshape(n_out, n)
+
+
+def make_lambda_weights_jax(lambda_nodes):
+    """TabCorr-style interpolation over the satellite concentration rescaling.
+
+    Returns ``weights(lam) -> (n_nodes,)`` such that ``weights(lam) @ y_nodes``
+    is the cubic not-a-knot spline in log(lambda) through ``y_nodes`` — the
+    scheme of TabCorr's ``Interpolator`` over log(eta) (Lange et al.). The
+    spline is linear in the node values, so its piecewise coefficients are
+    built once by splining the identity; per call it is one polynomial
+    evaluation. Outside the node range the end polynomials extrapolate.
+    """
+    import jax.numpy as jnp
+    from scipy.interpolate import CubicSpline
+
+    x = np.log(np.asarray(lambda_nodes, dtype=np.float64))
+    if len(x) < 4 or np.any(np.diff(x) <= 0):
+        raise ValueError("need >= 4 strictly increasing lambda nodes")
+    spl = CubicSpline(x, np.eye(len(x)), bc_type='not-a-knot')
+    j_c = jnp.asarray(spl.c)               # (4, n_nodes - 1, n_nodes)
+    j_x = jnp.asarray(x)
+
+    def weights(lam):
+        xl = jnp.log(lam)
+        i = jnp.clip(jnp.searchsorted(j_x, xl) - 1, 0, len(x) - 2)
+        dx = xl - j_x[i]
+        c = j_c[:, i, :]
+        return ((c[0] * dx + c[1]) * dx + c[2]) * dx + c[3]
+
+    return weights
+
+
 def build_tabulation_bins(
     logM: np.ndarray,
     fI: Optional[np.ndarray] = None,
@@ -1460,8 +1520,27 @@ class TabulatedDeltaSigma:
 
         return ngal_fn
 
+    def _lambda_node_operators(self, lambda_nodes, f_exp, tau):
+        """Satellite convolution operators at each lambda node.
+
+        Returns an array (n_nodes, n_m, n_out, n_sigma) with
+        ``K[n, m] @ Sigma_M[m]`` equal to the per-mass-bin satellite Sigma of
+        :meth:`predict_occupation` at ``lambda_NFW = lambda_nodes[n]`` (same
+        offset nodes, same interpolation), for the pinned (f_exp, tau).
+        """
+        K = np.zeros((len(lambda_nodes), self.n_m, len(self.R_out),
+                      len(self.R_sigma)))
+        for n, lam in enumerate(lambda_nodes):
+            for m in range(self.n_m):
+                rho, w_rho = self._offset_nodes(m, f_exp, tau, lam)
+                K[n, m] = offset_convolution_operator(
+                    self.R_out, self.R_sigma, rho, w_rho,
+                    self._cos_phi, self._phi_w)
+        return K
+
     def make_predict_jax(self, n_sub_logM: int = 16, n_sub_fI: int = 32,
-                         fI_sub: str = "width"):
+                         fI_sub: str = "width", lambda_nodes=None,
+                         f_exp: float = 0.0, tau: float = 6.0):
         """Build a pure-JAX twin of :meth:`predict` for jit/vmap sampling.
 
         Returns ``predict_fn(params) -> (ds_total, ngal, fsat)`` where
@@ -1479,12 +1558,22 @@ class TabulatedDeltaSigma:
         property (fI or fE); 'direct' uses exact per-cell means of
         sign(prop), 'variant' the per-cell mean of the property (exact for
         its linear factor; the rank when the Occupation has ``ab_rank``).
+
+        With ``lambda_nodes`` the satellite profile is pinned at
+        (``f_exp``, ``tau``) and ``params['lambda_NFW']`` is read through a
+        cubic spline in log(lambda) over convolution operators precomputed at
+        the nodes (:func:`make_lambda_weights_jax`), instead of rebuilding the
+        offset convolution per call: exact at the nodes, interpolated between.
         """
         import jax
         import jax.numpy as jnp
         from ..HOD_models import build_occupation_fn_jax, variant_coefficient
 
         occ = self.halo.HOD
+        if lambda_nodes is not None:
+            j_K_nodes = jnp.asarray(
+                self._lambda_node_operators(lambda_nodes, f_exp, tau))
+            lam_weights = make_lambda_weights_jax(lambda_nodes)
         cells = self._occupation_cells(n_sub_logM, n_sub_fI, fI_sub)
         prop = cells['prop']
         cen_coef, sat_coef = cells['cen_coef'], cells['sat_coef']
@@ -1581,6 +1670,14 @@ class TabulatedDeltaSigma:
             w = (probS * j_N_cell).reshape(
                 n_m, n_sub_logM, n_f, n_sub_fI).sum(axis=(1, 3))
             Sigma_M = jnp.einsum('mf,mfr->mr', w, j_Sigma_bins)
+
+            if lambda_nodes is not None:
+                S_nodes = jnp.einsum('nmos,ms->no', j_K_nodes, Sigma_M)
+                Sigma_sat = lam_weights(params['lambda_NFW']) @ S_nodes
+                Sigma_sat = Sigma_sat / jnp.sum(w)
+                Sigma_mean = j_M_sig @ Sigma_sat
+                ds_sat = j_M_avg @ ((Sigma_mean - Sigma_sat) * rho_fac)
+                return (1.0 - fsat) * ds_cen + fsat * ds_sat, ngal, fsat
 
             f_exp = params.get('f_exp', 0.0)
             tau = params.get('tau', 6.0)
