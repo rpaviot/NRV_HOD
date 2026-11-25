@@ -231,6 +231,21 @@ class MassBinData:
     
     # Other
     mean_sigma_crit: Optional[np.ndarray] = None
+
+    # Tangential shear (observable 'GammaT'): angles in arcmin, and the
+    # redshift distributions of the lens bin and of its source sample
+    theta: Optional[np.ndarray] = None
+    theta_bins: Optional[np.ndarray] = None
+    gamma_t: Optional[np.ndarray] = None
+    gamma_t_err: Optional[np.ndarray] = None
+    cov_gamma_t: Optional[np.ndarray] = None
+    z_lens: Optional[np.ndarray] = None
+    nz_lens: Optional[np.ndarray] = None
+    z_source: Optional[np.ndarray] = None
+    nz_source: Optional[np.ndarray] = None
+    # 2 x the unit lens-magnification term, computed by the fitter from the
+    # two n(z) when alpha_minus_one is set (same convention as mag_contribution)
+    mag_gamma_t: Optional[np.ndarray] = None
     
     def __post_init__(self):
         if self.rp_wgg is None:
@@ -250,6 +265,15 @@ class MassBinData:
         else:
             return self.delta_sigma
     
+    def get_corrected_gamma_t(self) -> np.ndarray:
+        """
+        gamma_t with the lens-magnification term removed:
+        gamma_t - (alpha - 1) * mag_gamma_t when alpha_minus_one is set.
+        """
+        if self.alpha_minus_one is not None and self.mag_gamma_t is not None:
+            return self.gamma_t - self.alpha_minus_one * self.mag_gamma_t
+        return self.gamma_t
+
     @classmethod
     def from_npz(
         cls,
@@ -276,26 +300,49 @@ class MassBinData:
             (alpha - 1) of the magnification correction; None for none.
         """
         data = np.load(filepath)
-        
-        # Handle different key names for rp
-        if 'rp_delta_sigma' in data:
-            rp = data['rp_delta_sigma']
-        elif 'rp' in data:
-            rp = data['rp']
+        has_gt = 'gamma_t' in data
+        has_ds = 'delta_sigma' in data
+        if not (has_ds or has_gt):
+            raise KeyError(f"{filepath}: neither 'delta_sigma' nor 'gamma_t'")
+
+        empty = np.array([])
+        if has_ds:
+            # Handle different key names for rp
+            if 'rp_delta_sigma' in data:
+                rp = data['rp_delta_sigma']
+            elif 'rp' in data:
+                rp = data['rp']
+            else:
+                raise KeyError("Could not find 'rp' or 'rp_delta_sigma' in data file")
+            rp_bins = data['rp_bins']
+            # Handle different key names for covariance
+            if 'cov_delta_sigma' in data:
+                cov_delta_sigma = data['cov_delta_sigma']
+            elif 'covariance_matrix' in data:
+                cov_delta_sigma = data['covariance_matrix']
+            else:
+                raise KeyError("Could not find covariance matrix in data file")
+            delta_sigma = data['delta_sigma']
+            delta_sigma_err = data['delta_sigma_err']
         else:
-            raise KeyError("Could not find 'rp' or 'rp_delta_sigma' in data file")
-        
+            rp = data.get('rp', empty)
+            rp_bins = data.get('rp_bins', empty)
+            cov_delta_sigma = delta_sigma = delta_sigma_err = empty
+
         rp_wgg = data.get('rp_wgg', rp)
-        rp_bins_wgg = data.get('rp_bins_wgg', data['rp_bins'])
-        
-        # Handle different key names for covariance
-        if 'cov_delta_sigma' in data:
-            cov_delta_sigma = data['cov_delta_sigma']
-        elif 'covariance_matrix' in data:
-            cov_delta_sigma = data['covariance_matrix']
-        else:
-            raise KeyError("Could not find covariance matrix in data file")
-        
+        rp_bins_wgg = data.get('rp_bins_wgg', rp_bins)
+
+        gt = {}
+        if has_gt:
+            for key in ('theta', 'theta_bins', 'cov_gamma_t', 'z_lens',
+                        'nz_lens', 'z_source', 'nz_source'):
+                if key not in data:
+                    raise KeyError(f"{filepath}: 'gamma_t' needs '{key}'")
+                gt[key] = data[key]
+            gt['gamma_t'] = data['gamma_t']
+            gt['gamma_t_err'] = data.get(
+                'gamma_t_err', np.sqrt(np.diag(data['cov_gamma_t'])))
+
         # Load galaxy number density (abundance anchor) if present
         n_gal = data.get('n_gal', None)
         n_gal = float(n_gal) if n_gal is not None else None
@@ -303,7 +350,7 @@ class MassBinData:
         n_gal_err = float(n_gal_err) if n_gal_err is not None else None
 
         mag_contribution = data.get('mag_contribution', None)
-        if alpha_minus_one is not None and mag_contribution is None:
+        if alpha_minus_one is not None and mag_contribution is None and not has_gt:
             raise ValueError(f"{filepath}: alpha given but the file has no "
                              f"'mag_contribution' for the magnification correction")
         
@@ -316,9 +363,9 @@ class MassBinData:
                                            0.5 * (data['logmstar_min'] + data['logmstar_max']))),
             sample=getattr(sample, 'value', sample),
             rp=rp,
-            rp_bins=data['rp_bins'],
-            delta_sigma=data['delta_sigma'],
-            delta_sigma_err=data['delta_sigma_err'],
+            rp_bins=rp_bins,
+            delta_sigma=delta_sigma,
+            delta_sigma_err=delta_sigma_err,
             cov_delta_sigma=cov_delta_sigma,
             rp_wgg=rp_wgg,
             rp_bins_wgg=rp_bins_wgg,
@@ -330,6 +377,7 @@ class MassBinData:
             mag_contribution=mag_contribution,
             alpha_minus_one=alpha_minus_one,
             mean_sigma_crit=data.get('mean_sigma_crit', None),
+            **gt,
         )
 
 
@@ -460,7 +508,10 @@ class CSMFFitter:
     cosmo_params : dict, optional
         Cosmology parameters. Default uses the fiducial cosmology.
     observables : list of str
-        Which observables to fit. Options: ['DeltaSigma', 'WGG']
+        Which observables to fit. Options: ['DeltaSigma', 'WGG', 'GammaT',
+        'ngal']. 'GammaT' fits the tangential shear gamma_t(theta) instead of
+        DeltaSigma: it needs the lens and source n(z) of each bin, not a
+        redshift per lens.
     rp_min : float, optional
         Minimum r_p to include in fit [Mpc/h]
     rp_max : float, optional
@@ -469,6 +520,8 @@ class CSMFFitter:
         Minimum r_p for WGG fit [Mpc/h]
     rp_max_wgg : float, optional
         Maximum r_p for WGG fit [Mpc/h]
+    theta_min, theta_max : float, optional
+        Angular range of the gamma_t fit [arcmin]
     include_beta_nl : bool
         Whether to include β^NL (non-linear bias) correction. Default: False
     beta_nl_kwargs : dict, optional
@@ -501,6 +554,8 @@ class CSMFFitter:
         rp_max: Optional[float] = None,
         rp_min_wgg: Optional[float] = None,
         rp_max_wgg: Optional[float] = None,
+        theta_min: Optional[float] = None,
+        theta_max: Optional[float] = None,
         include_beta_nl: bool = False,
         beta_nl_kwargs: Optional[Dict] = None,
         k_array: Optional = None,
@@ -518,6 +573,9 @@ class CSMFFitter:
         self.rp_max = rp_max
         self.rp_min_wgg = rp_min_wgg if rp_min_wgg is not None else rp_min
         self.rp_max_wgg = rp_max_wgg if rp_max_wgg is not None else rp_max
+        self.theta_min = theta_min
+        self.theta_max = theta_max
+        self._gt_projectors: Optional[List[Any]] = None
         self.include_beta_nl = include_beta_nl
         self.beta_nl_kwargs = beta_nl_kwargs or {}
         self.units_per_h = units_per_h
@@ -560,6 +618,8 @@ class CSMFFitter:
             print(f"  β^NL correction: {'enabled' if include_beta_nl else 'disabled'}")
             print(f"  rp range (DS): [{rp_min}, {rp_max}]")
             print(f"  rp range (WGG): [{self.rp_min_wgg}, {self.rp_max_wgg}]")
+            if 'GammaT' in self.observables:
+                print(f"  theta range (gamma_t): [{theta_min}, {theta_max}] arcmin")
             if self.halo_model_kwargs:
                 print(f"  halo model overrides: {self.halo_model_kwargs}")
     def load_data(
@@ -589,7 +649,8 @@ class CSMFFitter:
         alpha_values : float or dict, optional
             Magnification slope alpha, one value or one per mass bin. If given,
             DeltaSigma is corrected by (alpha - 1) * mag_contribution (from the
-            file). Default: no correction.
+            file), and gamma_t by 2 (alpha - 1) times the lens-magnification
+            term computed from the lens and source n(z). Default: no correction.
 
         Notes
         -----
@@ -598,6 +659,12 @@ class CSMFFitter:
         ``delta_sigma_err`` and ``cov_delta_sigma`` (or ``covariance_matrix``);
         optionally ``wp``, ``wp_err``, ``cov_wgg``, ``rp_wgg``, ``n_gal``,
         ``logmstar_median`` and ``mag_contribution``.
+
+        For the 'GammaT' observable a file holds ``theta`` and ``theta_bins``
+        [arcmin], ``gamma_t``, ``cov_gamma_t`` (optionally ``gamma_t_err``) and
+        the redshift distributions ``z_lens``, ``nz_lens``, ``z_source``,
+        ``nz_source``; the DeltaSigma keys are then optional. ``z_eff`` is
+        the redshift at which the model DeltaSigma of the bin is evaluated.
 
         Examples
         --------
@@ -799,6 +866,9 @@ class CSMFFitter:
         }
         self._halo_model.set_hod_params(init_params)
         
+        if 'GammaT' in self.observables:
+            self._build_gamma_t_projectors()
+
         # Count total data points for chi2/ndof calculation
         self._count_data_points()
         
@@ -806,6 +876,53 @@ class CSMFFitter:
             print(f"\nUnified halo model initialized successfully!")
             print(f"Total data points: {self._n_data_points}")
     
+    def _build_gamma_t_projectors(self):
+        """One DeltaSigma -> gamma_t projector per mass bin, and the
+        lens-magnification term of the bins that have an alpha."""
+        self._gt_projectors = []
+        for mb in self.mass_bins:
+            if mb.gamma_t is None:
+                raise ValueError(
+                    f"observable 'GammaT': {mb.sample} bin {mb.massbin_id} "
+                    f"has no gamma_t data")
+            proj = self._halo_model.make_gamma_t_projector(
+                mb.theta_bins, mb.z_lens, mb.nz_lens, mb.z_source, mb.nz_source)
+            if mb.alpha_minus_one is not None:
+                mb.mag_gamma_t = 2.0 * proj.lens_magnification()
+            self._gt_projectors.append(proj)
+            if self.verbose:
+                mag = ""
+                if mb.mag_gamma_t is not None:
+                    frac = mb.alpha_minus_one * mb.mag_gamma_t / mb.gamma_t
+                    mag = (f", magnification / gamma_t = "
+                           f"{np.nanmin(frac):+.3f} .. {np.nanmax(frac):+.3f}")
+                print(f"  gamma_t {mb.sample} bin {mb.massbin_id}: lensing-weighted "
+                      f"z = {proj.z_eff:.3f} (model z_eff = {mb.z_eff:.3f}), "
+                      f"R = {proj.r_grid[0]:.3g}-{proj.r_grid[-1]:.3g}{mag}")
+
+    def _compute_model_gamma_t(self) -> Dict[Tuple, np.ndarray]:
+        """Model gamma_t per (sample, massbin_id), for the HOD parameters
+        currently set on the halo model."""
+        gt_all = self._halo_model.GammaT(self._gt_projectors)
+        if self._halo_model.is_single_z:
+            gt_all = [gt_all]
+        return {(mb.sample, mb.massbin_id): np.asarray(gt_all[i])
+                for i, mb in enumerate(self.mass_bins)}
+
+    def _apply_scale_cuts_gamma_t(
+        self,
+        mass_bin: MassBinData
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Apply the theta cuts to gamma_t (magnification-corrected if set)."""
+        theta = mass_bin.theta
+        mask = np.ones(len(theta), dtype=bool)
+        if self.theta_min is not None:
+            mask &= (theta >= self.theta_min)
+        if self.theta_max is not None:
+            mask &= (theta <= self.theta_max)
+        gt = mass_bin.get_corrected_gamma_t()
+        return theta[mask], gt[mask], mass_bin.cov_gamma_t[np.ix_(mask, mask)], mask
+
     def _count_data_points(self):
         """Count total number of data points after scale cuts."""
         n_total = 0
@@ -818,6 +935,10 @@ class CSMFFitter:
             if 'WGG' in self.observables and mass_bin.wp is not None:
                 _, _, _, mask_wgg = self._apply_scale_cuts_wgg(mass_bin)
                 n_total += np.sum(mask_wgg)
+
+            if 'GammaT' in self.observables and mass_bin.gamma_t is not None:
+                _, _, _, mask_gt = self._apply_scale_cuts_gamma_t(mass_bin)
+                n_total += np.sum(mask_gt)
         
         self._n_data_points = n_total
     
@@ -855,16 +976,20 @@ class CSMFFitter:
         rp_ds = self.mass_bins[0].rp
         rp_bins_ds = self.mass_bins[0].rp_bins
         
-        # Compute Delta Sigma for all redshifts
-        _, ds_all = self._halo_model.DeltaSigma(
-            rp=rp_ds,
-            rp_bins=rp_bins_ds)#include_stripping=False)
+        # Compute Delta Sigma for all redshifts (gamma_t-only files have no rp)
+        has_ds = len(rp_ds) > 0
+        if has_ds:
+            _, ds_all = self._halo_model.DeltaSigma(
+                rp=rp_ds,
+                rp_bins=rp_bins_ds)#include_stripping=False)
         
         # Build output dictionary
         ds_dict = {}
         for i, mass_bin in enumerate(self.mass_bins):
             uid = (mass_bin.sample, mass_bin.massbin_id)
-            if self._halo_model.is_single_z:
+            if not has_ds:
+                ds_dict[uid] = None
+            elif self._halo_model.is_single_z:
                 ds_dict[uid] = np.asarray(ds_all)
             else:
                 ds_dict[uid] = np.asarray(ds_all[i])
@@ -1031,6 +1156,30 @@ class CSMFFitter:
                         print(f"Warning: WGG likelihood failed: {e}")
                     return -1e100
 
+        # Tangential shear: model DeltaSigma projected through the lens and
+        # source n(z) of each bin (HOD params already set on the halo model).
+        if 'GammaT' in self.observables:
+            try:
+                gt_dict = self._compute_model_gamma_t()
+            except Exception as e:
+                if self.verbose:
+                    print(f"Warning: gamma_t evaluation failed: {e}")
+                return -1e100
+            for mass_bin in self.mass_bins:
+                theta_cut, gt_data, cov_gt, mask_gt = \
+                    self._apply_scale_cuts_gamma_t(mass_bin)
+                if len(theta_cut) == 0:
+                    continue
+                gt_model = gt_dict[(mass_bin.sample, mass_bin.massbin_id)][mask_gt]
+                if not np.all(np.isfinite(gt_model)):
+                    return -1e100
+                residual = gt_data - gt_model
+                try:
+                    chi2 = residual @ np.linalg.inv(cov_gt) @ residual
+                except np.linalg.LinAlgError:
+                    chi2 = np.sum((residual / mass_bin.gamma_t_err[mask_gt])**2)
+                total_log_L += -0.5 * chi2
+
         # Galaxy number-density (abundance) anchor: Gaussian chi^2 per mass bin on
         # the model n_gal vs the measured n_gal (h^3/Mpc^3; units_per_h=True). HOD
         # params were already set on the halo model by _compute_model_observables.
@@ -1072,7 +1221,7 @@ class CSMFFitter:
         import jax.numpy as jnp
         from HOD_NRV.utilsf.hankel_jax import build_direct_deltasigma
 
-        if 'WGG' in self.observables:
+        if 'WGG' in self.observables or 'GammaT' in self.observables:
             raise NotImplementedError(
                 "build_batched_loglike supports DeltaSigma-only fits.")
 
@@ -1875,6 +2024,8 @@ class CSMFFitter:
             params = self.get_best_fit()
         
         ds_dict, wgg_dict = self._compute_model_observables(params)
+        gt_dict = (self._compute_model_gamma_t()
+                   if 'GammaT' in self.observables else None)
         
         predictions = {}
         for mass_bin in self.mass_bins:
@@ -1887,6 +2038,11 @@ class CSMFFitter:
                 'z_eff': mass_bin.z_eff,
                 'sample': mass_bin.sample,
             }
+            if gt_dict is not None:
+                predictions[uid]['theta'] = mass_bin.theta
+                predictions[uid]['gamma_t_model'] = gt_dict[uid]
+                predictions[uid]['gamma_t_data'] = mass_bin.get_corrected_gamma_t()
+                predictions[uid]['gamma_t_err'] = mass_bin.gamma_t_err
             
             if wgg_dict[uid] is not None:
                 predictions[uid]['rp_wgg'] = mass_bin.rp_wgg
