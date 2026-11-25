@@ -214,7 +214,6 @@ check_xi_tree_one_case.png
 # example_scripts/ ships only the validation tests; everything else there is
 # local scratch (deprecated NN-emulator grids, benchmarks, one-off comparisons)
 example_scripts/*
-!example_scripts/CLAUDE.md
 !example_scripts/null_test_analytical.py
 !example_scripts/cross_check_analytical_numerical.py
 !example_scripts/numerical_dsigma_example.py
@@ -222,14 +221,17 @@ example_scripts/*
 !example_scripts/compute_assembly_bias.py
 !example_scripts/benchmark_dsigma_convergence.py
 
-# internal/ is the tracked production pipeline; its cluster drivers are not
-internal/slurm_*.sh
-!internal/slurm_tabulated_chains.sh
-!internal/slurm_tabulated_precompute.sh
-internal/dbg_*
+# Production pipeline moved to the nisp-hod-pipeline repo (2026-11-18)
+internal/
 
 # Deprecated NN emulator (superseded by the tabulated method)
 HOD_NRV/utilsf/emulator_nn_flax.py
 HOD_NRV/utilsf/emulator_utils.py
 EMULATOR_README.md
 !docs/requirements.txt
+
+# Agent / dev notes: local only
+CLAUDE.md
+**/CLAUDE.md
+EXTENDED_NFW_CHANGES.md
+.felt
