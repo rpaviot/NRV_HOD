@@ -1350,6 +1350,10 @@ class CSMFFitter:
             return neg_log_L + prior_penalty
         
         m = Minuit(cost_func, *[init_vals[name] for name in param_names], name=param_names)
+        # cost_func is -log L (= chi2/2, plus the 0.5 z^2 Gaussian prior
+        # penalty), so 1-sigma is Delta cost = 0.5; iminuit's default
+        # errordef=1 made HESSE errors sqrt(2) too large.
+        m.errordef = Minuit.LIKELIHOOD
         
         for name, (lo, hi) in limits.items():
             m.limits[name] = (lo, hi)
